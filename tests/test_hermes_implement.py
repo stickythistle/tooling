@@ -59,10 +59,21 @@ BODY
 #   commit_dirty   empty commit, then write STUB_DIRTY_FILE
 #   finish         commit, write HANDOVER.md in the run directory
 #   finish_clean   commit_dirty + finish + remove the sentinel
+#   hang_ignore_term  record this pid, ignore SIGTERM, sleep 300: an
+#                    agent that survives `timeout`'s signal and keeps its
+#                    session lease (issue #157)
+#   refuse         print the SESSION_NOT_OWNED refusal on stderr and
+#                    exit 1, the way hermes refuses a --continue whose
+#                    session is still owned
 # Attempts past the plan's end behave like do_nothing.
+#
+# Every call also logs `prev_alive=<bool>`: whether the pid in
+# $FAKE_HERMES_PIDFILE, written by an earlier hang_ignore_term, was
+# still alive at the moment this call started. It is how the tests see
+# the lease race from the outside.
 FAKE_HERMES = textwrap.dedent("""\
     #!/usr/bin/env python3
-    import hashlib, os, subprocess, sys, time
+    import hashlib, os, signal, subprocess, sys, time
     args = sys.argv[1:]
     log = os.environ.get("FAKE_HERMES_LOG", "/tmp/fake_hermes.log")
 
@@ -93,6 +104,20 @@ FAKE_HERMES = textwrap.dedent("""\
     is_continue = "--continue" in args
     pid = os.getpid()
     ts = time.monotonic()
+
+    # Is the agent a previous call left still running? Its pid is in the
+    # pidfile hang_ignore_term wrote.
+    prev_alive = False
+    pidfile = os.environ.get("FAKE_HERMES_PIDFILE", "")
+    if pidfile:
+        try:
+            with open(pidfile) as pf:
+                prev = int((pf.read() or "").strip())
+            os.kill(prev, 0)          # signal 0: existence only
+            prev_alive = True
+        except (FileNotFoundError, ValueError, ProcessLookupError,
+                PermissionError):
+            prev_alive = False
 
     # Each invocation consumes one entry from FAKE_HERMES_PLAN; the
     # counter is recorded before the action runs so the log line also
@@ -126,7 +151,8 @@ FAKE_HERMES = textwrap.dedent("""\
         f.write(f"call pid={pid} continue={is_continue} fd8={fd8_held} "
                 f"has_query_file={has_query_file} "
                 f"query_bytes={query_bytes} "
-                f"query_sha={query_sha} action={action} t={ts:.6f}\\n")
+                f"query_sha={query_sha} prev_alive={prev_alive} "
+                f"action={action} t={ts:.6f}\\n")
         f.flush()
 
     # Run the action against the worktree the script handed the lane.
@@ -143,6 +169,26 @@ FAKE_HERMES = textwrap.dedent("""\
         subprocess.check_call(["git", "-C", wt, *a], env=env)
     if action == "timeout":
         sys.exit(124)
+    if action == "refuse":
+        # Exactly what hermes writes when a --continue arrives while the
+        # session still has a live owner. The script reads both lines, so
+        # their shape is part of the contract under test.
+        sys.stderr.write("hermes-refusal-reason: SESSION_NOT_OWNED\\n")
+        sys.stderr.write(
+            "Session s1 already has a live owner (cli, pid 4242, "
+            "lease age 1m). The session is held by a running hermes.\\n")
+        sys.exit(1)
+    if action == "hang_ignore_term":
+        # The pid goes to a file so the next call can report whether this
+        # one was still alive when it started (prev_alive) -- the situation
+        # issue #157 reports.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        hang_pidfile = os.environ.get("FAKE_HERMES_PIDFILE", "")
+        if hang_pidfile:
+            with open(hang_pidfile, "w") as pf:
+                pf.write(str(os.getpid()))
+        time.sleep(300)
+        sys.exit(0)
     if action in ("commit", "commit_dirty", "finish", "finish_clean"):
         run_git("commit", "--allow-empty", "-m", "stub commit")
     if action == "commit_with_c_flag":
@@ -232,6 +278,9 @@ def setup_env(tmp: Path, **extra) -> dict:
 
     (tmp / "fake_hermes.state").write_text("0")
 
+    # Starts absent, so the first call of any run reads prev_alive=False.
+    pidfile = tmp / "fake_hermes.pid"
+
     (tmp / "fake.env").write_text("")
     (tmp / "hermes_home").mkdir()
     (tmp / "tmpdir").mkdir()
@@ -262,6 +311,7 @@ def setup_env(tmp: Path, **extra) -> dict:
             "GPU_GROUP_DEFAULT": "test-gpu-group",
             "TMPDIR": str(tmp / "tmpdir"),
             "FAKE_HERMES_LOG": str(log),
+            "FAKE_HERMES_PIDFILE": str(pidfile),
             "FAKE_HERMES_STATE": str(tmp / "fake_hermes.state"),
             # hermes-implement sources its env file; let an empty one
             # stand in for the operator's so HOST_BUILDER etc. do not
@@ -331,7 +381,8 @@ def test_hermes_implement_holds_gpu_lock_across_retry():
         for line in calls:
             m = re.match(r"call pid=(\d+) continue=(\S+) fd8=(\S+) "
                          r"has_query_file=(\S+) query_bytes=(\d+) "
-                         r"query_sha=(\S*) action=(\S+) t=(\S+)", line)
+                         r"query_sha=(\S*) prev_alive=(\S+) action=(\S+) "
+                         r"t=(\S+)", line)
             assert m, f"unparseable log line: {line!r}"
             assert m.group(3) == "True", (
                 f"hermes child did not inherit fd 8 from hermes-implement: "
@@ -906,6 +957,246 @@ def test_lane_identity_verifier_does_not_leak_pinned_env_to_caller():
             f"verifier clobbered caller's LANE_GIT_EMAIL: {out!r}")
 
 
+def _pid_alive(pid: int) -> bool:
+    """Is this pid still a live process? Signal 0 asks without delivering."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _fast_clocks(env: dict) -> dict:
+    """The attempt clock and the two waits below it, in seconds rather than
+    minutes, so a test that really hangs resolves in seconds."""
+    env["HERMES_IMPLEMENT_TIMEOUT"] = "2"
+    env["HERMES_IMPLEMENT_KILL_AFTER"] = "1"
+    env["HERMES_IMPLEMENT_SETTLE"] = "1"
+    return env
+
+
+def test_timed_out_attempt_leaves_no_live_process_before_the_next_attempt():
+    """Issue #157, row 1: an attempt whose agent ignores SIGTERM must not
+    still be running when the next attempt resumes the session.
+
+    The stub sleeps through SIGTERM, which is what `timeout` signals. Left
+    alone it outlives the attempt and keeps the lease, and the resume is
+    refused with SESSION_NOT_OWNED. The fix kills the attempt's whole
+    process group and waits for it to empty; the stub's prev_alive on
+    attempt 2's log line is where the test sees that."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fast_clocks(setup_env(
+            tmp,
+            HERMES_IMPLEMENT_ATTEMPTS="2",
+            # attempt 1 hangs and ignores SIGTERM; attempt 2 finishes the
+            # run. A third call would be an attempt the loop must not make.
+            FAKE_HERMES_PLAN="hang_ignore_term:finish_clean:do_nothing"))
+        repo = make_repo(tmp)
+        log = tmp / "fake_hermes.log"
+        pidfile = tmp / "fake_hermes.pid"
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "157", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stderr={proc.stderr!r}")
+
+        calls = log.read_text().splitlines()
+        assert len(calls) == 2, (
+            f"expected 2 invocations (one hung attempt, one finishing "
+            f"attempt), got {len(calls)}: {calls!r}")
+        assert "action=hang_ignore_term" in calls[0], calls[0]
+        # The pin: attempt 2 started only once attempt 1's agent was
+        # really gone. prev_alive=True here is the bug in the issue -- a
+        # resume launched on top of a live session owner.
+        assert "prev_alive=False" in calls[1], (
+            f"attempt 2 started while attempt 1's agent was still alive: "
+            f"{calls[1]!r}")
+
+        # And the hung agent is dead when the run returns, not merely by
+        # the time attempt 2 started.
+        assert pidfile.exists(), (
+            f"the hung stub never wrote its pidfile: {pidfile}")
+        hung_pid = int(pidfile.read_text().strip())
+        assert not _pid_alive(hung_pid), (
+            f"the timed-out attempt's agent (pid {hung_pid}) outlived the "
+            f"run and still holds the session lease")
+
+        # A SIGTERM-ignoring agent is what --kill-after is for, so the run
+        # says the attempt was killed rather than leaving the reader to
+        # infer it from a bare exit code.
+        assert "hermes timed out" in proc.stderr, (
+            f"the run did not report the attempt as timed out: "
+            f"{proc.stderr!r}")
+
+
+def test_refused_resume_does_not_spend_an_attempt():
+    """Issue #157, row 3: SESSION_NOT_OWNED is this run's own timing going
+    wrong, not a failed attempt. Two refusals under a one-attempt budget
+    must still leave the run able to finish."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fast_clocks(setup_env(
+            tmp,
+            # One attempt: if a refusal spent one, this run could not
+            # finish and the test would see a FAILED run instead.
+            HERMES_IMPLEMENT_ATTEMPTS="1",
+            FAKE_HERMES_PLAN="refuse:refuse:finish_clean:do_nothing"))
+        repo = make_repo(tmp)
+        log = tmp / "fake_hermes.log"
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "157", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stderr={proc.stderr!r}")
+        assert "FAILED:" not in proc.stderr, (
+            f"a run whose only two refusals were recoverable reported "
+            f"FAILED: {proc.stderr!r}")
+
+        calls = log.read_text().splitlines()
+        assert len(calls) == 3, (
+            f"expected 3 invocations (two refusals then a finish), got "
+            f"{len(calls)}: {calls!r}")
+        # All three are attempt 1: a refusal spent no attempt, so no call
+        # carried --continue and the attempt number never advanced.
+        assert all("continue=False" in c for c in calls), (
+            f"a refusal spent an attempt: {calls!r}")
+        assert "refused (session still owned)" in proc.stderr, (
+            f"the script did not report the retry: {proc.stderr!r}")
+
+
+def test_three_refusals_in_a_row_stop_the_run():
+    """Issue #157, row 4: a lease that will not free stops the run with a
+    message naming the session and its owner, instead of burning every
+    remaining attempt on refusals."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fast_clocks(setup_env(
+            tmp,
+            HERMES_IMPLEMENT_ATTEMPTS="4",
+            FAKE_HERMES_PLAN="refuse:refuse:refuse:refuse"))
+        repo = make_repo(tmp)
+        log = tmp / "fake_hermes.log"
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "157", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 6, (
+            f"expected exit 6 (the lease never freed), got "
+            f"{proc.returncode}: stderr={proc.stderr!r}")
+        assert "FAILED: session s1 pid 4242 still owned after 3 refusals" \
+                in proc.stderr, (
+            f"the stop message must name the session and its owner, taken "
+            f"from the refusal text: {proc.stderr!r}")
+
+        calls = log.read_text().splitlines()
+        # Exactly three: the fourth refusal is never made. A run that kept
+        # going would show four.
+        assert len(calls) == 3, (
+            f"expected exactly 3 invocations before the run stopped, got "
+            f"{len(calls)}: {calls!r}")
+
+
+def test_refusal_cap_still_runs_the_identity_check():
+    """A run that stops at the refusal cap must still exit 6 *and* leave
+    the commit authored by the expected identity.
+
+    A commit the agent made with `git commit --author=Wrong...` would
+    otherwise stay authored by Wrong, because verify_lane_identity -- the
+    backstop that re-authors it -- never ran. Attempt 1 commits under the
+    wrong identity, then attempts 2+ are refused until the cap.
+
+    The author field is asserted, not the whole log line: the committer
+    picks up the lane's exported GIT_COMMITTER_* either way, so an
+    assertion that merely greps for the expected name passes against the
+    unfixed script too.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fast_clocks(setup_env(
+            tmp,
+            HERMES_IMPLEMENT_ATTEMPTS="2",
+            LANE_GIT_NAME="Expected",
+            LANE_GIT_EMAIL="expected@example.invalid",
+            FAKE_HERMES_PLAN="commit_with_author:refuse:refuse:refuse:refuse"))
+        repo = make_repo(tmp)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.email"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config",
+                        "--unset", "user.name"], check=True)
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "157", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 6, (
+            f"expected exit 6 (the lease never freed), got "
+            f"{proc.returncode}: stderr={proc.stderr!r}")
+        assert "still owned after 3 refusals" in proc.stderr, (
+            f"the run did not stop at the refusal cap: "
+            f"stderr={proc.stderr!r}")
+
+        # The commit attempt 1 left, and only that one: the refusals make
+        # no commit of their own.
+        log = subprocess.run(
+            ["git", "-C", str(repo), "log", "--format=%an <%ae> | %cn <%ce>",
+             "--grep=^shape-author-flag$"],
+            capture_output=True, text=True, check=True).stdout
+        assert log.strip(), (
+            f"the agent's commit is missing; the run reauthored nothing "
+            f"to read: stderr={proc.stderr!r}")
+        author, _, committer = log.strip().partition("|")
+        assert "Expected <expected@example.invalid>" in author, (
+            f"the refusal-cap path skipped verify_lane_identity, so the "
+            f"commit is still authored by the agent's --author "
+            f"(author={author.strip()!r} committer={committer.strip()!r})")
+        assert "re-authored:" in proc.stderr, (
+            f"the verifier did not run on the refusal-cap path: "
+            f"stderr={proc.stderr!r}")
+
+
+def test_a_non_refusal_resets_the_refusal_count():
+    """Issue #157, row 5: refusals are counted in a row. An attempt that
+    got past the refusal resets the count, so a later refusal is retried
+    rather than counting as the third."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = _fast_clocks(setup_env(
+            tmp,
+            HERMES_IMPLEMENT_ATTEMPTS="2",
+            FAKE_HERMES_PLAN="refuse:commit_dirty:refuse:finish_clean"))
+        repo = make_repo(tmp)
+        log = tmp / "fake_hermes.log"
+
+        proc = subprocess.run(
+            [str(BIN), "--issue", "157", "--worktree", str(repo),
+             "--verify", "true"],
+            env=env, capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, (
+            f"hermes-implement failed: rc={proc.returncode} "
+            f"stderr={proc.stderr!r}")
+
+        calls = log.read_text().splitlines()
+        assert len(calls) == 4, (
+            f"expected 4 invocations (refuse, commit, refuse, finish), got "
+            f"{len(calls)}: {calls!r}")
+        # The second refusal was retried rather than being the third in a
+        # row: with the count unreset the run would have stopped with exit
+        # 6 before the fourth call.
+        assert "FAILED:" not in proc.stderr, (
+            f"a reset refusal count still stopped the run: {proc.stderr!r}")
+        assert "action=finish_clean" in calls[3], calls[3]
+
+
 def main() -> int:
     failures: list[tuple[str, str]] = []
     for name, fn in [
@@ -924,6 +1215,19 @@ def main() -> int:
         ("hermes-implement names the uncommitted files on the final "
          "FAILED line and does not commit leftover work itself",
          test_hermes_implement_reports_uncommitted_files_when_attempts_exhausted),
+        ("a timed-out attempt leaves no live agent before the next "
+         "attempt resumes the session",
+         test_timed_out_attempt_leaves_no_live_process_before_the_next_attempt),
+        ("a SESSION_NOT_OWNED refusal does not spend an attempt",
+         test_refused_resume_does_not_spend_an_attempt),
+        ("three refusals in a row stop the run and name the session "
+         "owner",
+         test_three_refusals_in_a_row_stop_the_run),
+        ("a run stopped at the refusal cap still re-authors a lane "
+         "commit made with `git commit --author=...`",
+         test_refusal_cap_still_runs_the_identity_check),
+        ("a non-refusal resets the refusal count",
+         test_a_non_refusal_resets_the_refusal_count),
         ("hermes-implement pins the lane identity when the agent uses "
          "`git -c user.name=... -c user.email=...`",
          test_lane_identity_env_vars_win_over_c_flag_override),
