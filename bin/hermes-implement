@@ -4,6 +4,11 @@
 # Hermes writes the change in a worktree this script does not create: the
 # caller decides the branch point, so a failed run is thrown away by deleting
 # the tree rather than by unwinding commits.
+#
+# Exit codes. 0 finished, 2 usage, 3 the lane identity would not pin, and
+# 6 a previous attempt's agent would not let go of the session lease: the
+# run stopped rather than resuming the session on top of a live writer.
+# A SESSION_NOT_OWNED refusal that never clears is the other 6.
 set -euo pipefail
 
 # readlink -f: these are installed as symlinks into a bin directory on PATH,
@@ -15,6 +20,17 @@ BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
 TIMEOUT=${HERMES_IMPLEMENT_TIMEOUT:-5400}
+# How long an attempt's agent gets to wind down after SIGTERM before the
+# whole attempt group is SIGKILLed. Without this an agent that ignores
+# SIGTERM (or a `bash -c` that will not exit while its foreground child is
+# still running) keeps the session lease, and the next attempt's
+# --continue is refused with SESSION_NOT_OWNED.
+KILL_AFTER=${HERMES_IMPLEMENT_KILL_AFTER:-60}
+# How long to wait, after an attempt is over, for its process group to
+# empty before resuming the session. This is the window the refusal race
+# lives in: the timed-out process can outlive `timeout` returning by a few
+# seconds, and the lease is freed only once it is really gone.
+SETTLE=${HERMES_IMPLEMENT_SETTLE:-120}
 
 usage() {
 	cat <<'EOF'
@@ -223,6 +239,15 @@ echo "$$" >"$ACTIVE_FILE"
 # abandoned task and a finished one both exit 0. The branch is the only
 # trustworthy completion signal: keep resuming the session until it carries a
 # commit that BASE did not.
+#
+# The attempt runs in the background and its process group is recorded in
+# ATTEMPT_PGID, because the group is how `wait_attempt_gone` recognises
+# "this attempt's processes are gone" before the next attempt resumes the
+# session. `timeout` (GNU coreutils) puts itself in a fresh process group
+# unless --foreground is given, so its pid is that group's id -- but the
+# value is read back from /proc rather than assumed, and wait_attempt_gone
+# refuses to signal a group that is this script's own.
+ATTEMPT_PGID=""
 run() {
 	local label="$1" prompt="$2"
 	shift 2
@@ -243,21 +268,112 @@ run() {
 	# earlier session. Pre-chat is `-p`. timeout wraps the whole call and the
 	# subshell re-sources the helper so `hermes_query` is in scope; timeout
 	# itself cannot call a parent's shell function directly.
+	#
+	# --kill-after is the backstop for the case KILL_AFTER's own comment
+	# describes: without it `timeout` itself can hang, waiting on a
+	# `bash -c` whose agent ignored SIGTERM. The kill-after path exits 137
+	# rather than 124, reported as its own message below.
 	PRE=("${PROFILE_ARGS[@]}")
 	POST=(--skills "${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}"
 	      --yolo --no-restore-cwd "$@")
-	timeout "$TIMEOUT" "$BASH" -c '
+	timeout --kill-after="$KILL_AFTER" "$TIMEOUT" "$BASH" -c '
 		. "$1/lib/common.sh"
 		shift
 		hermes_query "$@"
 	' bash "$BIN_DIR/.." \
 		"$HERMES -m hermes_cli.main" "$prompt_file" \
 		"$WORK/$label.stdout" "$WORK/$label.stderr" \
-		"${PRE[@]}" -- "${POST[@]}"
+		"${PRE[@]}" -- "${POST[@]}" &
+	ATTEMPT_PID=$!
+	ATTEMPT_PGID=$(attempt_pgid "$ATTEMPT_PID")
+	wait "$ATTEMPT_PID"
 	local rc=$?
+	# A group that could not be established is not a reason to skip the
+	# attempt, only a reason the settle wait cannot vouch for it. Say so
+	# once here rather than in every caller of wait_attempt_gone.
+	if [[ -z "$ATTEMPT_PGID" ]]; then
+		echo "$label: cannot identify this attempt's process group;" \
+			"the next attempt may resume on top of a live agent" >&2
+	fi
 	set -e
-	echo "$label: hermes exited $rc" >&2
+	if [[ "$rc" -eq 137 ]]; then
+		echo "$label: hermes timed out (killed after ${KILL_AFTER}s grace)" >&2
+	elif [[ "$rc" -eq 124 ]]; then
+		echo "$label: hermes timed out" >&2
+	else
+		echo "$label: hermes exited $rc" >&2
+	fi
 	tail -3 "$WORK/$label.stdout" >&2
+}
+
+# The process group `timeout` put itself in, or nothing. Read from
+# /proc/PID/stat field 3-after-comm (pgrp) rather than assumed to equal the
+# pid: it does on GNU coreutils today, but the settle wait signals this
+# group, and a wrong guess there kills processes nobody started. comm can
+# contain spaces and parentheses, so the fields are read from after its
+# last ')'.
+#
+# The read is retried: the child has just been forked and `timeout` calls
+# setpgid after exec, so the first read can still see the parent's group.
+# Returning the parent's group would be worse than returning nothing --
+# the caller signals what it is given -- so a group equal to this script's
+# own is treated as "not yet" and re-read.
+attempt_pgid() {
+	local pid="$1" stat rest pgid own deadline=$((SECONDS + 5))
+	own=$(ps -o pgid= -p $$ | tr -d ' ')
+	while (( SECONDS < deadline )); do
+		stat=$(cat "/proc/$pid/stat" 2>/dev/null) || return 0
+		rest=${stat##*') '}
+		# shellcheck disable=SC2086 # deliberate split into fields
+		set -- $rest
+		pgid="${3:-}"
+		# Still in this script's group (not yet re-grouped), or no value
+		# yet: re-read. Anything else is the attempt's own group.
+		[[ "$pgid" == "$own" ]] || { [[ "$pgid" =~ ^[0-9]+$ ]] && printf '%s\n' "$pgid"; return 0; }
+		sleep 0.1
+	done
+	return 0
+}
+
+# Pids still alive in the attempt's group, one per line; empty when the
+# group is empty or ATTEMPT_PGID was never established.
+attempt_pids() {
+	[[ -n "$ATTEMPT_PGID" ]] || return 0
+	pgrep -g "$ATTEMPT_PGID" 2>/dev/null || true
+}
+
+# Block until the previous attempt's group is empty, so the session lease
+# it holds is really free before the next attempt resumes the session.
+# A group that is still occupied after the wait is SIGKILLed (this script
+# started it) and waited on again; a group that survives that returns
+# non-zero, because resuming on top of a live writer is worse than not
+# finishing. The caller records the stop and the live-agent reason.
+wait_attempt_gone() {
+	local label="$1" deadline=$((SECONDS + SETTLE)) pids
+	[[ -n "$ATTEMPT_PGID" ]] || return 0
+	while :; do
+		pids=$(attempt_pids)
+		[[ -z "$pids" ]] && return 0
+		(( SECONDS < deadline )) || break
+		sleep 2
+	done
+	pids=$(attempt_pids)
+	[[ -z "$pids" ]] && return 0
+	echo "$label: previous attempt's agent (pids $(echo $pids | tr '\n' ' '))" \
+		"still alive after ${SETTLE}s; killing" >&2
+	# The group, not a name: another lane's hermes runs on this host and a
+	# name match would kill it.
+	kill -KILL -"$ATTEMPT_PGID" 2>/dev/null || true
+	deadline=$((SECONDS + 10))
+	while :; do
+		pids=$(attempt_pids)
+		[[ -z "$pids" ]] && return 0
+		(( SECONDS < deadline )) || break
+		sleep 1
+	done
+	echo "FAILED: $label's agent (pid $(echo "$pids" | head -1 | tr -d ' '))" \
+		"would not exit; not resuming" >&2
+	return 1
 }
 
 # Opt-in: a tmux window that follows this lane with lane-watch. hermes stays
@@ -286,9 +402,51 @@ finished() {
 		&& [[ -s "$WORK/HANDOVER.md" ]]
 }
 
+# hermes refuses `--continue` while another process still holds the
+# session lease, naming the owner:
+#
+#   hermes-refusal-reason: SESSION_NOT_OWNED
+#   Session <id> already has a live owner (cli, pid <n>, lease age <t>).
+#
+# That refusal is the run's own timing going wrong, not a failed attempt,
+# so it must not spend one: the same attempt number is retried after the
+# settle wait, up to REFUSALS times in a row. Any other outcome -- even
+# another timeout -- resets the count.
+REFUSALS=${HERMES_IMPLEMENT_REFUSALS:-3}
+REFUSAL_REASON_RE='hermes-refusal-reason: SESSION_NOT_OWNED'
+refusal_owner() { # <stderr file> -> "session <id> pid <n>"
+	local f="$1" line session pid
+	line=$(grep -m1 'already has a live owner' "$f" 2>/dev/null) || return 0
+	session=$(sed -n 's/.*Session \([^ ]*\) already has.*/\1/p' <<<"$line")
+	pid=$(sed -n 's/.*pid \([0-9]*\).*/\1/p' <<<"$line")
+	[[ -n "$session" && -n "$pid" ]] || return 0
+	printf 'session %s pid %s\n' "$session" "$pid"
+}
+
+# How the loop stops, for the tail after `done`. Both former `exit 6`
+# sites now break out of the loop instead, so a run that gives up still
+# runs the identity check, the summary and the stray-write report -- the
+# same tail a finishing run runs.
+# STOP_RC is the code that was about to be exited with; the run prints it
+# at the very end. STOP_LIVE_AGENT marks the one stop reason that must
+# skip the identity check: an attempt's agent is still alive and writing,
+# and verify_lane_identity rebases the branch to re-author it.
+STOP_RC="" STOP_LIVE_AGENT=""
 i=1
+refusals=0
 while (( i <= ATTEMPTS )); do
 	label="attempt$i"
+	# Nothing from an earlier attempt may still be writing this worktree
+	# before this one resumes the session. It runs before attempt 1 too,
+	# where ATTEMPT_PGID is empty and it is a no-op.
+	#
+	# `if !`, not a bare call: under `set -e` a bare call would abort the
+	# script from inside the loop, skipping the tail.
+	if ! wait_attempt_gone "$label"; then
+		STOP_RC=6
+		STOP_LIVE_AGENT=1
+		break
+	fi
 	if (( i == 1 )); then
 		run "$label" "$PROMPT"
 	else
@@ -333,6 +491,33 @@ EOF
 )
 		run "$label" "$REMAINING" --continue
 	fi
+	# A refusal does not spend an attempt. Retrying the same attempt
+	# number is safe here because wait_attempt_gone at the top of the
+	# loop waits for this attempt's own group to empty first, so the retry
+	# cannot resume on top of the process that held the lease.
+	if grep -qF "$REFUSAL_REASON_RE" "$WORK/$label.stderr" 2>/dev/null; then
+		refusals=$((refusals + 1))
+		if (( refusals >= REFUSALS )); then
+			echo "FAILED: $(refusal_owner "$WORK/$label.stderr")" \
+				"still owned after $refusals refusals" >&2
+			# No STOP_LIVE_AGENT here: every refusal attempt's group
+			# emptied before the next one ran, so nothing is writing
+			# this worktree now and the identity check is safe.
+			STOP_RC=6
+			break
+		fi
+		echo "$label: refused (session still owned); retrying the same" \
+			"attempt ($refusals/$REFUSALS)" >&2
+		# `if !` for the same reason as the top-of-loop call above.
+		if ! wait_attempt_gone "$label"; then
+			STOP_RC=6
+			STOP_LIVE_AGENT=1
+			break
+		fi
+		sleep "$SETTLE"
+		continue
+	fi
+	refusals=0
 	finished && break
 	i=$((i + 1))
 done
@@ -344,8 +529,20 @@ exec 8>&-
 # pushes with the right identity. The exit code names the refusal
 # (1 identity, 2 rewritten history, 3 base unresolved, 4 tree
 # changed, 5 rebase failed).
-verify_lane_identity "$WORKTREE" "$BASE" "$WORK/HANDOVER.md" || IDENTITY_RC=$?
-IDENTITY_RC=${IDENTITY_RC:-0}
+#
+# Skipped on the one stop reason where a live agent is still writing this
+# worktree: re-authoring replays the lane's commits with a rebase, and
+# rebasing under a live writer is how a tree gets half-rewritten. The
+# commit is then reported as unverified rather than silently left as the
+# agent wrote it. Every other stop reason -- including the refusal cap,
+# where each attempt's group emptied before the next started -- verifies
+# as usual.
+IDENTITY_RC=0
+if [[ -n "$STOP_LIVE_AGENT" ]]; then
+	echo "IDENTITY: not verified (an attempt's agent is still running)" >&2
+else
+	verify_lane_identity "$WORKTREE" "$BASE" "$WORK/HANDOVER.md" || IDENTITY_RC=$?
+fi
 
 # Name the missing piece on a line of its own: stranded uncommitted
 # files, a committed branch with no handover, a no-commit nothing-tried,
@@ -406,3 +603,9 @@ fi
 
 # Kept after every run: callers read HANDOVER.md, or the transcripts on failure.
 echo "$WORK"
+
+# The code the loop's break was going to exit with, now that everything
+# above it has run: 6 for a lease that would not free, 0 for a run that
+# finished or that used up its attempts. Last, so it overrides the exit
+# status of the report above it without skipping any of it.
+exit "${STOP_RC:-0}"
