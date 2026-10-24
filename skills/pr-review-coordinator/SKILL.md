@@ -18,6 +18,21 @@ Every review is posted as the reviewer and every reply comes from the author's
 side, so a thread reads as a conversation. The ledger `agent-fix-pr` keeps on
 the agent host, not this conversation, is the record of what each round did.
 
+## A pull request's life
+
+1. The lane opens a draft.
+2. The coordinator reviews the draft with `COMMENT` reviews, and the fix rounds
+   run on the draft.
+3. When nothing is left to change, a finishing run condenses the prose, squashes
+   and pushes.
+4. The coordinator waits for CI, then runs `pr-ready`, which takes the PR out of
+   draft when the gates and the prose pass.
+5. The coordinator confirms the change since its last review is prose only, then
+   approves at that sha.
+6. The coordinator merges.
+
+A draft is reviewed but never approved.
+
 ## Briefing a lane on new work
 
 New work starts as an issue. Write a brief and pass it as
@@ -49,6 +64,10 @@ each fit. Commit each verified item before starting the next.
 
 **Search first.** Before briefing, search existing issues. The brief names
 its issue.
+
+**Check the brief against the escalation list before dispatch**, not after the
+merge. Anything touching auth, access, a runner allow-list or security goes to
+the user first.
 
 **Name the wrong mechanism.** In Mechanism, write the tempting wrong
 approach next to the right one and say why each fails. The lane has
@@ -145,7 +164,9 @@ not another round's.
 
 ## Merge readiness
 
-Approval means the reviewer has no change to ask for. It comes after `pr-ready` has taken the PR out of draft and after the patch-id check, at the final sha. It does not merge. Say in the approval what the reviewer did not check, such as a merge order two PRs share.
+Approval means the reviewer has no change to ask for. It comes after `pr-ready` has taken the PR out of draft and after the prose-only check, at the final sha. It does not merge. Say in the approval what the reviewer did not check, such as a merge order two PRs share.
+
+The merge note lists every call the coordinator made on its own.
 
 ## Lane-side merge work
 
@@ -163,27 +184,142 @@ When the content is agreed, the lane runs these in order, and only these:
    commits under its own configured git identity. The brief never sets
    one (`-c user.name`, `--author`).
 3. The push.
-4. `pr-ready N <worktree>`. Takes the PR out of draft when CI, the
-   gates and the prose pass.
 
-The coordinator then reviews the change since its last review (it should
-be prose only), checks the patch-id against the approved head, and approves
-at the final sha. A draft is never approved, and approval comes last.
+The coordinator runs `pr-ready N <worktree>` after the push, once CI's checks
+have finished (`gh pr checks N --watch`): it refuses while a check is still
+running. It takes the PR out of draft when the gates and the prose pass.
 
-When the lane reports the branch is ready, the coordinator compares the
-PR's whole diff against main before and after:
+The coordinator then checks the change the finishing run made, from the
+approved head to the new head, and approves at the final sha. A draft is never
+approved, and approval comes last.
+
+### What the finishing run changed
+
+`condense-prose` edits comments, so the patch-id after a finishing run never
+matches the approved head's. The check is per file instead, and it starts by
+reading the whole diff. Docs, terms and prose files may differ.
+
+**1. Read the full finishing diff, first.** For every file the finishing run
+changed, read the diff between the approved head and the new head. The read is
+the check; the filters below only narrow it.
 
 ```bash
-git diff origin/main...<approved-sha> | git patch-id --stable
-git diff origin/main...<lane-sha>     | git patch-id --stable
+git diff <approved-sha>..<new-sha> -- <file>
 ```
 
-The first fields must match. If the base moved, compare `git diff <old-base>..<approved-sha>` with `git diff <new-base>..<lane-sha>` instead, then approve again at the new sha.
+**2. For every changed line that is not plainly code, confirm what it is.** A
+line is ignorable only when it is a real comment, and only when it is a real
+comment *outside* any string, raw string or heredoc. A line that starts with a
+comment marker is not a comment: the marker can be literal data.
+
+- A shell heredoc body is data, not a comment:
+
+  ```bash
+  #!/usr/bin/env bash
+  cat <<'PAYLOAD'
+  # endpoint=staging
+  PAYLOAD
+  ```
+
+  That `#` line is the script's output. Changing `staging` to `production`
+  changes behaviour.
+- A Rust raw string's body is data, not a comment:
+
+  ```rust
+  let s = r#"
+      // endpoint=staging
+  "#;
+  ```
+- A removed blank line may be literal data too: a blank line inside a heredoc
+  or a raw string.
+
+**3. The regex comparison is a helper, never the proof.** The filters below
+say where to look. They cannot tell a comment from a comment-shaped string, so
+a passing diff is not a passing check. Narrow the file with the filter, then
+confirm every ignored line by hand against step 2.
+
+| Extension | Filter |
+|---|---|
+| `.rs` | `^\s*//` |
+| `.sql` | `^\s*--` |
+| `.sh`, `.py`, `.toml`, `.yaml` | `^\s*#` |
+| anything else | none: compare the file whole |
+
+Drop blank lines in every case. The `.rs` filter covers `///` and `//!` as well
+as `//`. The `^\s*#` filter drops a `#!` first line, so prepend it back:
+
+```bash
+{ git show <sha>:<file> | head -n1 | grep -E '^#!'; \
+  git show <sha>:<file> | grep -vE '^\s*#' | grep -vE '^\s*$'; }
+```
+
+One filter per language, never a combined one. A combined `^\s*(#|//|--)`
+strips Rust's `#[...]` attribute lines, so a finishing run that deletes
+`#[serde(default)]` or `#[sqlx::test(migrator = …)]` leaves the file looking
+prose-only and the check passes on a code change.
+
+```bash
+# Rust: attributes are code and survive the filter.
+diff <(git show <approved-sha>:<file> | grep -vE '^\s*//' | grep -vE '^\s*$') \
+     <(git show <new-sha>:<file>       | grep -vE '^\s*//' | grep -vE '^\s*$') \
+  || echo "CHANGED: <file>"
+```
+
+**4. Anything ambiguous is a review, not an approval.** A line whose lexical
+context you cannot settle from the diff — a comment marker inside a string, a
+heredoc, a macro, a generated file, a blank line whose meaning is not visible
+— gets the normal treatment: a review round against the change, and a reply
+from the lane. Do not approve a finishing run you could not read. A
+syntax-aware comparison settles the same question, and the answer is still the
+coordinator's to give.
+
+If the base moved, make the same comparison against each file's own head.
+
+### Rules for the finishing brief
+
+- **Keep the attribution line.** The PR body's attribution line stays:
+  `condense-prose` flags it as provenance, and a lane following the skill
+  removes it. The brief names it as required.
+- **Read only the last gate line.** The gate's verdict is its last `==>` line.
+  The prove gate prints `==> FAIL (bench: …_prove …)` for its negative control
+  on every passing run; a lane that reads it as failure stops a finished run.
+  A branch whose diff earns no gate prints `nothing to gate:` and exits 0 with
+  no `==>` line; that is its pass.
+- **Run the gate in the foreground** and wait for it.
+- **Push with a lease.** Use
+  `--force-with-lease=<branch>:<reviewed sha>`. Stop on a rebase conflict
+  rather than resolving it.
 
 Squash order follows merge order, parents first. Until `agent-fix-pr`
-has a finishing mode, run steps 1–4 as one `hermes-implement` brief
-naming the PR, the approved sha, the subject and body, and the
-patch-id check.
+has a finishing mode, run steps 1–3 as one `hermes-implement` brief
+naming the PR, the approved sha, the subject and body, the four rules
+above, and the prose-only check the coordinator will run.
+
+## A lane that stops short
+
+A run that ends without producing its outputs is not finished work. The
+coordinator reads what was committed and writes a **continuation brief**. It
+names those commits, says they are not to be redone, and lists only the
+remaining steps.
+
+Rerunning the original brief redoes finished work and risks a second,
+different implementation.
+
+## Parallel lanes
+
+Lanes that each add a migration, or edit the same files, run one after
+another. When two lanes' migration numbers collide, the second renumbers in
+its continuation or finishing run, after the first merges. Lanes whose files
+don't overlap may run in parallel.
+
+## Cleanup and pausing
+
+After a merge, remove the lane's worktree, its local branch, the gate's prove
+worktrees and the bench directories for the branch, each by name. Never by
+pattern, never before the merge.
+
+**Pause lanes** means in-flight runs finish and nothing new is dispatched,
+including review rounds and finishing runs, until the user resumes.
 
 ## Skill freshness
 
