@@ -1,7 +1,15 @@
 #!/usr/bin/env bash
-# Refuse a push that would delete files main added after the branch's
-# previous push: a squash that resets onto a moved origin/main records
-# main's new files as deletions, and nothing before push sees that.
+# Refuse three pushes that would land on the remote in a shape nobody
+# intended:
+#
+#   1. a push that deletes files main added after the branch's previous
+#      push -- a squash that resets onto a moved origin/main records
+#      main's new files as deletions, and nothing before push sees that;
+#   2. a push whose base moved backwards -- the branch is now rooted on
+#      an older main than the push it replaces;
+#   3. a push whose range carries a copy of a commit main already has
+#      -- same patch, new sha.
+#
 # A PR created ready never meets pr-ready, so this check has to run on
 # every push: install with
 #   git config core.hooksPath /path/to/agent-tools/hooks
@@ -11,6 +19,12 @@ set -euo pipefail
 
 REMOTE=${1:-}
 BASE_BRANCH=${PUSH_GUARD_BASE:-main}
+# The recovery this prints names $REMOTE/$BASE_BRANCH, not the local
+# branch: the guard judges against the remote-tracking ref, and a lane
+# worktree's local branch is often stale or missing entirely. Following
+# advice that named the local branch would rebase onto old history --
+# the very thing the base-regression check refuses.
+BASE_REF=$REMOTE/$BASE_BRANCH
 
 note() { echo "push-guard: $*" >&2; }
 
@@ -54,8 +68,66 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 		continue
 	fi
 
-	# Skip new branches: with no previous push, there is nothing to
-	# compare against.
+	local_sha=$(git rev-parse --verify "$local_sha^{commit}")
+	base_sha=$(git rev-parse --verify "$BASE")
+
+	if ! merge_base=$(git merge-base "$base_sha" "$local_sha"); then
+		note "$remote_ref: no common ancestor with $BASE; skipping"
+		continue
+	fi
+
+	# ---- Check: patch already on base -------------------------------
+	#
+	# `git cherry BASE local` walks the pushed range (merge_base..local)
+	# and marks each commit '-' when its patch is already on BASE under
+	# another sha. That is the shape a mid-run rebase plus the identity
+	# verifier's re-author leaves behind: same patch, new sha, and a
+	# later merge would put main's history on the PR twice.
+	#
+	# This runs for new branches too: a branch that never pushed can
+	# still carry a duplicate, and there is no previous push to compare
+	# it against.
+	#
+	# `git cherry` prints the branch-side sha; the twin on BASE is
+	# found by patch-id, which is what `git cherry` itself matches on.
+	dup_commit=
+	dup_subject=
+	while read -r mark sha subject; do
+		if [ "$mark" = "-" ]; then
+			dup_commit=$sha
+			dup_subject=$subject
+			break
+		fi
+	done < <(git cherry -v "$base_sha" "$local_sha" 2>/dev/null || true)
+
+	if [ -n "$dup_commit" ]; then
+		dup_patch_id=$(git show "$dup_commit" | git patch-id --stable | cut -d' ' -f1)
+		twin=
+		if [ -n "$dup_patch_id" ]; then
+			while read -r pid sha; do
+				if [ "$pid" = "$dup_patch_id" ]; then
+					twin=$sha
+					break
+				fi
+			done < <(git log -p --pretty=format:'%H' "$base_sha" | git patch-id --stable)
+		fi
+
+		note "$remote_ref carries a patch that $BASE_BRANCH already has:"
+		note "  branch commit: $dup_commit $dup_subject"
+		if [ -n "$twin" ]; then
+			note "  same patch on $BASE_BRANCH: $twin"
+		fi
+		note "the push would land a second copy of $BASE_BRANCH's change under a new sha."
+		if [ "${PUSH_GUARD_ACK:-0}" = "1" ]; then
+			note "PUSH_GUARD_ACK=1: acknowledging and pushing anyway."
+		else
+			note "acknowledge by re-running with PUSH_GUARD_ACK=1, or fetch the base and rebase onto it (git fetch $REMOTE && git rebase $BASE_REF), which drops the commit whose patch is already upstream, then rebuild with squash (squash -F <msg-file>)."
+			FAIL=1
+		fi
+	fi
+
+	# The checks below compare against the branch's previous push, so a
+	# new branch has nothing to compare against.
 	if [ "$remote_sha" = "$ZERO" ]; then
 		continue
 	fi
@@ -69,14 +141,40 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 		continue
 	fi
 
-	local_sha=$(git rev-parse --verify "$local_sha^{commit}")
 	remote_sha=$(git rev-parse --verify "$remote_sha^{commit}")
-	base_sha=$(git rev-parse --verify "$BASE")
 
-	if ! merge_base=$(git merge-base "$base_sha" "$local_sha"); then
-		note "$remote_ref: no common ancestor with $BASE; skipping"
-		continue
+	# ---- Check: the base moved backwards ----------------------------
+	#
+	# The branch's previous push sat on a newer main than this push
+	# does. `git reset --soft origin/main` followed by
+	# `git commit --amend` rewrites main's tip commit instead of
+	# adding one, so the rebuilt commit is parented on main's
+	# *previous* commit. Nothing deletes anything, so the gained/deleted
+	# check above stays silent on it.
+	#
+	# old is where the branch forked for the push being replaced, new is
+	# where it forks now. new strictly older than old is a regression:
+	# moving forward (a rebase onto newer main) is intended and allowed.
+	#
+	# Main need not have moved at all for this to happen: the branch can
+	# be re-rooted on an older main commit than the one it was pushed
+	# on, and the push is what would carry that back.
+	old_base=$(git merge-base "$base_sha" "$remote_sha" 2>/dev/null || true)
+	new_base=$(git merge-base "$base_sha" "$local_sha" 2>/dev/null || true)
+	if [ -n "$old_base" ] && [ -n "$new_base" ] && [ "$new_base" != "$old_base" ] \
+		&& git merge-base --is-ancestor "$new_base" "$old_base"; then
+		note "$remote_ref would move the branch's base backwards:"
+		note "  base at the previous push: $old_base"
+		note "  base at this push:        $new_base"
+		note "the branch now forks from an older $BASE_BRANCH commit than the push it replaces did."
+		if [ "${PUSH_GUARD_ACK:-0}" = "1" ]; then
+			note "PUSH_GUARD_ACK=1: acknowledging and pushing anyway."
+		else
+			note "acknowledge by re-running with PUSH_GUARD_ACK=1, or fetch the base and rebase onto it (git fetch $REMOTE && git rebase $BASE_REF), where the three-way merge treats $BASE_BRANCH's change as already applied, then rebuild with squash (squash -F <msg-file>)."
+			FAIL=1
+		fi
 	fi
+
 	deleted=$(git diff --name-only --diff-filter=D "$merge_base" "$local_sha")
 	# gained: paths main added between the branch's previously pushed
 	# head and base. This is what a stale-base squash would clobber.
