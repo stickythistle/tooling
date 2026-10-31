@@ -21,6 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 from pr_gate import (  # noqa: E402
     Malformed,
     decide,
+    same_patch,
     third_party_post,
     validate_comments,
     verdict_reviews,
@@ -146,6 +147,43 @@ def fetch_tree(repo: str, sha: str) -> str:
     return tree
 
 
+def fetch_compare_files(repo: str, base: str, commit: str) -> list:
+    """Return the files a three-dot compare reports.
+
+    The three-dot form diffs from the merge-base, so each side is that
+    commit's own patch against the base.
+    """
+    for label, sha in (("base", base), ("commit", commit)):
+        if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
+            raise FetchError(f"compare/{base}...{commit}: {label} is not a "
+                             "full commit sha")
+    endpoint = f"repos/{repo}/compare/{base}...{commit}"
+    payload = gh_json(endpoint)
+    files = payload.get("files") if isinstance(payload, dict) else None
+    if not isinstance(files, list):
+        raise FetchError(f"{endpoint}: response had no files")
+    return files
+
+
+def fetch_patch_equal(repo: str, base: str, left: str, right: str) -> bool:
+    """True when two commits carry the same patch against a base.
+
+    A compare that fails is an error, never a quiet `REVIEW`: the gate
+    must not answer from a comparison it did not make.
+    """
+    return same_patch(fetch_compare_files(repo, base, left),
+                      fetch_compare_files(repo, base, right))
+
+
+def pr_base_sha(pr: dict, repo: str, number: str) -> str:
+    """Return the pull request's current base sha."""
+    base = pr.get("base")
+    sha = base.get("sha") if isinstance(base, dict) else None
+    if not isinstance(sha, str) or not sha:
+        raise FetchError(f"repos/{repo}/pulls/{number}: no base sha")
+    return sha
+
+
 def latest_verdict(reviews: list, reviewer: str):
     """Return the reviewer's latest verdict review, or None.
 
@@ -200,14 +238,13 @@ def main(argv: list[str] | None = None) -> int:
         head = pr.get("head")
         head = head.get("sha") if isinstance(head, dict) else None
         trees = {}
+        patch_equal = None
 
         # A tree lookup is only worth making when a tree comparison could
-        # change the answer: a stale APPROVED verdict whose commit's tree
-        # equals the head's tree means the branch was squashed. One
-        # lookup per sha REAPPROVE needs.
+        # change the answer: a stale verdict whose commit carries the
+        # same work as the head means the branch was rebased or squashed.
         verdict = latest_verdict(reviews, reviewer)
         if (verdict is not None
-                and verdict["state"] == "APPROVED"
                 and verdict["commit_id"] != head
                 and isinstance(head, str) and head):
             # The decision compares trees only when nobody has objected
@@ -222,9 +259,16 @@ def main(argv: list[str] | None = None) -> int:
                 trees[head] = fetch_tree(repo, head)
                 trees[verdict["commit_id"]] = fetch_tree(
                     repo, verdict["commit_id"])
+                # Equal trees are the same work, so the patches are only
+                # compared when the trees differ: a rebase onto a moved
+                # base leaves the patch equal and the tree different.
+                if trees[head] != trees[verdict["commit_id"]]:
+                    base = pr_base_sha(pr, repo, number)
+                    patch_equal = fetch_patch_equal(
+                        repo, base, verdict["commit_id"], head)
 
         line = decide(pr, reviews, comments, checks, trees, reviewer,
-                      args.max_rounds, implementers)
+                      args.max_rounds, implementers, patch_equal)
     except FetchError as exc:
         print(f"ERR {exc}", file=sys.stderr)
         return 1
