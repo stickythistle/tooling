@@ -157,6 +157,21 @@ pr_json=$(gh pr view "$PR" --repo "$REPO" --json headRefName,headRefOid,body,sta
 HEAD_BRANCH=$(jq -r .headRefName <<<"$pr_json")
 PR_HEAD=$(jq -r .headRefOid <<<"$pr_json")
 [[ $(jq -r .state <<<"$pr_json") == OPEN ]] || { echo "PR #$PR is not open" >&2; exit 2; }
+
+# The owner reviews; an implementer must be another account. Read before
+# any write: a round must never post without knowing who it posts as.
+# Logins are case-insensitive on GitHub, so compare case-folded.
+owner_fold() { tr '[:upper:]' '[:lower:]' <<<"$1"; }
+OWNER_SEGMENT=${REPO%%/*}
+if ! login=$(gh api user --jq .login 2>&1); then
+	echo "agent-fix-pr: could not read the gh login: ${login:-no output}" >&2
+	exit 2
+fi
+if [[ $(owner_fold "$login") == "$(owner_fold "$OWNER_SEGMENT")" ]]; then
+	echo "agent-fix-pr: $login owns $REPO; the owner reviews, an implementer must be another account" >&2
+	exit 2
+fi
+
 # The implementer works an issue; the PR's own reference is the one it is for.
 ISSUE=$(jq -r .body <<<"$pr_json" | grep -oiE '(closes|fixes|resolves|part of) #[0-9]+' | head -1 | grep -oE '[0-9]+' || true)
 [[ -n "$ISSUE" ]] || { echo "PR #$PR names no issue (Closes #N or Part of #N)" >&2; exit 2; }
@@ -358,6 +373,16 @@ fi
 # does not have yet sends the reviewer to a sha that 404s, and one that names a
 # commit the branch never got is skipped for the same reason. Each entry is
 # checked on its own, so one malformed reply cannot cost the others.
+
+# The markers the gate reads to prove the loop wrote a post. The answer
+# marker goes on the posts that answer; the status marker, on every
+# round summary. Their head is $END when pushed, else $PR_HEAD.
+loop_marker() {
+	local kind=$1
+	local head="$PR_HEAD"
+	[[ "$pushed" == true ]] && head="$END"
+	printf '<!-- pr-loop:%s review=%s head=%s -->' "$kind" "$REVIEW" "$head"
+}
 names_missing_commit() { # body
 	local word
 	for word in $(grep -oiwE '[0-9a-f]{7,40}' <<<"$1" | grep -iE '[a-f]' | grep -E '[0-9]'); do
@@ -370,7 +395,8 @@ names_missing_commit() { # body
 # the driver's, so a reader sees one update, not five small comments.
 reply_threaded() { # id body
 	local id=$1 reply_body=$2
-	gh api -X POST "repos/$REPO/pulls/$PR/comments/$id/replies" -f body="$reply_body" >/dev/null &&
+	gh api -X POST "repos/$REPO/pulls/$PR/comments/$id/replies" -f body="$reply_body
+$(loop_marker answer)" >/dev/null &&
 		replied=$((replied + 1)) || echo "could not reply to comment $id" >&2
 }
 replied=0
@@ -412,6 +438,8 @@ fi
 if [[ ${#body_bodies[@]} -gt 0 ]]; then
 	body_comment=$(printf '%s\n\n' "${body_bodies[@]}")
 	body_comment=${body_comment%$'\n\n'}
+	body_comment="$body_comment
+$(loop_marker answer)"
 	if gh api -X POST "repos/$REPO/issues/$PR/comments" -f body="$body_comment" >/dev/null; then
 		replied=$((replied + ${#body_bodies[@]}))
 	else
@@ -425,6 +453,8 @@ gh pr comment "$PR" --repo "$REPO" --body "$(cat <<EOF
 Review round $ROUND${RESUME_TAG:+ (resumed)} (review $REVIEW): **$verdict**, ${START:0:7} → ${END:0:7}, gate $gate.
 
 ${handover:-No handover was written.}
+
+$(loop_marker status)
 EOF
 )" >/dev/null || echo "could not comment on PR #$PR" >&2
 

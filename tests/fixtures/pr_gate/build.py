@@ -46,6 +46,10 @@ def marker(review_id, head):
     return f"<!-- pr-loop:answer review={review_id} head={head} -->"
 
 
+def status_marker(review_id, head):
+    return f"<!-- pr-loop:status review={review_id} head={head} -->"
+
+
 def check_run(status="COMPLETED", conclusion="SUCCESS", name="Gates"):
     return {"__typename": "CheckRun", "status": status,
             "conclusion": conclusion, "name": name}
@@ -237,6 +241,83 @@ FIXTURES = {
         "trees": {},
         "expected": "WAIT checks",
     },
+    # An unlisted login's marker reads as a person speaking.
+    "marked_post_untrusted": {
+        "pr": pr(),
+        "reviews": [
+            review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", "a-person",
+                    body=marker(701, HEAD)),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1},
+        "implementers": [IMPLEMENTER],
+        "expected": "REVIEW " + HEAD,
+    },
+    # The reviewer's own marker.
+    "marked_post_by_reviewer": {
+        "pr": pr(),
+        "reviews": [
+            review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", REVIEWER,
+                    body=marker(701, HEAD)),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1},
+        "implementers": [IMPLEMENTER],
+        "expected": "REVIEW " + HEAD,
+    },
+    # An empty implementer set trusts nothing.
+    "marked_post_no_implementers": {
+        "pr": pr(),
+        "reviews": [
+            review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                    body=marker(701, COMMIT_A)),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1, COMMIT_A: TREE_1},
+        "implementers": [],
+        "expected": "REVIEW " + HEAD,
+    },
+    # The same marked post from a listed implementer: no third-party
+    # trip, so the squash shortcut stands.
+    "trusted_marker_no_trip": {
+        "pr": pr(),
+        "reviews": [
+            review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                    body=marker(701, COMMIT_A)),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1, COMMIT_A: TREE_1},
+        "implementers": [IMPLEMENTER],
+        "expected": "REAPPROVE " + HEAD,
+    },
+    # A failed round's summary proves the loop spoke without claiming an
+    # answer, so the fix stays in hand.
+    "failed_round_summary_only": {
+        "pr": pr(),
+        "reviews": [
+            review(77, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                    body="Review round 1: no commit\n" + status_marker(77, HEAD)),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1},
+        "implementers": [IMPLEMENTER],
+        "expected": "FIX 77",
+    },
 }
 
 
@@ -252,6 +333,10 @@ def main() -> int:
             "comments": data["comments"],
             "checks": data["checks"],
             "trees": data["trees"],
+            # The logins whose answer markers this scenario trusts. The
+            # suite passes them as --implementer, exactly as the host
+            # config would.
+            "implementers": data.get("implementers", [IMPLEMENTER]),
             "expected": data["expected"],
         }
         if "reviews_pages" in data:

@@ -66,7 +66,14 @@ FAKE_GH = textwrap.dedent("""\
         emit(canned["pr"])
     elif args[0] == "api" and "-X" not in args:
         path = args[1]
-        if path.endswith("/comments"):
+        if path == "user":
+            # The driver reads its own login before any write; a test
+            # can make that read fail.
+            if canned.get("user_fail"):
+                print("gh: Bad credentials", file=sys.stderr)
+                sys.exit(1)
+            emit({"login": canned.get("user_login", "implementer")})
+        elif path.endswith("/comments"):
             emit(canned.get("comments", []))
         elif "/reviews/" in path:
             emit(canned["review"])
@@ -147,7 +154,7 @@ def make_clone(tmp: Path, slug: str) -> tuple:
 
 def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
            replies=None, review_body="Please fix.", comments=None,
-           repo=REPO, pr="5"):
+           repo=REPO, pr="5", user_login="implementer", user_fail=False):
     origin = tmp / "origin.git"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     wt = tmp / "wt"
@@ -171,6 +178,8 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
         "pr": {"headRefName": BRANCH, "headRefOid": head, "body": body, "state": "OPEN"},
         "review": {"user": {"login": "reviewer"}, "commit_id": head, "body": review_body},
         "comments": comments,
+        "user_login": user_login,
+        "user_fail": user_fail,
     }))
     fakebin = tmp / "fakebin"
     fakebin.mkdir()
@@ -629,7 +638,7 @@ def test_mixed_review_uses_each_kind_only_for_its_kind():
         assert r.returncode == 0, r.stderr
         assert ledger(ld)[-1]["replied"] == 2, ledger(ld)[-1]
         threaded = [c for c in gh_calls(tmp) if "-X" in c
-                    and c[-1].startswith("body=") and c[-1] == "body=Fixed."]
+                    and c[-1].startswith("body=Fixed.")]
         issue_posts = _issue_comment_posts(gh_calls(tmp))
         # Body reply goes to issues/<PR>/comments, not as a threaded reply.
         assert any(c[3].endswith("issues/5/comments") and "> Body item." in c[c.index("-f") + 1]
@@ -658,6 +667,22 @@ def test_unknown_comment_id_is_refused_with_a_reason_and_does_not_drop_the_rest(
 
 def _ledger_path(ledger_dir):
     return ledger_dir / "rounds.jsonl"
+
+
+MARKER_PREFIX = "<!-- pr-loop:answer review=99 head="
+STATUS_PREFIX = "<!-- pr-loop:status review=99 head="
+MARKER_SUFFIX = " -->"
+
+
+def _marker_line(body):
+    return body.split("\n")[-1]
+
+
+def _body_without_marker(value):
+    """The `-f body=...` argument with the marker line removed."""
+    lines = value.split("\n")
+    assert lines[-1].startswith(MARKER_PREFIX) and lines[-1].endswith(MARKER_SUFFIX), lines
+    return "\n".join(lines[:-1])
 
 
 def test_refuses_when_no_clone_can_fetch_the_pr_branch():
@@ -807,6 +832,120 @@ def test_refuse_setting_refuses_with_commit_name_and_nothing_pushed():
         # refused because of identity should land in the ledger with
         # a verdict that names the cause.
         assert entry["pushed"] is False, entry
+
+
+def _api_post_bodies(calls):
+    """Threaded replies and the body-reply comment (`gh api -X POST -f`)."""
+    return [c[c.index("-f") + 1].removeprefix("body=")
+            for c in calls if "-X" in c and "-f" in c]
+
+
+def _summary_body(calls):
+    """The round summary's body (`gh pr comment --body`)."""
+    bodies = [c[c.index("--body") + 1] for c in calls
+              if c[:2] == ["pr", "comment"] and "--body" in c]
+    assert len(bodies) == 1, bodies
+    return bodies[0]
+
+
+def test_a_pushed_round_answers_with_the_pushed_head_and_summaries_with_a_status_marker():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, replies=[
+            {"comment_id": 11, "body": "Fixed."},
+            {"comment_id": "review", "body": "Body answer."},
+        ])
+        r = run(env, wt)
+        assert r.returncode == 0, r.stderr
+        new_head = git(origin, "rev-parse", BRANCH)
+        # Replies carry the answer marker naming the pushed head.
+        posts = _api_post_bodies(gh_calls(tmp))
+        assert len(posts) == 2, posts
+        for body in posts:
+            assert _marker_line(body) == (
+                f"<!-- pr-loop:answer review=99 head={new_head} -->"
+            ), _marker_line(body)
+        # The summary carries the status marker, never an answer.
+        summary = _summary_body(gh_calls(tmp))
+        assert _marker_line(summary) == (
+            f"<!-- pr-loop:status review=99 head={new_head} -->"
+        ), _marker_line(summary)
+        assert MARKER_PREFIX not in summary
+        joined = "\n".join(posts + [summary])
+        assert "Fixed." in joined and "Body answer." in joined
+        assert "Review round 1 (review 99): **pushed**" in joined
+
+
+def test_a_replies_only_round_marks_the_pr_head():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="answer", replies=[
+            {"comment_id": 11, "body": "Left as is."},
+            {"comment_id": "review", "body": "Body answer."},
+        ])
+        r = run(env, wt)
+        assert r.returncode == 0, r.stderr
+        assert git(origin, "rev-parse", BRANCH) == head
+        posts = _api_post_bodies(gh_calls(tmp))
+        assert len(posts) == 2, posts
+        for body in posts:
+            assert _marker_line(body) == (
+                f"<!-- pr-loop:answer review=99 head={head} -->"
+            ), _marker_line(body)
+        summary = _summary_body(gh_calls(tmp))
+        assert _marker_line(summary) == (
+            f"<!-- pr-loop:status review=99 head={head} -->"
+        ), _marker_line(summary)
+        # Without the marker suffix the body is exactly the lane's text.
+        threaded = [p for p in posts if p.startswith("Left as is.\n")]
+        assert threaded and _body_without_marker(threaded[0]) == "Left as is."
+
+
+def test_a_failed_round_summaries_with_a_status_marker_and_no_answer():
+    # The summary of a round that committed nothing carries the status
+    # marker only: the loop spoke, and the fix stays in hand.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="none")
+        assert run(env, wt).returncode == 1
+        calls = gh_calls(tmp)
+        assert not _api_post_bodies(calls), "a failed round posts no replies"
+        summary = _summary_body(calls)
+        assert _marker_line(summary) == (
+            f"<!-- pr-loop:status review=99 head={head} -->"
+        ), _marker_line(summary)
+        assert MARKER_PREFIX not in summary
+        assert "**no commit**" in summary
+
+
+def test_running_as_the_owner_exits_2_and_makes_no_post():
+    # Logins are case-insensitive: `Jerhaad` owning `jerhaad/proj` is the
+    # same account.
+    for login, repo in (("owner", "owner/proj"),
+                        ("Jerhaad", "jerhaad/proj"),
+                        ("OWNER", "owner/proj")):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, _, _, env, ld = setup(tmp, user_login=login, repo=repo)
+            r = run(env, wt, repo=repo)
+            assert r.returncode == 2, (login, repo, r.stderr)
+            assert f"{login} owns {repo}" in r.stderr, r.stderr
+            assert "the owner reviews" in r.stderr, r.stderr
+            assert not [c for c in gh_calls(tmp) if "-X" in c], "no write"
+            assert not [c for c in gh_calls(tmp) if c[:2] == ["pr", "comment"]]
+            assert not _ledger_path(ld).exists(), "no round recorded"
+
+
+def test_an_unreadable_gh_login_exits_2_and_makes_no_post():
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, _, _, env, ld = setup(tmp, user_fail=True)
+        r = run(env, wt)
+        assert r.returncode == 2, r.stderr
+        assert "could not read the gh login" in r.stderr, r.stderr
+        assert "Bad credentials" in r.stderr, r.stderr
+        assert not [c for c in gh_calls(tmp) if "-X" in c], "no write"
+        assert not _ledger_path(ld).exists(), "no round recorded"
 
 
 def test_refuses_a_rewritten_history_in_agent_fix_pr():
