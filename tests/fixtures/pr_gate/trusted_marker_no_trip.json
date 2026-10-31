@@ -1,0 +1,54 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "4444444444444444444444444444444444444444"
+    },
+    "mergeable": "MERGEABLE"
+  },
+  "reviews": [
+    {
+      "id": 701,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "APPROVED",
+      "commit_id": "3333333333333333333333333333333333333333",
+      "submitted_at": "2026-10-20T00:00:00Z",
+      "body": "a review"
+    }
+  ],
+  "comments": [
+    {
+      "id": 1,
+      "user": {
+        "login": "harbord-st",
+        "type": "User"
+      },
+      "created_at": "2026-10-20T01:00:00Z",
+      "body": "<!-- pr-loop:answer review=701 head=3333333333333333333333333333333333333333 -->"
+    }
+  ],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "name": "Gates"
+    }
+  ],
+  "trees": {
+    "1111111111111111111111111111111111111111": "aaaaaaaa00000000000000000000000000000000",
+    "3333333333333333333333333333333333333333": "aaaaaaaa00000000000000000000000000000000"
+  },
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "REAPPROVE 1111111111111111111111111111111111111111"
+}

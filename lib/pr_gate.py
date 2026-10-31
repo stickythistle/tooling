@@ -16,6 +16,13 @@ MARKER_RE = re.compile(
     r"<!--\s*pr-loop:answer\s+review=(?P<review>\d+)\s+head=(?P<head>[0-9a-fA-F]{7,40})\s*-->"
 )
 
+# The round-status marker. The summary of every round carries it, so the
+# loop's record of a failed round is the loop's own post too. It proves
+# authorship only: it answers no review.
+STATUS_MARKER_RE = re.compile(
+    r"<!--\s*pr-loop:status\s+review=(?P<review>\d+)\s+head=(?P<head>[0-9a-fA-F]{7,40})\s*-->"
+)
+
 # A review by the reviewer that is a verdict. `COMMENTED` and `DISMISSED`
 # are absent: a thread reply is a `COMMENTED` review, and counting one as a
 # verdict is the mistake this module exists to avoid.
@@ -121,7 +128,8 @@ def _verdicts(checked_reviews: list, reviewer: str) -> list:
     the latest review and the latest verdict differ.
     """
     out = [r for r in checked_reviews
-           if r["user"] == reviewer and r["state"] in VERDICT_STATES]
+           if r["user"].casefold() == reviewer.casefold()
+           and r["state"] in VERDICT_STATES]
     # `submitted_at` is an ISO-8601 UTC timestamp, so it sorts as a string.
     # The id breaks a tie: reviews submitted in the same second are ordered
     # by id, which GitHub assigns in increasing order.
@@ -143,7 +151,8 @@ def changes_requested_count(checked_reviews: list, reviewer: str) -> int:
     latest, so a run of rejections is what pushes a PR to `ESCALATE`.
     """
     return sum(1 for r in checked_reviews
-               if r["user"] == reviewer and r["state"] == "CHANGES_REQUESTED")
+               if r["user"].casefold() == reviewer.casefold()
+               and r["state"] == "CHANGES_REQUESTED")
 
 
 def pending_checks(checks: list) -> bool:
@@ -194,31 +203,56 @@ def validate_comments(comments: list) -> list:
     return out
 
 
-def third_party_post(comments: list, reviewer: str, after: str | None) -> bool:
+def _is_our_post(entry: dict, reviewer: str, implementers) -> bool:
+    """True when the post is the loop's own: a marker whose author is a
+    case-folded member of `implementers` and not the reviewer.
+
+    Either marker proves authorship; only an answer marker answers.
+    """
+    if not (MARKER_RE.search(entry["body"])
+            or STATUS_MARKER_RE.search(entry["body"])):
+        return False
+    author = entry["user"].casefold()
+    reviewer_name = reviewer.casefold()
+    if author == reviewer_name:
+        return False
+    return any(author == name.casefold() for name in implementers)
+
+
+def third_party_post(comments: list, reviewer: str, after: str | None,
+                     implementers=frozenset()) -> bool:
     """True when someone other than the reviewer spoke after the verdict.
 
     A *third-party post* is an issue or inline comment created after the
-    verdict, written by someone other than the reviewer, with no answer
-    marker in its body.
+    verdict that speaks for itself: a marker counts only from a listed
+    implementer.
     """
     for entry in comments:
         if after is not None and entry["created_at"] <= after:
             continue
-        if entry["user"] == reviewer:
+        marked = bool(MARKER_RE.search(entry["body"])
+                      or STATUS_MARKER_RE.search(entry["body"]))
+        # The reviewer speaking plainly is no third party; the reviewer
+        # wearing the loop's marker is.
+        if entry["user"].casefold() == reviewer.casefold() and not marked:
             continue
-        if MARKER_RE.search(entry["body"]):
+        if _is_our_post(entry, reviewer, implementers):
             continue
         return True
     return False
 
 
-def answered_review(comments: list, review_id) -> bool:
-    """True when a post carries a marker naming this review id.
+def answered_review(comments: list, review_id, reviewer: str,
+                    implementers=frozenset()) -> bool:
+    """True when a listed implementer's answer marker names this review id.
 
     `comments` is a list of checked comment records, as `validate_comments`
-    returns. The marker's `review=` must name the *latest* verdict.
+    returns. The marker's `review=` must name the *latest* verdict. A
+    status marker proves authorship and answers nothing.
     """
     for entry in comments:
+        if not _is_our_post(entry, reviewer, implementers):
+            continue
         for match in MARKER_RE.finditer(entry["body"]):
             if int(match.group("review")) == review_id:
                 return True
@@ -226,12 +260,13 @@ def answered_review(comments: list, review_id) -> bool:
 
 
 def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
-           reviewer: str, max_rounds: int = 4) -> str:
+           reviewer: str, max_rounds: int = 4,
+           implementers=frozenset()) -> str:
     """Return the one line that says what the pull request needs next.
 
-    `pr` is the parsed `repos/R/pulls/N` object. `reviews` is the
-    flattened list of reviews, `comments` the flattened issue and inline
-    comments, `checks` the `statusCheckRollup` list.
+    `pr` is the parsed `repos/R/pulls/N` object; `reviews`, `comments`
+    and `checks` are the fetched lists; `implementers` are the logins
+    whose markers are trusted.
     """
     head = _pr_head(pr)
     state = pr.get("state")
@@ -266,7 +301,7 @@ def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
     # need a ruling before the verdict can be acted on. Asked once, here,
     # so the one question has one answer.
     interrupted = third_party_post(checked_comments, reviewer,
-                                    verdict["submitted_at"])
+                                    verdict["submitted_at"], implementers)
 
     # Rule 5: the verdict is stale, the tree is unchanged, and nobody has
     # objected since -> REAPPROVE <head>. The squash case: a squash
@@ -297,7 +332,7 @@ def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
 
     # Rule 9: the verdict was answered without a commit -> REVIEW <head>.
     # The rejections need a ruling.
-    if answered_review(checked_comments, verdict["id"]):
+    if answered_review(checked_comments, verdict["id"], reviewer, implementers):
         return f"REVIEW {head}"
 
     # Rule 10: too many rounds -> ESCALATE max-rounds.

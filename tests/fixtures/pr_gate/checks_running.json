@@ -22,5 +22,8 @@
     }
   ],
   "trees": {},
+  "implementers": [
+    "harbord-st"
+  ],
   "expected": "WAIT checks"
 }

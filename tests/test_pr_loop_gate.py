@@ -58,6 +58,10 @@ def marker(review_id, head):
     return f"<!-- pr-loop:answer review={review_id} head={head} -->"
 
 
+def status_marker(review_id, head):
+    return f"<!-- pr-loop:status review={review_id} head={head} -->"
+
+
 def check_run(status: str = "COMPLETED", conclusion=None,
              name: str = "Gates"):
     return {"__typename": "CheckRun", "status": status,
@@ -190,13 +194,56 @@ def scenarios():
                 [comment(1, "2026-10-20T01:00:00Z", REVIEWER)],
                 [check_run()], {}, "AGREED " + HEAD))
 
-    # Row 7d: a post carrying the answer marker is the loop's own reply,
-    # never a third party's comment, even from a different login.
+    # Row 7d: a marked post from a listed implementer is the loop's own
+    # reply, never a third party's comment.
     out.append(("marked_post_is_ours", pr(),
+                [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                         body=marker(701, HEAD))],
+                [check_run()], {}, "AGREED " + HEAD))
+
+    # A marker's format proves nothing: from a login outside the
+    # implementer set it reads as a person speaking, and rule 7 asks for
+    # a ruling.
+    out.append(("marked_post_untrusted", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "someone-else",
                          body=marker(701, HEAD))],
-                [check_run()], {}, "AGREED " + HEAD))
+                [check_run()], {}, "REVIEW " + HEAD))
+
+    # The reviewer wearing the loop's marker is a third party too.
+    out.append(("marked_post_by_reviewer", pr(),
+                [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", REVIEWER,
+                         body=marker(701, HEAD))],
+                [check_run()], {}, "REVIEW " + HEAD))
+
+    # No implementers configured: no marker is trusted.
+    out.append(("marked_post_no_implementers", pr(),
+                [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                         body=marker(701, COMMIT_A))],
+                [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
+                "REVIEW " + HEAD))
+
+    # The trusted twin of the three above: the same stale approval, the
+    # same marked post, now from a listed implementer. No third-party
+    # trip, so the squash shortcut stands.
+    out.append(("trusted_marker_no_trip", pr(),
+                [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                         body=marker(701, COMMIT_A))],
+                [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
+                "REAPPROVE " + HEAD))
+
+    # Logins are case-insensitive on GitHub: a configured implementer in
+    # a different case still matches the API login.
+    out.append(("implementer_case_differs", pr(),
+                [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                         body=marker(701, COMMIT_A))],
+                [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
+                "REAPPROVE " + HEAD))
 
     # Row 8: approved on the head.
     out.append(("agreed", pr(),
@@ -204,11 +251,33 @@ def scenarios():
                 [], [check_run()], {}, "AGREED " + HEAD))
 
     # Row 9: changes requested, and the implementer answered with a
-    # marker naming that review, without a new commit.
+    # marker naming that review, without a new commit. The round's
+    # summary (status marker) rides along; only the answer counts.
     out.append(("answered_without_commit", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
-                         body="here is the fix\n" + marker(801, HEAD))],
+                         body="here is the fix\n" + marker(801, HEAD)),
+                 comment(2, "2026-10-20T01:00:01Z", IMPLEMENTER,
+                         body="Review round 1: answered\n"
+                              + status_marker(801, HEAD))],
+                [check_run()], {}, "REVIEW " + HEAD))
+
+    # A failed round: its summary is the loop's only post. The status
+    # marker keeps it from reading as a person speaking, and claims no
+    # answer, so the fix stays in hand.
+    out.append(("failed_round_summary_only", pr(),
+                [review(77, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
+                         body="Review round 1: no commit\n"
+                              + status_marker(77, HEAD))],
+                [check_run()], {}, "FIX 77"))
+
+    # A status marker from outside the implementer set is a forgery like
+    # any other: rule 7 asks for a ruling.
+    out.append(("status_marker_untrusted", pr(),
+                [review(77, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", "someone-else",
+                         body=status_marker(77, HEAD))],
                 [check_run()], {}, "REVIEW " + HEAD))
 
     # Row 9b: marker_names_older
@@ -283,6 +352,18 @@ def scenarios():
                 {HEAD2: TREE_2, COMMIT_A: TREE_1}, "REVIEW " + HEAD2))
 
     return out
+
+
+# Which implementers each scenario configures. Scenarios not named here
+# run with the one implementer listed; `marked_post_no_implementers`
+# runs with none. The names pick the outcome; the rest is shared setup.
+def implementers_for(name):
+    if name == "marked_post_no_implementers":
+        return []
+    if name == "implementer_case_differs":
+        # The configured login differs from the API login only in case.
+        return ["Harbord-St"]
+    return [IMPLEMENTER]
 
 
 # ----- the stub gh --------------------------------------------------------
@@ -378,13 +459,18 @@ def install(data_dir: Path, pr_obj, reviews, comments, checks, trees) -> None:
 
 def run_gate(data_dir: Path, bin_dir: Path, *extra: str,
              reviewer: str | None = REVIEWER,
+             implementers: list | None = None,
              env_extra: dict | None = None):
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["STUB_DATA"] = str(data_dir)
     env.pop("REVIEWER_LOGIN", None)
+    env.pop("IMPLEMENTER_LOGINS", None)
     if reviewer is not None:
         env["REVIEWER_LOGIN"] = reviewer
+    if implementers is not None:
+        extra = (*extra, *(a for login in implementers
+                           for a in ("--implementer", login)))
     if env_extra:
         env.update(env_extra)
     return subprocess.run(
@@ -416,10 +502,12 @@ def main() -> int:
         write_stub_gh(bin_dir)
 
         for name, pr_obj, reviews, comments, checks, trees, expected in scenarios():
+            implementers = implementers_for(name)
             # 1. Through the pure function.
             try:
                 got = pr_gate.decide(pr_obj, list(reviews), list(comments),
-                                     list(checks), dict(trees), REVIEWER, 4)
+                                     list(checks), dict(trees), REVIEWER, 4,
+                                     frozenset(implementers))
             except Exception as exc:  # noqa: BLE001 - the point is to report it
                 got = f"<raised {exc!r}>"
             if got != expected:
@@ -431,7 +519,7 @@ def main() -> int:
             data.mkdir()
             install(data, pr_obj, list(reviews), list(comments),
                     list(checks), dict(trees))
-            r = run_gate(data, bin_dir)
+            r = run_gate(data, bin_dir, implementers=implementers)
             if r.returncode != 0:
                 failures.append(
                     f"{name}: gate exited {r.returncode}: "
@@ -458,12 +546,14 @@ def main() -> int:
             if "reviews_pages" in fixture:
                 reviews = [r for page in fixture["reviews_pages"] for r in page]
             expected = fixture["expected"]
+            fixture_implementers = fixture.get("implementers", [IMPLEMENTER])
 
             try:
                 got = pr_gate.decide(fixture["pr"], list(reviews),
                                      list(fixture["comments"]),
                                      list(fixture["checks"]),
-                                     dict(fixture["trees"]), REVIEWER, 4)
+                                     dict(fixture["trees"]), REVIEWER, 4,
+                                     frozenset(fixture_implementers))
             except pr_gate.Malformed as exc:
                 got = f"<malformed: {exc}>"
             if got != expected:
@@ -478,7 +568,7 @@ def main() -> int:
             if "reviews_pages" in fixture:
                 (data / "reviews.json").write_text(
                     json.dumps(fixture["reviews_pages"]))
-            r = run_gate(data, bin_dir)
+            r = run_gate(data, bin_dir, implementers=fixture_implementers)
             if r.returncode != 0:
                 failures.append(
                     f"{path.name}: gate exited {r.returncode}: "
@@ -710,20 +800,21 @@ def main() -> int:
                 f"malformed_commit: expected exit 1 with 'ERR malformed', got "
                 f"rc={r.returncode} stderr={r.stderr!r}")
 
-        # No reviewer given, by either route: exit 2, naming both.
+        # With no --reviewer and no $REVIEWER_LOGIN, the reviewer is the
+        # owner segment of the repo argument: the owner reviews their own
+        # repository. The stub's repo is owner/repo, so `owner` is V.
         data = tmp / "data_no_reviewer"
         data.mkdir()
-        install(data, pr(), [], [], [check_run()], {})
+        install(data, pr(),
+                [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z",
+                        login="owner")],
+                [], [check_run()], {})
         r = run_gate(data, bin_dir, reviewer=None)
-        if r.returncode != 2:
-            failures.append(f"no_reviewer: expected exit 2, got {r.returncode}")
-        if r.stdout != "":
+        if r.returncode != 0 or r.stdout.strip() != "AGREED " + HEAD:
             failures.append(
-                f"no_reviewer: stdout was {r.stdout!r}, expected empty")
-        if "reviewer" not in r.stderr:
-            failures.append(
-                f"no_reviewer: stderr was {r.stderr!r}, expected to name "
-                "'reviewer'")
+                f"no_reviewer: expected 'AGREED {HEAD}' from the owner "
+                f"fallback, got rc={r.returncode} stdout={r.stdout.strip()!r} "
+                f"stderr={r.stderr.strip()!r}")
 
         # The reviewer can come from the environment, with no flag.
         data = tmp / "data_env_reviewer"

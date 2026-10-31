@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """Print the one line that says what a pull request needs next.
 
-    pr-loop-gate <owner/repo> <pr> [--reviewer LOGIN] [--max-rounds N]
+    pr-loop-gate <owner/repo> <pr> [--reviewer LOGIN] [--implementer LOGIN]
+                 [--max-rounds N]
 
-Fetches the data and hands it to `lib/pr_gate.py:decide`. It writes
-nothing, and a `gh` failure ends the run with `ERR`.
+Fetches the data and hands it to `lib/pr_gate.py:decide`. A `gh`
+failure ends the run with `ERR`.
 """
 from __future__ import annotations
 
@@ -163,16 +164,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo", help="owner/repo")
     parser.add_argument("pr", help="pull request number")
     parser.add_argument("--reviewer", default=None,
-                        help="the reviewer's login (default $REVIEWER_LOGIN)")
+                        help="the reviewer's login (default $REVIEWER_LOGIN, "
+                             "then the repository owner)")
+    parser.add_argument("--implementer", action="append", default=[],
+                        metavar="LOGIN",
+                        help="an implementer whose answer markers are "
+                             "trusted; repeatable (default $IMPLEMENTER_LOGINS)")
     parser.add_argument("--max-rounds", type=int, default=4,
                         help="changes-requested rounds before ESCALATE (default 4)")
     args = parser.parse_args(argv)
-
-    reviewer = args.reviewer or os.environ.get("REVIEWER_LOGIN")
-    if not reviewer:
-        print("ERR reviewer: pass --reviewer or set REVIEWER_LOGIN",
-              file=sys.stderr)
-        return 2
 
     if "/" not in args.repo:
         print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
@@ -180,6 +180,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.pr.isdigit():
         print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
         return 2
+
+    # The reviewer is the repository's owner unless told otherwise.
+    reviewer = (args.reviewer or os.environ.get("REVIEWER_LOGIN")
+                or args.repo.split("/", 1)[0])
+    # With no implementers configured, no marker is trusted: an extra
+    # review is the safe direction.
+    implementers = frozenset(args.implementer or
+                             (os.environ.get("IMPLEMENTER_LOGINS") or
+                              "").split())
 
     repo, number = args.repo, args.pr
     try:
@@ -209,13 +218,13 @@ def main(argv: list[str] | None = None) -> int:
             # object.
             checked = validate_comments(comments)
             if not third_party_post(checked, reviewer,
-                                    verdict["submitted_at"]):
+                                    verdict["submitted_at"], implementers):
                 trees[head] = fetch_tree(repo, head)
                 trees[verdict["commit_id"]] = fetch_tree(
                     repo, verdict["commit_id"])
 
         line = decide(pr, reviews, comments, checks, trees, reviewer,
-                      args.max_rounds)
+                      args.max_rounds, implementers)
     except FetchError as exc:
         print(f"ERR {exc}", file=sys.stderr)
         return 1
