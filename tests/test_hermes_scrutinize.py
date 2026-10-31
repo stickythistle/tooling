@@ -95,19 +95,22 @@ def run_pair(profiles: tuple[str, str]) -> list[tuple[str, str, float]]:
             out, err = p.communicate(timeout=30)
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
-        # Log lines have the fixed shape `<kind> <profile> <ts>` followed
-            # by zero or more `key=value` attributes (no spaces inside). Split
-            # the line on whitespace with a 3-token cap so the trailing
-            # attributes stay in the third slot; the test only needs the kind
-            # and the timestamp.
-            def parse_line(line):
-                parts = line.split(None, 3)
-                return parts[0], parts[1], float(parts[2])
-            events = []
-            for line in (tmp / "agent.log").read_text().splitlines():
-                kind, profile, ts = parse_line(line)
-                events.append((kind, profile, ts))
-            return events
+        # Read the log only after every review has exited: leaving the
+        # TemporaryDirectory deletes it, and a reviewer still waiting for
+        # the slot dies with it.
+
+        # A log line is `<kind> <profile> <ts>` plus optional `key=value`
+        # attributes with no spaces inside. A 3-token cap keeps the
+        # trailing attributes grouped; the test needs the kind and the
+        # timestamp.
+        def parse_line(line):
+            parts = line.split(None, 3)
+            return parts[0], parts[1], float(parts[2])
+        events = []
+        for line in (tmp / "agent.log").read_text().splitlines():
+            kind, profile, ts = parse_line(line)
+            events.append((kind, profile, ts))
+        return events
 
 
 def run_n(profiles: tuple[str, ...],
@@ -169,7 +172,9 @@ def all_overlap(events) -> bool:
 
 
 def test_same_profile_runs_one_at_a_time():
-    assert not overlapped(run_pair(("rev", "rev")))
+    events = run_pair(("rev", "rev"))
+    assert not overlapped(events), \
+        f"expected no overlap on a 1-slot profile, got {events}"
 
 
 def test_different_profiles_run_together():
