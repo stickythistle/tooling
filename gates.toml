@@ -30,6 +30,13 @@ name = "pr-ready tests"
 when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
 run = "python3 tests/test_pr_ready.py"
 
+# The gate that decides what a PR needs. `lib/pr_gate.py` is in the
+# `when` because moving the decision moves what the suite pins.
+[[gates]]
+name = "pr-loop-gate tests"
+when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
+run = "python3 tests/test_pr_loop_gate.py"
+
 [[gates]]
 name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'

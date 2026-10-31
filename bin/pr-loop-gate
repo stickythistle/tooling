@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Print the one line that says what a pull request needs next.
+
+    pr-loop-gate <owner/repo> <pr> [--reviewer LOGIN] [--max-rounds N]
+
+Fetches the data and hands it to `lib/pr_gate.py:decide`. It writes
+nothing, and a `gh` failure ends the run with `ERR`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from pr_gate import (  # noqa: E402
+    Malformed,
+    decide,
+    third_party_post,
+    validate_comments,
+    verdict_reviews,
+)
+
+
+class FetchError(Exception):
+    """A `gh` call failed. `endpoint` names what was being asked for."""
+
+
+def gh(endpoint: str, *args: str) -> str:
+    """Run one `gh api` call and return its stdout.
+
+    A non-zero exit is a failure naming the endpoint.
+    """
+    cmd = ["gh", "api", endpoint, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"{endpoint}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"{endpoint}: {reason}")
+    return proc.stdout
+
+
+def gh_json(endpoint: str, *args: str):
+    """Run one `gh api` call and parse its stdout as JSON."""
+    out = gh(endpoint, *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"{endpoint}: response was not JSON: {exc}") from exc
+
+
+def flatten_pages(payload, endpoint: str) -> list:
+    """Flatten the array-of-pages `--slurp` returns into one list.
+
+    `gh api --paginate --slurp` wraps each page in an outer array, so the
+    output is an array of arrays. `--slurp` refuses `--jq`, so the
+    flattening happens here.
+    """
+    if not isinstance(payload, list):
+        raise FetchError(f"{endpoint}: response was not an array")
+    out = []
+    for page in payload:
+        if not isinstance(page, list):
+            raise FetchError(f"{endpoint}: a page was not an array")
+        out.extend(page)
+    return out
+
+
+def fetch_reviews(repo: str, number: str) -> list:
+    """Fetch every review on the pull request, flattened across pages."""
+    endpoint = f"repos/{repo}/pulls/{number}/reviews"
+    return flatten_pages(gh_json(endpoint, "--paginate", "--slurp"), endpoint)
+
+
+def fetch_comments(repo: str, number: str) -> list:
+    """Fetch issue comments and inline comments together.
+
+    Both are posts a person or the loop can make on the pull request, and
+    the decision treats them the same way, so they are fetched as two
+    lists and concatenated.
+    """
+    out = []
+    for endpoint in (f"repos/{repo}/issues/{number}/comments",
+                     f"repos/{repo}/pulls/{number}/comments"):
+        out.extend(flatten_pages(
+            gh_json(endpoint, "--paginate", "--slurp"), endpoint))
+    return out
+
+
+def fetch_checks(repo: str, number: str) -> list:
+    """Fetch the head's check rollup.
+
+    `statusCheckRollup` mixes `CheckRun` and `StatusContext` entries; they
+    are told apart by `__typename`, in the decision.
+
+    Read from `gh pr view --json statusCheckRollup`: it is a union, and a
+    GraphQL query could not reach the entries.
+    """
+    proc = subprocess.run(
+        ["gh", "pr", "view", number, "-R", repo, "--json", "statusCheckRollup"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"statusCheckRollup: {reason}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"statusCheckRollup: response was not JSON: {exc}") from exc
+    rollup = payload.get("statusCheckRollup") if isinstance(payload, dict) else None
+    if rollup is None:
+        # A pull request with no checks reports a null rollup. That is
+        # "there is nothing to wait for", not a failure.
+        return []
+    if not isinstance(rollup, list):
+        raise FetchError("statusCheckRollup: rollup was not an array")
+    return rollup
+
+
+def fetch_tree(repo: str, sha: str) -> str:
+    """Return the tree sha of a commit.
+
+    The endpoint needs the full 40-character sha; an abbreviated one
+    returns 404. The length is checked anyway: a shortened sha reads as a
+    missing tree and turns a squash into a plain `REVIEW`.
+    """
+    if len(sha) != 40 or not all(c in "0123456789abcdef" for c in sha.lower()):
+        raise FetchError(f"git/commits/{sha}: not a full commit sha")
+    endpoint = f"repos/{repo}/git/commits/{sha}"
+    payload = gh_json(endpoint)
+    try:
+        tree = payload["tree"]["sha"]
+    except (KeyError, TypeError) as exc:
+        raise FetchError(f"{endpoint}: response had no tree") from exc
+    if not isinstance(tree, str) or not tree:
+        raise FetchError(f"{endpoint}: response had no tree sha")
+    return tree
+
+
+def latest_verdict(reviews: list, reviewer: str):
+    """Return the reviewer's latest verdict review, or None.
+
+    Read through the same helper the decision uses, so the fetcher and the
+    decision cannot disagree about what V is.
+    """
+    verdicts = verdict_reviews(reviews, reviewer)
+    return verdicts[-1] if verdicts else None
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pr-loop-gate",
+        description="Print the one line that says what a pull request needs next.",
+    )
+    parser.add_argument("repo", help="owner/repo")
+    parser.add_argument("pr", help="pull request number")
+    parser.add_argument("--reviewer", default=None,
+                        help="the reviewer's login (default $REVIEWER_LOGIN)")
+    parser.add_argument("--max-rounds", type=int, default=4,
+                        help="changes-requested rounds before ESCALATE (default 4)")
+    args = parser.parse_args(argv)
+
+    reviewer = args.reviewer or os.environ.get("REVIEWER_LOGIN")
+    if not reviewer:
+        print("ERR reviewer: pass --reviewer or set REVIEWER_LOGIN",
+              file=sys.stderr)
+        return 2
+
+    if "/" not in args.repo:
+        print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+        return 2
+    if not args.pr.isdigit():
+        print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
+        return 2
+
+    repo, number = args.repo, args.pr
+    try:
+        pr = gh_json(f"repos/{repo}/pulls/{number}")
+        reviews = fetch_reviews(repo, number)
+        comments = fetch_comments(repo, number)
+        checks = fetch_checks(repo, number)
+
+        head = pr.get("head")
+        head = head.get("sha") if isinstance(head, dict) else None
+        trees = {}
+
+        # A tree lookup is only worth making when a tree comparison could
+        # change the answer: a stale APPROVED verdict whose commit's tree
+        # equals the head's tree means the branch was squashed. One
+        # lookup per sha REAPPROVE needs.
+        verdict = latest_verdict(reviews, reviewer)
+        if (verdict is not None
+                and verdict["state"] == "APPROVED"
+                and verdict["commit_id"] != head
+                and isinstance(head, str) and head):
+            # The decision compares trees only when nobody has objected
+            # since the verdict, so the fetch looks them up only then.
+            #
+            # The comments are checked the way the decision checks them:
+            # `third_party_post` reads a login, not the API's nested user
+            # object.
+            checked = validate_comments(comments)
+            if not third_party_post(checked, reviewer,
+                                    verdict["submitted_at"]):
+                trees[head] = fetch_tree(repo, head)
+                trees[verdict["commit_id"]] = fetch_tree(
+                    repo, verdict["commit_id"])
+
+        line = decide(pr, reviews, comments, checks, trees, reviewer,
+                      args.max_rounds)
+    except FetchError as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 1
+    except Malformed as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 1
+
+    print(line)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
