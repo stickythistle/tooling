@@ -1,0 +1,71 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "5555555555555555555555555555555555555555"
+    },
+    "mergeable": true
+  },
+  "reviews": [
+    {
+      "id": 501,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "APPROVED",
+      "commit_id": "3333333333333333333333333333333333333333",
+      "submitted_at": "2026-10-20T00:00:00Z",
+      "body": "a review"
+    }
+  ],
+  "comments": [
+    {
+      "id": 1,
+      "user": {
+        "login": "ci-bot",
+        "type": "Bot"
+      },
+      "created_at": "2026-10-20T01:00:00Z",
+      "body": "the build finished"
+    }
+  ],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "name": "Gates"
+    }
+  ],
+  "trees": {
+    "1111111111111111111111111111111111111111": "bbbbbbbb00000000000000000000000000000000",
+    "3333333333333333333333333333333333333333": "aaaaaaaa00000000000000000000000000000000"
+  },
+  "compares": {
+    "5555555555555555555555555555555555555555...3333333333333333333333333333333333333333": [
+      {
+        "filename": "lib/x.py",
+        "status": "modified",
+        "patch": "--- a/lib/x.py\n+++ b/lib/x.py\n@@ -10,3 +10,3 @@ def f():\n-old line\n+new line\n keep\n"
+      }
+    ],
+    "5555555555555555555555555555555555555555...1111111111111111111111111111111111111111": [
+      {
+        "filename": "lib/x.py",
+        "status": "modified",
+        "patch": "--- a/lib/x.py\n+++ b/lib/x.py\n@@ -10,3 +10,3 @@ def f():\n-old line\n+new line\n keep\n"
+      }
+    ]
+  },
+  "patch_equal": true,
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "REAPPROVE 1111111111111111111111111111111111111111"
+}

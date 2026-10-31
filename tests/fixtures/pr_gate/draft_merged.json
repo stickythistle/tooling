@@ -1,0 +1,24 @@
+{
+  "pr": {
+    "state": "closed",
+    "merged": true,
+    "draft": true,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "5555555555555555555555555555555555555555"
+    },
+    "mergeable": true
+  },
+  "reviews": [],
+  "comments": [],
+  "checks": [],
+  "trees": {},
+  "compares": {},
+  "patch_equal": null,
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "DONE merged"
+}
