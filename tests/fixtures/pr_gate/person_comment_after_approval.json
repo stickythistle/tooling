@@ -1,0 +1,50 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "4444444444444444444444444444444444444444"
+    },
+    "mergeable": "MERGEABLE"
+  },
+  "reviews": [
+    {
+      "id": 701,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "APPROVED",
+      "commit_id": "1111111111111111111111111111111111111111",
+      "submitted_at": "2026-10-20T00:00:00Z",
+      "body": "a review"
+    }
+  ],
+  "comments": [
+    {
+      "id": 1,
+      "user": {
+        "login": "a-person",
+        "type": "User"
+      },
+      "created_at": "2026-10-20T01:00:00Z",
+      "body": "a comment"
+    }
+  ],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "name": "Gates"
+    }
+  ],
+  "trees": {
+    "1111111111111111111111111111111111111111": "aaaaaaaa00000000000000000000000000000000"
+  },
+  "expected": "REVIEW 1111111111111111111111111111111111111111"
+}

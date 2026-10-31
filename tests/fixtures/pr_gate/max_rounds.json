@@ -1,0 +1,73 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "4444444444444444444444444444444444444444"
+    },
+    "mergeable": "MERGEABLE"
+  },
+  "reviews": [
+    {
+      "id": 1,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "1111111111111111111111111111111111111111",
+      "submitted_at": "2026-10-16T00:00:00Z",
+      "body": "a review"
+    },
+    {
+      "id": 2,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "1111111111111111111111111111111111111111",
+      "submitted_at": "2026-10-17T00:00:00Z",
+      "body": "a review"
+    },
+    {
+      "id": 3,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "1111111111111111111111111111111111111111",
+      "submitted_at": "2026-10-18T00:00:00Z",
+      "body": "a review"
+    },
+    {
+      "id": 4,
+      "user": {
+        "login": "stickythistle",
+        "type": "User"
+      },
+      "state": "CHANGES_REQUESTED",
+      "commit_id": "1111111111111111111111111111111111111111",
+      "submitted_at": "2026-10-19T00:00:00Z",
+      "body": "a review"
+    }
+  ],
+  "comments": [],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "name": "Gates"
+    }
+  ],
+  "trees": {
+    "1111111111111111111111111111111111111111": "aaaaaaaa00000000000000000000000000000000"
+  },
+  "expected": "ESCALATE max-rounds"
+}
