@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Read and validate the per-repository `pr-loop.toml`.
+
+    pr-loop-config [--config FILE] [<owner/repo>]
+    pr-loop-config --list [--config FILE]
+
+`pr-loop.toml` lives in the operator's own config directory, because it
+names what a repository is allowed to do and not what a repository
+contains. It is the place the merge method, the ruleset that holds the
+merge authority, and the mode live.
+
+Every repository the file names is validated, whether or not it is the
+one asked about: a file whose second repository is broken is a file
+whose settings are partly unknown, and the tool that reads it later
+would use the broken one.
+
+A repository the file does not name is reported as shadow with no
+protections. That is the safe reading, and it is also the honest one:
+nothing has been configured for it, so nothing may merge there.
+
+Exit status is 0 when the file is readable and every repository in it is
+valid, 1 when a repository is invalid, and 2 when the file itself
+cannot be read.
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import sys
+import tomllib
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from auto_merge import (  # noqa: E402
+    ConfigError,
+    SHADOW,
+    parse_config,
+)
+
+DEFAULT_CONFIG = Path(os.environ.get(
+    "PR_LOOP_CONFIG",
+    Path.home() / ".config" / "hermes-tools" / "pr-loop.toml"))
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pr-loop-config",
+        description="Read and validate the per-repository pr-loop.toml.",
+    )
+    parser.add_argument("repo", nargs="?", default=None,
+                        help="owner/repo; omitted to report every repository")
+    parser.add_argument("--config", default=None,
+                        help=f"the pr-loop.toml to read "
+                             f"(default {DEFAULT_CONFIG})")
+    parser.add_argument("--list", action="store_true",
+                        help="name every repository the file configures")
+    args = parser.parse_args(argv)
+
+    path = Path(args.config) if args.config else DEFAULT_CONFIG
+    if not path.exists():
+        if args.repo and "/" not in args.repo:
+            print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+            return 2
+        if args.repo:
+            # No file at all: the repository has no configuration, which
+            # is shadow mode with no protections.
+            print(f"{args.repo}: auto_merge={SHADOW} merge_method=- "
+                  f"ruleset=- required_checks=- protected_paths=-")
+            return 0
+        print(f"no configuration at {path}")
+        return 0
+
+    try:
+        with path.open("rb") as fh:
+            doc = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        print(f"ERR {path}: {exc}", file=sys.stderr)
+        return 2
+    except OSError as exc:
+        print(f"ERR {path}: {exc}", file=sys.stderr)
+        return 2
+
+    names = [k for k, v in doc.items() if isinstance(v, dict)]
+    if args.list:
+        for name in sorted(names):
+            print(name)
+        return 0
+
+    # Every repository in the file is validated, not only the one asked
+    # about: a file whose second repository is broken is a file whose
+    # settings are partly unknown.
+    failures = []
+    for name in names:
+        try:
+            parse_config(name, doc)
+        except ConfigError as exc:
+            failures.append(str(exc))
+
+    if args.repo:
+        if "/" not in args.repo:
+            print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+            return 2
+        try:
+            config = parse_config(args.repo, doc)
+        except ConfigError as exc:
+            print(f"ERR {exc}", file=sys.stderr)
+            return 1
+        print(f"{args.repo}: auto_merge={config.mode} "
+              f"merge_method={config.merge_method or '-'} "
+              f"ruleset={config.ruleset or '-'} "
+              f"required_checks={','.join(config.required_checks) or '-'} "
+              f"protected_paths={','.join(config.protected_paths) or '-'} "
+              f"allow_same_family="
+              f"{'unset' if config.allow_same_family is None else config.allow_same_family}")
+
+    if failures:
+        for f in failures:
+            print(f"ERR {f}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

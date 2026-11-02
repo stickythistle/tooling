@@ -30,6 +30,14 @@ unfinished, or `gate-verify` fails. A check that never started (no steps, no log
 promoted with an annotation naming which local gates ran, so the reviewer is
 told what they are getting rather than left to infer it.
 
+**GitHub holds the merge rule, not a tool.** A repository's ruleset requires one
+approving review of the most recent push, dismisses stale approvals on push,
+requires the status checks and linear history. `pr-auto-merge` asks GitHub to
+*enable* auto-merge for one exact head; GitHub merges later, under the ruleset.
+Nothing in this repository merges a pull request. A repository whose protections
+are unknown is never enabled, because an unknown prerequisite is not a satisfied
+one.
+
 **Review, triage and implement are one pipeline, not three jobs.** Each phase
 hands the next a file rather than a conclusion. Findings that survive triage
 become issues, and the branch fixing one opens a draft PR saying `Closes #N`.
@@ -72,13 +80,89 @@ Exit 3 means *unprovable*: the gate gathered no evidence either way.
 `gate-verify` reports it on its own line, because a gate that measured nothing
 must not appear in a list headed "passed".
 
+The drivers are not gates, but they belong to the same set:
+
+| | |
+|---|---|
+| `pr-loop-gate`   | print the one line that says what a pull request needs next |
+| `pr-auto-merge`  | ask GitHub to auto-merge an agreed head, or record that it would have |
+| `pr-loop-config` | read and validate the per-repository `pr-loop.toml` |
+| `pr-merge-ledger`| record a person's outcome against the loop's decision, and report the rate |
+
+## Governed auto-merge
+
+An agreed pull request waits on a person to merge it, even when nothing is
+left to decide. The rule that decides is a repository's *ruleset*, not a
+script:
+
+    one approving review, of the most recent push
+    stale approvals dismissed on push
+    the required status checks (Gates)
+    linear history
+
+`pr-auto-merge` asks GitHub to enable auto-merge for one exact head. GitHub
+merges later, when the ruleset is satisfied, and a push after the approval
+dismisses it and stops the merge. No script here merges anything.
+
+    pr-auto-merge <owner/repo> <pr>          # decide, and act
+    pr-auto-merge <owner/repo> <pr> --check  # decide, and change nothing
+    pr-loop-config <owner/repo>              # what the configuration says
+    pr-merge-ledger rate                     # the disagreement rate
+
+### The configuration
+
+`pr-loop.toml` holds one table per repository, in
+`~/.config/hermes-tools/pr-loop.toml`. Copy `pr-loop.toml.example` and edit
+it. The merge method, the ruleset that holds the authority, the required
+checks and the mode all live there.
+
+| | |
+|---|---|
+| `auto_merge` | `"shadow"` (the default) or `"on"` |
+| `merge_method` | `"squash"` or `"rebase"` |
+| `ruleset` | the name of the ruleset that holds the merge authority |
+| `required_checks` | the checks the ruleset must require |
+| `protected_paths` | paths a loop must not merge on its own |
+| `codeowners` | where the CODEOWNERS file lives |
+| `allow_same_family` | whether the implementer and reviewer may share a model family |
+
+A repository with no table is a repository nobody configured: shadow mode, no
+protections, nothing merges.
+
+### Shadow first
+
+`auto_merge = "shadow"` records the would-merge decision in the merge ledger
+and leaves the merge to a person. The person's answer is recorded against it:
+
+    pr-merge-ledger record-outcome <owner/repo> <pr> <head> merged --by NAME
+
+The disagreement rate counts only the decisions a person answered. An
+unanswered decision is not agreement: nothing has been said against it, and
+nothing has been said for it either. Counting it as agreement would make the
+rate fall as the loop got slower, which is the wrong direction for the number
+that decides a rollout.
+
+### What the tool refuses
+
+Every one of these is a refusal, and each names what is missing:
+
+- the ruleset is absent, not enforced, or weaker than the list above;
+- the approval is on another commit, or a push landed while the decision was
+  being made;
+- a required check has not finished, or is not in the ruleset's list;
+- the pull request touches a path the repository protects -- it is approved,
+  but labelled `pr-loop:needs-merge` and left to a person;
+- `allow_same_family` has not been answered. An unanswered question is not a
+  permission.
+
 ## Setup
 
     cp hosts.env.example ~/.config/agent-tools/env    # then edit
     cp gates.toml.example /path/to/project/gates.toml # then edit, and commit it
+    cp pr-loop.toml.example ~/.config/hermes-tools/pr-loop.toml  # then edit
     export PATH="$PWD/bin:$PATH"
 
-Both example files document every field.
+Every example file documents every field.
 
 ## What you have to wire in
 
@@ -107,6 +191,16 @@ unmodified tree first. A command that could not start is reported as unprovable.
 
 Each gate inherits the blind spots of the command it runs. `gate-verify` refuses
 a branch no gate matches rather than reporting a pass it did not earn.
+
+`pr-auto-merge` reads the protections from GitHub and refuses when they are
+not what the issue asks for, but it cannot create them. The ruleset has to
+exist on the repository, and a repository whose ruleset was never written
+never auto-merges -- which is the safe direction, and also why nothing here
+is a substitute for writing the ruleset.
+
+`pr-merge-ledger`'s rate counts only the decisions a person answered, and a
+rate over a handful of decisions is not evidence. The tool reports the counts
+beside the rate so a small sample reads as the small sample it is.
 
 ## License
 

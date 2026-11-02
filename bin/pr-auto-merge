@@ -1,0 +1,409 @@
+#!/usr/bin/env python3
+"""Ask GitHub to auto-merge an agreed pull request, or record that it
+would have.
+
+    pr-auto-merge <owner/repo> <pr> [--config FILE] [--reviewer LOGIN]
+                  [--same-family|--different-family] [--check]
+
+Nothing in this repository merges a pull request. This tool asks GitHub
+to *enable* auto-merge for one exact head, and GitHub's ruleset is what
+finally merges it: one approving review of the most recent push, stale
+approvals dismissed, the required checks green, linear history. A pull
+request whose protections are unknown is never enabled, because an
+unknown prerequisite is not a satisfied one.
+
+Two modes, set per repository in `pr-loop.toml`:
+
+- `shadow` (the default): the would-merge decision is recorded in the
+  merge ledger and the merge is left to a person. The person's answer
+  is recorded against it, so the disagreement rate is measurable.
+
+- `on`: auto-merge is enabled for the agreed head, through GitHub.
+
+`--check` reports the decision and changes nothing.
+
+The exit status is 0 when a decision was reached and acted on (or would
+have been), 1 when the pull request is blocked, and 2 when the tool
+could not read what it needed.
+"""
+from __future__ import annotations
+
+import argparse
+import base64
+import json
+import os
+import subprocess
+import sys
+import tomllib
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from auto_merge import (  # noqa: E402
+    ConfigError,
+    Malformed,
+    decide,
+    parse_config,
+)
+import merge_ledger  # noqa: E402
+
+# The configuration file, per repository, in the operator's own config
+# directory. The path is overridable so a test can point at its own.
+DEFAULT_CONFIG = Path(os.environ.get(
+    "PR_LOOP_CONFIG",
+    Path.home() / ".config" / "hermes-tools" / "pr-loop.toml"))
+
+
+class FetchError(Exception):
+    """A `gh` call failed. `endpoint` names what was being asked for."""
+
+
+def gh(endpoint: str, *args: str) -> str:
+    """Run one `gh api` call and return its stdout.
+
+    A non-zero exit is a failure naming the endpoint.
+    """
+    cmd = ["gh", "api", endpoint, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"{endpoint}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"{endpoint}: {reason}")
+    return proc.stdout
+
+
+def gh_json(endpoint: str, *args: str):
+    """Run one `gh api` call and parse its stdout as JSON."""
+    out = gh(endpoint, *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"{endpoint}: response was not JSON: {exc}") from exc
+
+
+def flatten_pages(payload, endpoint: str) -> list:
+    """Flatten the array-of-pages `--slurp` returns into one list."""
+    if not isinstance(payload, list):
+        raise FetchError(f"{endpoint}: response was not an array")
+    out = []
+    for page in payload:
+        if not isinstance(page, list):
+            raise FetchError(f"{endpoint}: a page was not an array")
+        out.extend(page)
+    return out
+
+
+def fetch_reviews(repo: str, number: str) -> list:
+    """Fetch every review on the pull request, flattened across pages."""
+    endpoint = f"repos/{repo}/pulls/{number}/reviews"
+    return flatten_pages(gh_json(endpoint, "--paginate", "--slurp"), endpoint)
+
+
+def fetch_checks(repo: str, number: str) -> list:
+    """Fetch the head's check rollup.
+
+    Read from `gh pr view --json statusCheckRollup`: it is a union, and a
+    GraphQL query could not reach the entries.
+    """
+    proc = subprocess.run(
+        ["gh", "pr", "view", number, "-R", repo, "--json", "statusCheckRollup"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"statusCheckRollup: {reason}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"statusCheckRollup: response was not JSON: {exc}") from exc
+    rollup = payload.get("statusCheckRollup") if isinstance(payload, dict) else None
+    if rollup is None:
+        # A pull request with no checks reports a null rollup. That is
+        # "there is nothing to wait for", not a failure.
+        return []
+    if not isinstance(rollup, list):
+        raise FetchError("statusCheckRollup: rollup was not an array")
+    return rollup
+
+
+def fetch_rulesets(repo: str) -> list:
+    """Fetch every ruleset the repository has.
+
+    `includes_parents=false`: a ruleset inherited from an organization
+    is not one the repository's configuration names, and a repository
+    that depends on an inherited ruleset has to say so explicitly.
+
+    The query parameters are sent as query parameters (`-F` on a GET is
+    a query parameter; `-f` would send a request body, which a GET
+    ignores).
+    """
+    endpoint = f"repos/{repo}/rulesets"
+    payload = gh_json(endpoint, "--paginate", "--slurp",
+                      "-X", "GET",
+                      "-F", "includes_parents=false",
+                      "-F", "targets=branch")
+    # `--slurp` wraps each page in an outer array, so the payload is an
+    # array of arrays. A payload that is already flat is one page with
+    # no wrapper, which `--slurp` does not produce but a caller may
+    # hand over.
+    if (isinstance(payload, list) and payload
+            and all(isinstance(page, list) for page in payload)):
+        out = []
+        for page in payload:
+            out.extend(page)
+        return out
+    if not isinstance(payload, list):
+        raise FetchError(f"{endpoint}: response was not an array")
+    return payload
+
+
+def fetch_changed_paths(repo: str, number: str) -> list:
+    """Fetch the paths the pull request touches.
+
+    The `files` endpoint is paginated, and the page size is capped by
+    GitHub at 3000 files. A pull request with more files than that is
+    refused rather than silently truncated: a truncated list of changed
+    paths can miss a protected one, and a missed protected path is a
+    merge the loop was not allowed to make.
+
+    The paging parameters are query parameters: `-F` on a GET is a
+    query parameter, and `-f` would send a request body, which a GET
+    ignores.
+    """
+    endpoint = f"repos/{repo}/pulls/{number}/files"
+    out = []
+    page = 1
+    while True:
+        payload = gh_json(endpoint, "-X", "GET",
+                          "-F", "per_page=100", "-F", f"page={page}")
+        if not isinstance(payload, list):
+            raise FetchError(f"{endpoint}: response was not an array")
+        for entry in payload:
+            if not isinstance(entry, dict):
+                raise FetchError(f"{endpoint}: a file entry")
+            path = entry.get("filename")
+            if not isinstance(path, str) or not path:
+                raise FetchError(f"{endpoint}: a file entry with no filename")
+            out.append(path)
+        if len(payload) < 100:
+            break
+        page += 1
+        if page > 31:
+            raise FetchError(
+                f"{endpoint}: the pull request touches more files than can "
+                f"be listed; the protected paths cannot be checked")
+    return out
+
+
+def fetch_codeowners(repo: str, ref: str, path: str) -> str | None:
+    """Fetch the CODEOWNERS file at a ref, or None when there is none.
+
+    A repository with no CODEOWNERS file has no code owners, which is
+    not a failure: the file is optional, and its absence is reported
+    as no owners rather than as an error.
+
+    A file that exists but cannot be read is an error. A CODEOWNERS
+    file that cannot be read is a repository whose protected paths are
+    unknown, and an unknown prerequisite is not a satisfied one.
+    """
+    endpoint = f"repos/{repo}/contents/{path}"
+    proc = subprocess.run(
+        ["gh", "api", endpoint, "-X", "GET", "-F", f"ref={ref}",
+         "--jq", ".content"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        if "404" in reason or "Not Found" in reason:
+            return None
+        raise FetchError(f"{endpoint}: {reason}")
+    try:
+        return base64.b64decode(proc.stdout.strip()).decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 - any decode failure is a read failure
+        raise FetchError(f"{endpoint}: the file could not be decoded: {exc}") from exc
+
+
+def enable_auto_merge(repo: str, number: str, method: str) -> None:
+    """Ask GitHub to enable auto-merge for this pull request.
+
+    This is the only write this tool makes to the pull request, and it
+    is not a merge. GitHub merges later, on its own, when the ruleset
+    is satisfied -- and only then.
+
+    The endpoint refuses a merge method the repository does not allow,
+    which is the right answer: the configuration and the ruleset have
+    to agree, and this is where that disagreement surfaces.
+    """
+    endpoint = f"repos/{repo}/pulls/{number}/auto-merge"
+    proc = subprocess.run(
+        ["gh", "api", "-X", "PUT", endpoint,
+         "-f", f"merge_method={method}"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"{endpoint}: {reason}")
+
+
+def add_label(repo: str, number: str, label: str) -> None:
+    """Add a label to the pull request.
+
+    A label that is already there is not an error: `gh pr edit` is
+    idempotent about labels, and the caller re-runs this tool.
+    """
+    proc = subprocess.run(
+        ["gh", "pr", "edit", number, "-R", repo, "--add-label", label],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"label {label}: {reason}")
+
+
+def read_config(path: Path, repo: str):
+    """Read the configuration for one repository.
+
+    A configuration file that does not exist yields the defaults, which
+    are shadow mode and no protections: nothing merges. A file that
+    exists and cannot be parsed is an error, because a broken file is
+    a repository whose settings are unknown.
+    """
+    if not path.exists():
+        return parse_config(repo, {})
+    try:
+        with path.open("rb") as fh:
+            doc = tomllib.load(fh)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(f"{path}: {exc}") from exc
+    return parse_config(repo, doc)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pr-auto-merge",
+        description="Ask GitHub to auto-merge an agreed pull request, or "
+                    "record that it would have.",
+    )
+    parser.add_argument("repo", help="owner/repo")
+    parser.add_argument("pr", help="pull request number")
+    parser.add_argument("--config", default=None,
+                        help=f"the pr-loop.toml to read "
+                             f"(default {DEFAULT_CONFIG})")
+    parser.add_argument("--reviewer", default=None,
+                        help="the reviewer's login (default $REVIEWER_LOGIN, "
+                             "then the repository owner)")
+    parser.add_argument("--ledger", default=None,
+                        help="the merge ledger to write "
+                             f"(default {merge_ledger.LEDGER})")
+    parser.add_argument("--same-family", action="store_true", default=False,
+                        help="the implementer and the reviewer run the same "
+                             "model family")
+    parser.add_argument("--different-family", action="store_true",
+                        default=False,
+                        help="the implementer and the reviewer run "
+                             "different model families")
+    parser.add_argument("--check", action="store_true",
+                        help="report the decision and change nothing")
+    args = parser.parse_args(argv)
+
+    if "/" not in args.repo:
+        print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+        return 2
+    if not args.pr.isdigit():
+        print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
+        return 2
+    if args.same_family and args.different_family:
+        print("ERR --same-family and --different-family contradict each other",
+              file=sys.stderr)
+        return 2
+
+    reviewer = (args.reviewer or os.environ.get("REVIEWER_LOGIN")
+                or args.repo.split("/", 1)[0])
+    config_path = Path(args.config) if args.config else DEFAULT_CONFIG
+    ledger_path = Path(args.ledger) if args.ledger else merge_ledger.LEDGER
+    same_family = True if args.same_family else (
+        False if args.different_family else None)
+
+    repo, number = args.repo, args.pr
+    try:
+        config = read_config(config_path, repo)
+        pr = gh_json(f"repos/{repo}/pulls/{number}")
+        head = pr.get("head")
+        head = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(head, str) or not head:
+            raise FetchError(f"repos/{repo}/pulls/{number}: no head sha")
+
+        reviews = fetch_reviews(repo, number)
+        checks = fetch_checks(repo, number)
+        rulesets = fetch_rulesets(repo)
+        changed = fetch_changed_paths(repo, number)
+        codeowners = fetch_codeowners(repo, head, config.codeowners)
+
+        decision = decide(config, pr, reviews, checks, rulesets, codeowners,
+                          changed, reviewer, head=head,
+                          same_family=same_family)
+    except (FetchError, ConfigError, Malformed) as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 2
+
+    # The decision is about one exact head. Before anything is written,
+    # the head is re-read: a push between the fetch and the write would
+    # otherwise enable auto-merge for a commit nobody agreed to.
+    if decision.action in ("enable", "shadow"):
+        try:
+            fresh = gh_json(f"repos/{repo}/pulls/{number}")
+        except FetchError as exc:
+            print(f"ERR {exc}", file=sys.stderr)
+            return 2
+        fresh_head = fresh.get("head")
+        fresh_head = (fresh_head.get("sha")
+                      if isinstance(fresh_head, dict) else None)
+        if fresh_head != head:
+            print(f"BLOCK the head moved from {head[:7]} to "
+                  f"{(fresh_head or 'none')[:7]} while deciding",
+                  file=sys.stderr)
+            return 1
+
+    if decision.action in ("enable", "shadow"):
+        if args.check:
+            print(decision.line)
+            return 0
+        if decision.action == "enable":
+            try:
+                enable_auto_merge(repo, number, decision.method)
+            except FetchError as exc:
+                print(f"ERR {exc}", file=sys.stderr)
+                return 2
+        # Both modes record the decision. In `on` mode the record is
+        # what the rate is measured from too: a repository that
+        # auto-merges still wants to know how often a person would have
+        # disagreed with the loop.
+        merge_ledger.record_decision(ledger_path, repo, number, head,
+                                     config.mode, decision.method)
+        print(decision.line)
+        return 0
+
+    # Blocked. A pull request that touches a protected path is approved
+    # but must be merged by a person, so it is labelled for them. A
+    # pull request blocked for any other reason is not labelled: the
+    # label means "a person has to merge this", and a missing approval
+    # is not that.
+    if decision.needs_merge and not args.check:
+        try:
+            add_label(repo, number, "pr-loop:needs-merge")
+        except FetchError as exc:
+            print(f"ERR {exc}", file=sys.stderr)
+            return 2
+    print(decision.line)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
