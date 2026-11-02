@@ -365,6 +365,86 @@ def find_ruleset(rulesets: list, name: str) -> Ruleset | None:
     return None
 
 
+def find_ruleset_checks(rulesets: list, name: str) -> Ruleset | None:
+    """Return the ruleset with this name, read for its checks only.
+
+    The check union is the one thing the shadow path needs from a
+    ruleset, and it needs only two facts: whether the ruleset is
+    enforced, and which status checks it requires. `parse_ruleset`
+    refuses a ruleset whose *review* rule carries a field of the wrong
+    type, and that refusal is right for `on` mode -- where the merge
+    authority has to be read in full -- but it would abort a shadow
+    decision over a field the shadow path never consults. A decision
+    that is not recorded is a repository that is silently missing from
+    the disagreement rate.
+
+    So this reader is strict about the facts it uses and tolerant
+    about the ones it does not: a `dismiss_stale_reviews_on_push` that
+    is not a boolean is ignored here, and the required check names are
+    still read. When the *checks* cannot be read the refusal is kept,
+    because a ruleset whose required checks are unknown must not be
+    treated as one that requires none: that would silently drop checks
+    the ruleset does require, which is the fail-open direction.
+    """
+    for payload in rulesets:
+        if not isinstance(payload, dict) or payload.get("name") != name:
+            continue
+        return Ruleset(payload.get("name", name),
+                       _ruleset_enforcement(payload),
+                       required_status_checks=_ruleset_check_names(payload))
+    return None
+
+
+def _ruleset_enforcement(payload: dict) -> str:
+    """The enforcement state of a ruleset, or "" when it cannot be read.
+
+    A ruleset whose enforcement cannot be read is treated as one that
+    holds no authority: only an `active` ruleset contributes checks to
+    the union, so an unreadable enforcement contributes none, and the
+    refusal that matters -- the ruleset is not enforced -- is the one
+    `on` mode makes.
+    """
+    enforcement = payload.get("enforcement")
+    if not isinstance(enforcement, str):
+        return ""
+    return enforcement
+
+
+def _ruleset_check_names(payload: dict) -> tuple:
+    """The status check contexts a ruleset requires.
+
+    The `required_status_checks` rule is read the way `parse_ruleset`
+    reads it: a rule that is not a list, an entry that is not an
+    object, or a context that is not a string all refuse. The check
+    names are the fact the shadow path cannot do without, so an
+    unreadable one is a refusal and not an empty answer.
+    """
+    rules = payload.get("rules")
+    if not isinstance(rules, list):
+        raise Malformed("ruleset: rules")
+    for rule in rules:
+        if not isinstance(rule, dict):
+            continue
+        if rule.get("type") != RULE_REQUIRED_STATUS_CHECKS:
+            continue
+        params = rule.get("parameters")
+        if not isinstance(params, dict):
+            raise Malformed("ruleset: required_status_checks")
+        names = params.get("required_status_checks")
+        if not isinstance(names, list):
+            raise Malformed("ruleset: required_status_checks list")
+        out = []
+        for entry in names:
+            if not isinstance(entry, dict):
+                raise Malformed("ruleset: a required status check")
+            context = entry.get("context")
+            if not isinstance(context, str) or not context:
+                raise Malformed("ruleset: a required status check context")
+            out.append(context)
+        return tuple(out)
+    return ()
+
+
 # ----- CODEOWNERS ----------------------------------------------------------
 
 # A CODEOWNERS line: one or more patterns, then one or more owners.
@@ -570,8 +650,22 @@ def decide(config: RepoConfig, pr: dict, reviews: list, checks: list,
     # is what the disagreement rate is measured from -- and a
     # repository nobody configured is a repository whose rate has not
     # started yet, not one that is refused.
+    #
+    # The two modes read the ruleset differently, and the difference is
+    # about how much of it each one needs. `on` mode validates the
+    # merge authority in full, so it uses the strict reader and a
+    # ruleset it cannot read is a refusal. Shadow mode needs only the
+    # checks, so it uses the lenient one: a ruleset whose *review* rule
+    # carries a field of the wrong type is still readable for the
+    # checks it requires, and the decision is still recorded. Reading
+    # it strictly there would cost the record -- and a repository
+    # missing from the ledger is one whose disagreement rate is
+    # measured as if it had never been considered.
     if ruleset is None and config.ruleset:
-        ruleset = find_ruleset(rulesets, config.ruleset)
+        if config.mode == ON:
+            ruleset = find_ruleset(rulesets, config.ruleset)
+        else:
+            ruleset = find_ruleset_checks(rulesets, config.ruleset)
 
     # ----- the checks -----
     #

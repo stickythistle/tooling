@@ -107,6 +107,22 @@ def config(mode="on", method: "str | None" = "squash",
         codeowners=codeowners, allow_same_family=same_family)
 
 
+def malformed_ruleset(field="dismiss_stale_reviews_on_push",
+                      value="yes", checks=("Gates",)):
+    """A ruleset whose review rule carries a field of the wrong type.
+
+    GitHub sends a boolean for `dismiss_stale_reviews_on_push`; a
+    string there is outside the API's shape, so the strict reader
+    refuses the ruleset. The check names are still readable, which is
+    what the shadow path needs.
+    """
+    payload = ruleset(checks=checks)
+    for rule in payload["rules"]:
+        if rule.get("type") == "pull_request":
+            rule["parameters"][field] = value
+    return payload
+
+
 def decide(cfg, pr_obj=None, reviews=None, checks=None, rulesets=None,
            codeowners=None, paths=None, reviewer=REVIEWER,
            same_family=None, protected=()):
@@ -337,6 +353,46 @@ def decision_scenarios():
                      rulesets=[ruleset(checks=("Gates", "Nightly"))]),
                 "block", "not reported: Nightly"))
 
+    # A ruleset the strict reader refuses -- here a review rule whose
+    # `dismiss_stale_reviews_on_push` is not a boolean -- still has
+    # readable check names. In shadow mode the decision is recorded:
+    # the shadow path needs the checks, not the merge authority, and a
+    # decision that is not recorded is a repository that is missing
+    # from the disagreement rate.
+    out.append(("shadow_malformed_ruleset_is_recorded",
+                dict(cfg=config(mode="shadow", checks=("Gates",)),
+                     checks=[check_run(name="Gates")],
+                     rulesets=[malformed_ruleset()]),
+                "shadow", ""))
+
+    # The same malformed ruleset, and the checks it requires are still
+    # read: a missing one is still a missing one. Reading the ruleset
+    # leniently must not silently drop the checks it requires.
+    out.append(("shadow_malformed_ruleset_still_needs_its_checks",
+                dict(cfg=config(mode="shadow", checks=("Gates",)),
+                     checks=[check_run(name="Gates")],
+                     rulesets=[malformed_ruleset(checks=("Gates", "Nightly"))]),
+                "block", "not reported: Nightly"))
+
+    # The same malformed ruleset, and the check it requires has failed.
+    out.append(("shadow_malformed_ruleset_still_needs_green_checks",
+                dict(cfg=config(mode="shadow", checks=("Gates",)),
+                     checks=[check_run(name="Gates"),
+                             check_run(name="Nightly",
+                                       conclusion="FAILURE")],
+                     rulesets=[malformed_ruleset(checks=("Gates", "Nightly"))]),
+                "block", "did not pass: Nightly"))
+
+    # The same malformed ruleset, with every check it requires green.
+    # The decision is recorded, because the record is what the rate is
+    # measured from.
+    out.append(("shadow_malformed_ruleset_records_when_green",
+                dict(cfg=config(mode="shadow", checks=("Gates",)),
+                     checks=[check_run(name="Gates"),
+                             check_run(name="Nightly")],
+                     rulesets=[malformed_ruleset(checks=("Gates", "Nightly"))]),
+                "shadow", ""))
+
     # A ruleset that is not enforced holds no authority, so a check it
     # names is not one anybody is waiting for. The refusal names the
     # unenforced ruleset, which is the truer reason.
@@ -520,6 +576,116 @@ def check_ruleset_reader(failures):
     if other.required_approving_review_count != 0:
         failures.append(
             "a ruleset with no pull_request rule reported an approval count")
+
+
+# ----- the lenient ruleset reader -----------------------------------------
+
+def check_lenient_ruleset_reader(failures):
+    """The reader the shadow path uses is strict about the facts it
+    uses and tolerant about the ones it does not.
+
+    A ruleset the strict reader refuses -- a review rule whose
+    `dismiss_stale_reviews_on_push` is not a boolean -- still has
+    readable check names, and the shadow path needs those. Reading it
+    strictly there would cost the shadow record.
+
+    But the *checks* are the fact the shadow path cannot do without, so
+    a ruleset whose required checks cannot be read is still a refusal.
+    Treating it as one that requires no checks would silently drop
+    checks the ruleset does require, which is the fail-open direction.
+    """
+    # The lenient reader reads the checks out of a ruleset the strict
+    # reader refuses.
+    payload = malformed_ruleset(checks=("Gates", "Nightly"))
+    try:
+        auto_merge.parse_ruleset(payload)
+        failures.append(
+            "the strict reader accepted a ruleset with a malformed "
+            "dismiss_stale_reviews_on_push")
+    except auto_merge.Malformed:
+        pass
+    lenient = auto_merge.find_ruleset_checks([payload], "loop-merge")
+    if lenient is None:
+        failures.append("the lenient reader did not find the ruleset")
+    elif lenient.required_status_checks != ("Gates", "Nightly"):
+        failures.append(
+            f"the lenient reader read the checks "
+            f"{lenient.required_status_checks!r}, expected "
+            f"('Gates', 'Nightly')")
+    elif not lenient.enforced:
+        failures.append(
+            "the lenient reader lost the enforcement of the ruleset")
+
+    # A ruleset that is not enforced holds no authority, so it
+    # contributes no checks to the union.
+    disabled = auto_merge.find_ruleset_checks(
+        [ruleset(enforcement="disabled")], "loop-merge")
+    if disabled is None:
+        failures.append("the lenient reader did not find a disabled ruleset")
+    elif disabled.enforced:
+        failures.append("the lenient reader read a disabled ruleset as enforced")
+
+    # A ruleset that is not there is not one either.
+    if auto_merge.find_ruleset_checks([ruleset()], "other") is not None:
+        failures.append("the lenient reader found a ruleset that is not there")
+
+    # The checks themselves are still read strictly: a context that is
+    # not a string refuses, because a ruleset whose required checks are
+    # unknown must not be treated as one that requires none.
+    for label, names, expected in [
+        ("a check context that is not a string", [{"context": 42}], "context"),
+        ("a check entry that is not an object", ["Gates"], "required status check"),
+        ("a check list that is not a list", "Gates", "required_status_checks list"),
+    ]:
+        payload = ruleset()
+        for rule in payload["rules"]:
+            if rule.get("type") == "required_status_checks":
+                rule["parameters"]["required_status_checks"] = names
+        try:
+            auto_merge.find_ruleset_checks([payload], "loop-merge")
+            failures.append(
+                f"the lenient reader accepted {label}")
+        except auto_merge.Malformed as exc:
+            if expected not in str(exc):
+                failures.append(
+                    f"the lenient reader refused {label} with {exc!s}, "
+                    f"which does not name {expected!r}")
+
+    # A ruleset with no required_status_checks rule at all requires no
+    # checks. That is a well-formed ruleset, not a malformed one.
+    payload = ruleset(checks=None)
+    try:
+        lenient = auto_merge.find_ruleset_checks([payload], "loop-merge")
+    except auto_merge.Malformed as exc:
+        failures.append(f"the lenient reader refused a ruleset with no "
+                        f"status-check rule: {exc!s}")
+    else:
+        if lenient is None or lenient.required_status_checks:
+            failures.append(
+                "the lenient reader read checks out of a ruleset that "
+                "requires none")
+
+
+def check_on_mode_refuses_a_malformed_ruleset(failures):
+    """`on` mode validates the merge authority in full, so a ruleset it
+    cannot read is still a refusal there.
+
+    The lenient reader belongs to the shadow path, where the decision
+    is only recorded. `on` mode merges, so an unreadable ruleset is an
+    unknown prerequisite there, and an unknown prerequisite is never a
+    satisfied one.
+    """
+    cfg = config(mode="on", checks=("Gates",))
+    try:
+        decide(cfg, checks=[check_run(name="Gates")],
+               rulesets=[malformed_ruleset()])
+    except auto_merge.Malformed as exc:
+        if "dismiss_stale_reviews_on_push" not in str(exc):
+            failures.append(
+                f"the refusal {exc!s} does not name the malformed field")
+        return
+    failures.append(
+        "on mode accepted a ruleset the strict reader refuses")
 
 
 # ----- the configuration reader -------------------------------------------
@@ -999,6 +1165,68 @@ def check_driver(failures):
         elif entries[0].get("mode") != "shadow":
             failures.append("the shadow decision did not record the mode")
 
+        # ---- a malformed ruleset does not cost the shadow record ----
+        #
+        # The ruleset's review rule carries a field of the wrong type.
+        # The strict reader refuses such a ruleset, and in `on` mode
+        # that refusal is right. In shadow mode it would cost the
+        # record, and a repository with no record is one whose
+        # disagreement rate is measured as if it had never been
+        # considered. So the decision is recorded.
+        data = tmp / "shadow-malformed"
+        data.mkdir()
+        install(data, pr(), good_reviews, [check_run()],
+                [malformed_ruleset()], [])
+        config_path = tmp / "shadow-malformed.toml"
+        write_config(config_path, auto_merge="shadow", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"])
+        ledger = tmp / "shadow-malformed-ledger.jsonl"
+        r = run_driver(data, bin_dir, config_path=config_path, ledger=ledger)
+        if r.returncode != 0:
+            failures.append(
+                f"the driver exited {r.returncode} for a malformed ruleset in "
+                f"shadow mode: {r.stderr.strip()!r}")
+        elif not r.stdout.startswith("SHADOW"):
+            failures.append(
+                f"the driver printed {r.stdout.strip()!r} for a malformed "
+                f"ruleset in shadow mode")
+        if auto_merge_write(data):
+            failures.append(
+                "the driver enabled auto-merge in shadow mode with a "
+                "malformed ruleset")
+        entries = merge_ledger.load(ledger) if ledger.exists() else []
+        if not entries:
+            failures.append(
+                "the driver recorded no shadow decision for a malformed ruleset")
+        elif entries[0].get("mode") != "shadow":
+            failures.append(
+                "the shadow decision for a malformed ruleset did not record "
+                "the mode")
+
+        # ---- a malformed ruleset is still a refusal in `on` mode ----
+        data = tmp / "on-malformed"
+        data.mkdir()
+        install(data, pr(), good_reviews, [check_run()],
+                [malformed_ruleset()], [])
+        config_path = tmp / "on-malformed.toml"
+        write_config(config_path, auto_merge="on", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"],
+                     allow_same_family=True)
+        ledger = tmp / "on-malformed-ledger.jsonl"
+        r = run_driver(data, bin_dir, config_path=config_path, ledger=ledger)
+        if r.returncode != 2:
+            failures.append(
+                f"the driver exited {r.returncode} for a malformed ruleset in "
+                f"on mode; expected 2")
+        if "malformed ruleset" not in r.stderr:
+            failures.append(
+                f"the driver printed {r.stderr.strip()!r} for a malformed "
+                f"ruleset in on mode")
+        if ledger.exists():
+            failures.append(
+                "the driver recorded a decision for a malformed ruleset in "
+                "on mode")
+
         # ---- a protected path is labelled and not merged ----
         data = tmp / "protected"
         data.mkdir()
@@ -1430,6 +1658,8 @@ def main() -> int:
     # crash reports one problem where it could have reported all of
     # them.
     checks = (check_decision_scenarios, check_ruleset_reader,
+              check_lenient_ruleset_reader,
+              check_on_mode_refuses_a_malformed_ruleset,
               check_config_reader, check_codeowners, check_ledger,
               check_driver, check_tools, check_no_merge)
     for check in checks:

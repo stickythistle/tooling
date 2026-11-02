@@ -144,6 +144,14 @@ nothing has been said for it either. Counting it as agreement would make the
 rate fall as the loop got slower, which is the wrong direction for the number
 that decides a rollout.
 
+Shadow mode needs only the checks a ruleset requires, so it reads the ruleset
+for those and no further. A ruleset whose review rule carries a field of the
+wrong type is still read for its checks, and the decision is still recorded:
+a repository with no record is one whose rate is measured as if it had never
+been considered. In `on` mode the ruleset is read in full, because the merge
+authority has to be read in full, and a ruleset that cannot be read is a
+refusal there.
+
 ### What the tool refuses
 
 Every one of these is a refusal, and each names what is missing:
