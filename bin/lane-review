@@ -1,0 +1,636 @@
+#!/usr/bin/env bash
+# Take an agent lane's branch through the review loop, and stop at every step
+# that needs a judgement.
+#
+# The loop is: check the lane's commit, review it, decide what to do about
+# each finding, fix what was accepted, review again. Every step that needs
+# no judgement runs here; every step that does stops here with a named
+# refusal. A person reading this does not have to know which steps those
+# are -- the exit code says.
+#
+# What runs without judgement:
+#   - lane-settled: is the lane still writing the tree?
+#   - redaction-check: did an agent's redaction rewrite reach the source?
+#   - the diff against the merge-base: does it name files the issue never
+#     mentioned?
+#   - the review itself, and finding-check's annotation of it
+#
+# What needs judgement, and therefore stops here:
+#   - what to do about each finding (the decision file)
+#   - whether the branch is done (--done)
+#
+# Exit codes:
+#   0  nothing to do: the last round is decided and the branch is not ready
+#   1  the round needs a decision, or --done refused
+#   2  misuse
+#   3  the tree is not settled, or a hygiene check refused the commit
+#   4  --done refused: the last round had accepted findings
+#   5  --apply dispatched a fix round (the lane now has work to do)
+#
+# State lives under $AGENT_STATE_DIR, never in the worktree: a review's
+# findings and decisions are not part of the change under review, and a
+# driver that writes them into the tree would have them reviewed by the
+# next round and committed by the next lane.
+set -euo pipefail
+
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+# shellcheck source=../lib/common.sh
+. "$BIN_DIR/../lib/common.sh"
+# The gates call this checkout's tools by name, and a detached run starts
+# with whatever PATH a non-login session had.
+export PATH="$BIN_DIR:$PATH"
+
+HELPER="$BIN_DIR/../lib/lane_review.py"
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+STATE_DIR=${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}
+# The reviewer. Named here rather than taken from the ambient profile: a
+# review that runs on the same model that wrote the code has the same blind
+# spots, which is the whole reason a second model is spent.
+#
+# REVIEW_PROFILE is the operator's default reviewer, the same one
+# hermes-review-pr uses. LANE_REVIEW_PROFILE overrides it for a lane that
+# wants a different one.
+REVIEW_PROFILE=${LANE_REVIEW_PROFILE:-${REVIEW_PROFILE:-}}
+REVIEW_MODEL=${LANE_REVIEW_MODEL:-}
+# The priors file folded into the review prompt, the same one
+# hermes-review-pr folds in: the project's standing domain facts, so no
+# run rediscovers them. Optional -- a lane with no priors file still gets
+# a review.
+REVIEW_PRIORS=${REVIEW_PRIORS:-}
+# The base the diff is taken against. The fork point, not the remote tip: a
+# branch that forked three commits ago is reviewed against what it forked
+# from, and `origin/main` moves under the review.
+BASE_REF=${LANE_REVIEW_BASE:-origin/main}
+MAX_ROUNDS=${LANE_REVIEW_MAX_ROUNDS:-10}
+# How long to wait for a lane to settle before giving up on it. Zero waits
+# forever, which is right for a driver run by a person watching it.
+SETTLE_TIMEOUT=${LANE_REVIEW_SETTLE_TIMEOUT:-0}
+
+usage() {
+	cat <<'EOF'
+usage: lane-review <worktree> [--apply] [--done]
+                    [--issue N] [--repo OWNER/NAME] [--profile NAME]
+                    [--model NAME] [--base REF] [--max-rounds N]
+       lane-review ids <worktree>
+
+Runs the review loop over a lane's branch, stopping at every step that
+needs a judgement.
+
+  (no flag)  Check the lane's commit, review it, verify the findings
+             against the source, and write round-N/findings.json. Exits
+             1: the findings need decisions.
+
+  --apply    Take the decisions in round-N/decisions.json and dispatch
+             the accepted fixes to a lane. Every rejection is carried
+             into the next review, so it is not raised again. Exits 5:
+             a fix round was dispatched.
+
+  --done     Refuse unless the last round had no accepted findings. Then
+             squash the branch at its fork point, push it, and open the
+             pull request as a Draft saying `Closes #N`.
+
+  ids        Print the finding ids of the last round, one per line, so
+             the decision file can be written without reading the
+             findings by hand.
+
+The decision file is a JSON object:
+
+  {
+    "head": "<the commit the decisions are about>",
+    "decisions": [
+      {"id": "<finding id>", "decision": "accept",
+       "mechanism": "<how to fix it>", "forbid": "<the wrong fix>"},
+      {"id": "<finding id>", "decision": "reject",
+       "reason": "<why the source stays as it is>"},
+      {"id": "<finding id>", "decision": "defer", "issue": "81"}
+    ]
+  }
+
+Every finding needs a decision.
+
+The `head` field is checked against the commit the round is about: a
+decision file written about a different commit does not authorise this
+one.
+
+The state lives under $AGENT_STATE_DIR/lane-review/, never in the
+worktree.
+EOF
+	exit 2
+}
+
+WORKTREE=""
+MODE="review"
+ISSUE=""
+REPO=${DEFAULT_GH_REPO:-}
+PROFILE=""
+# `lane-review ids <worktree>` prints the finding ids of the last round, so
+# a person writing the decision file has them without reading the findings.
+SUBCOMMAND=""
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--apply) MODE="apply"; shift ;;
+	--done) MODE="done"; shift ;;
+	--issue) ISSUE="$2"; shift 2 ;;
+	--repo) REPO="$2"; shift 2 ;;
+	--profile) PROFILE="$2"; shift 2 ;;
+	--model) REVIEW_MODEL="$2"; shift 2 ;;
+	--base) BASE_REF="$2"; shift 2 ;;
+	--max-rounds) MAX_ROUNDS="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	-*) echo "lane-review: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	*) POSITIONAL+=("$1"); shift ;;
+	esac
+done
+# The one positional is the worktree, except in the `ids` form, where the
+# first positional is the subcommand and the second is the worktree.
+if [[ ${#POSITIONAL[@]} -eq 1 ]]; then
+	WORKTREE="${POSITIONAL[0]}"
+elif [[ ${#POSITIONAL[@]} -eq 2 ]]; then
+	SUBCOMMAND="${POSITIONAL[0]}"
+	WORKTREE="${POSITIONAL[1]}"
+else
+	usage
+fi
+[[ -n "$WORKTREE" ]] || usage
+
+# ---- resolve the worktree ------------------------------------------------
+
+# The worktree's own path, not the one the caller gave: a relative path or
+# a trailing slash would otherwise key the state directory under a name
+# nothing else resolves to, and two worktrees could share one record.
+if ! WORKTREE=$(git -C "$WORKTREE" rev-parse --show-toplevel 2>/dev/null); then
+	echo "lane-review: $WORKTREE is not inside a git worktree" >&2
+	exit 2
+fi
+BRANCH=$(git -C "$WORKTREE" rev-parse --abbrev-ref HEAD)
+cd "$WORKTREE"
+
+# The state directory is keyed by the worktree's path, hashed the same way
+# lane-settled and hermes-implement hash it: a path contains separators and
+# cannot be a filename, and flattening one collides two worktrees.
+WORKTREE_HASH=$(printf '%s' "$WORKTREE" | python3 -c "import hashlib,sys; print(hashlib.sha256(sys.stdin.read().encode()).hexdigest())")
+RUN_DIR="$STATE_DIR/lane-review/$WORKTREE_HASH"
+STATE_FILE="$RUN_DIR/state.json"
+LEDGER="$RUN_DIR/ledger.jsonl"
+mkdir -p "$RUN_DIR"
+
+state_get() { python3 "$HELPER" state-get "$STATE_FILE" "$1" 2>/dev/null || true; }
+state_set() { python3 "$HELPER" state-set "$STATE_FILE" "$1" "$2"; }
+
+# `lane-review ids <worktree>` prints the ids of the last round's findings,
+# so a person writing the decision file has them without reading the
+# findings by hand.
+if [[ "$SUBCOMMAND" == "ids" ]]; then
+	ROUND=$(state_get round)
+	[[ "$ROUND" =~ ^[0-9]+$ ]] && [[ "$ROUND" -ge 1 ]] || {
+		echo "lane-review: there is no round yet; run lane-review $WORKTREE first" >&2
+		exit 1
+	}
+	F="$RUN_DIR/round-$ROUND/findings.json"
+	[[ -s "$F" ]] || {
+		echo "lane-review: round $ROUND has no findings file" >&2
+		exit 1
+	}
+	python3 "$HELPER" ids --findings "$F"
+	exit 0
+fi
+[[ -z "$SUBCOMMAND" ]] || {
+	echo "lane-review: unknown subcommand: $SUBCOMMAND" >&2; usage >&2; exit 2
+}
+
+# ---- the lane must have finished ----------------------------------------
+
+# Waits for the lane to settle. Returns 0 when it has, 1 when the wait ran
+# out, 3 when the tree has drifted since the lane recorded its final.
+#
+# Drift is never waited out: somebody amended or committed on top of the
+# lane's work, and the tree is not what the lane left. Waiting for a
+# moving tree reviews nothing.
+settle() {
+	local deadline=0
+	[[ "$SETTLE_TIMEOUT" -gt 0 ]] && deadline=$((SECONDS + SETTLE_TIMEOUT))
+	while :; do
+		set +e
+		"$BIN_DIR/lane-settled" "$WORKTREE"
+		local rc=$?
+		set -e
+		case "$rc" in
+		0) return 0 ;;
+		1)
+			[[ "$deadline" -eq 0 || $SECONDS -lt $deadline ]] || return 1
+			sleep 5
+			;;
+		3) return 3 ;;
+		*) return "$rc" ;;
+		esac
+	done
+}
+
+settle || {
+	echo "lane-review: the lane has not settled; nothing was reviewed" >&2
+	exit 3
+}
+
+HEAD_SHA=$(git -C "$WORKTREE" rev-parse HEAD)
+MERGE_BASE=$(git -C "$WORKTREE" merge-base "$BASE_REF" HEAD 2>/dev/null || true)
+if [[ -z "$MERGE_BASE" ]]; then
+	echo "lane-review: no merge-base between $BASE_REF and HEAD" >&2
+	echo "  the branch does not fork from $BASE_REF; review it against a base it shares" >&2
+	exit 3
+fi
+
+# ---- hygiene -------------------------------------------------------------
+
+# The redaction artifact: an agent that rewrites secret-shaped text as
+# three asterisks eventually commits the rewrite, and nothing else can
+# see it.
+if ! VERIFY_BASE="$MERGE_BASE" "$BIN_DIR/redaction-check" "$WORKTREE" >&2; then
+	echo "lane-review: refusing to review a commit carrying a redaction artifact" >&2
+	exit 3
+fi
+
+# The files the diff names against the files the issue named. A lane that
+# was asked for one thing and changed three other things has either found
+# more than it was asked for or has wandered; both are worth a look
+# before the review spends a model on them.
+#
+# The issue's own text names the files it is about. A path is "mentioned"
+# when the issue's text contains it, or when the issue names its
+# directory (`bin/` covers `bin/lane-review`). A path the issue does not
+# mention is named in the refusal, not guessed at.
+ISSUE_TEXT=""
+if [[ -n "$ISSUE" ]]; then
+	GH_ARGS=(issue view "$ISSUE")
+	[[ -n "$REPO" ]] && GH_ARGS+=(--repo "$REPO")
+	if ! ISSUE_TEXT=$(gh "${GH_ARGS[@]}" --json body --jq .body 2>/dev/null); then
+		echo "lane-review: could not read issue $ISSUE" >&2
+		exit 2
+	fi
+fi
+
+issue_mentions() {
+	local path="$1"
+	[[ -n "$ISSUE_TEXT" ]] || return 0
+	[[ "$ISSUE_TEXT" == *"$path"* ]] && return 0
+	# A directory mention covers what is under it.
+	local dir
+	dir=$(dirname "$path")
+	[[ "$dir" != "." ]] || return 1
+	[[ "$ISSUE_TEXT" == *"$dir/"* ]] && return 0
+	return 1
+}
+
+UNMENTIONED=()
+while IFS= read -r path; do
+	[[ -n "$path" ]] || continue
+	# A test's fixture is not a change to the product; the suites are
+	# part of the change and the issue never names them.
+	case "$path" in
+	tests/* | */test_* | */tests/*) continue ;;
+	esac
+	issue_mentions "$path" || UNMENTIONED+=("$path")
+done < <(git -C "$WORKTREE" diff --name-only "$MERGE_BASE...HEAD")
+
+if [[ ${#UNMENTIONED[@]} -gt 0 ]]; then
+	echo "lane-review: refusing to review a commit that changes files the issue never mentioned:" >&2
+	printf '  - %s\n' "${UNMENTIONED[@]}" >&2
+	echo "The issue named: ${ISSUE:-<no issue>}." >&2
+	echo "Say so in the issue, or take the change out of the branch." >&2
+	exit 3
+fi
+
+# ---- the rounds ----------------------------------------------------------
+
+ROUND=$(state_get round)
+[[ "$ROUND" =~ ^[0-9]+$ ]] || ROUND=0
+NEXT_ROUND=$((ROUND + 1))
+ROUND_DIR="$RUN_DIR/round-$NEXT_ROUND"
+
+# ---- --done ---------------------------------------------------------------
+
+if [[ "$MODE" == "done" ]]; then
+	[[ "$ROUND" -ge 1 ]] || {
+		echo "lane-review: there is no round to finish; run lane-review $WORKTREE first" >&2
+		exit 1
+	}
+	FINDINGS="$RUN_DIR/round-$ROUND/findings.json"
+	DECISIONS="$RUN_DIR/round-$ROUND/decisions.json"
+	[[ -s "$FINDINGS" ]] || {
+		echo "lane-review: round $ROUND has no findings file" >&2
+		exit 1
+	}
+	# The decisions must exist and be usable: a branch is finished when
+	# the last round was decided and nothing was accepted in it.
+	if [[ ! -s "$DECISIONS" ]]; then
+		echo "lane-review: round $ROUND has no decisions; nothing is decided yet" >&2
+		exit 1
+	fi
+	if ! python3 "$HELPER" decisions --findings "$FINDINGS" \
+		--decisions "$DECISIONS" --head "$HEAD_SHA" \
+		>"$RUN_DIR/round-$ROUND/decision-report.json"; then
+		echo "lane-review: the decisions for round $ROUND are not usable:" >&2
+		python3 - "$RUN_DIR/round-$ROUND/decision-report.json" <<'PYEOF' >&2
+import json, sys
+report = json.load(open(sys.argv[1]))
+for key in ("malformed", "invalid", "unknown", "missing"):
+    for item in report.get(key, []):
+        print(f"  {key}: {item}")
+PYEOF
+		exit 1
+	fi
+	ACCEPTED=$(python3 "$HELPER" accepted-count --decisions "$DECISIONS")
+	if [[ "$ACCEPTED" -gt 0 ]]; then
+		echo "lane-review: refusing to finish: round $ROUND accepted $ACCEPTED finding(s)" >&2
+		echo "Apply them with --apply, or decide them as rejected." >&2
+		exit 4
+	fi
+
+	# The issue number the pull request will say. Checked before the
+	# squash and the push: those two are irreversible, and a branch
+	# pushed with no pull request is a half-finished state that the
+	# next run cannot tell from a finished one.
+	[[ -n "$ISSUE" ]] || {
+		echo "lane-review: --done needs --issue N: the pull request says 'Closes #N'" >&2
+		exit 2
+	}
+
+	# The ledger line for this round, whether or not the branch is pushed.
+	python3 "$HELPER" ledger --findings "$FINDINGS" --decisions "$DECISIONS" \
+		--ledger "$LEDGER" --round "$ROUND" --head "$HEAD_SHA" \
+		--base "$MERGE_BASE" --model "$REVIEW_PROFILE" \
+		--brief "$RUN_DIR/round-$ROUND/review-brief.txt" >/dev/null 2>&1 || true
+
+	# Squash at the fork point. `squash` computes the merge-base itself,
+	# so a base that moved between the review and the squash does not
+	# re-parent the branch onto a different commit.
+	MSG_FILE="$RUN_DIR/squash-message.txt"
+	{
+		echo "$BRANCH"
+		echo
+		git -C "$WORKTREE" log -1 --format=%B "$MERGE_BASE..HEAD" | \
+			head -20
+	} >"$MSG_FILE"
+	"$BIN_DIR/squash" --base "$BASE_REF" -F "$MSG_FILE" >&2 || {
+		echo "lane-review: the squash refused; the branch is unchanged" >&2
+		exit 1
+	}
+	SQUASHED=$(git -C "$WORKTREE" rev-parse HEAD)
+
+	# Push the branch. The push is the point of no return, so everything
+	# that could refuse has already refused above.
+	#
+	# The squash rewrote the branch, so this push is not a fast-forward
+	# when the branch was pushed before. `--force-with-lease` names the
+	# commit the remote is expected to be at: the push lands only if the
+	# remote is still where it was read, and is refused when somebody
+	# else moved it in between. A bare `--force` would overwrite their
+	# commit.
+	#
+	# The remote's own sha is read before the push, not after: the lease
+	# is a promise about what the remote was at when this driver looked,
+	# and reading it afterwards would make the promise about a later
+	# state than the one it checked.
+	REMOTE_SHA=$(git -C "$WORKTREE" ls-remote --heads origin "refs/heads/$BRANCH" 2>/dev/null |
+		awk 'NR==1 {print $1}')
+	PUSH_ARGS=(push --quiet)
+	if [[ -n "$REMOTE_SHA" ]]; then
+		PUSH_ARGS+=("--force-with-lease=refs/heads/$BRANCH:$REMOTE_SHA")
+	fi
+	PUSH_ARGS+=(origin "HEAD:refs/heads/$BRANCH")
+	if ! git -C "$WORKTREE" "${PUSH_ARGS[@]}" >&2; then
+		echo "lane-review: the push refused; the branch was not pushed" >&2
+		if [[ -n "$REMOTE_SHA" ]]; then
+			echo "  the remote branch was at $REMOTE_SHA; nothing was overwritten" >&2
+		fi
+		exit 1
+	fi
+
+	# The pull request, as a Draft. Ready means no further change is
+	# expected, and it is a separate act (pr-ready), because this branch
+	# has just been squashed and a Ready PR that then changes has spent
+	# its final reviewer's time on a version that did not ship.
+	BODY=$RUN_DIR/pr-body.md
+	{
+		echo "Closes #$ISSUE"
+		echo
+		echo "Reviewed by \`lane-review\`. Draft: the review loop found nothing" \
+			"that was accepted in its last round."
+		echo
+		git -C "$WORKTREE" log -1 --format=%B "$MERGE_BASE..HEAD" | \
+			head -20
+	} >"$BODY"
+	PR_ARGS=(pr create --draft --title "$BRANCH" --body-file "$BODY")
+	[[ -n "$REPO" ]] && PR_ARGS+=(--repo "$REPO")
+	gh "${PR_ARGS[@]}" >&2 || {
+		echo "lane-review: the pull request could not be opened" >&2
+		exit 1
+	}
+
+	state_set round "$ROUND"
+	state_set head "$SQUASHED"
+	state_set pr "opened"
+	echo "lane-review: branch $BRANCH is squashed at $SQUASHED, pushed, and its pull request is open as a Draft"
+	exit 0
+fi
+
+# ---- --apply --------------------------------------------------------------
+
+if [[ "$MODE" == "apply" ]]; then
+	[[ "$ROUND" -ge 1 ]] || {
+		echo "lane-review: there is no round to apply; run lane-review $WORKTREE first" >&2
+		exit 1
+	}
+	FINDINGS="$RUN_DIR/round-$ROUND/findings.json"
+	DECISIONS="$RUN_DIR/round-$ROUND/decisions.json"
+	[[ -s "$FINDINGS" ]] || {
+		echo "lane-review: round $ROUND has no findings; nothing to apply" >&2
+		exit 1
+	}
+	# The decision file is bound to the commit it was written about. A
+	# decision file about a different commit must not authorise this one.
+	if ! python3 "$HELPER" decisions --findings "$FINDINGS" \
+		--decisions "$DECISIONS" --head "$HEAD_SHA" \
+		>"$RUN_DIR/round-$ROUND/decision-report.json"; then
+		echo "lane-review: the decisions for round $ROUND are not usable:" >&2
+		python3 - "$RUN_DIR/round-$ROUND/decision-report.json" <<'PYEOF' >&2
+import json, sys
+report = json.load(open(sys.argv[1]))
+for key in ("malformed", "invalid", "unknown", "missing"):
+    for item in report.get(key, []):
+        print(f"  {key}: {item}")
+PYEOF
+		exit 1
+	fi
+
+	# The rejections carried into the next review, so a finding that was
+	# decided is not raised again.
+	REJECTIONS="$RUN_DIR/round-$ROUND/rejections.json"
+	python3 "$HELPER" rejections --findings "$FINDINGS" \
+		--decisions "$DECISIONS" --out "$REJECTIONS"
+
+	ACCEPTED=$(python3 "$HELPER" accepted-count --decisions "$DECISIONS")
+	if [[ "$ACCEPTED" -eq 0 ]]; then
+		echo "lane-review: round $ROUND accepted no findings; there is nothing to fix" >&2
+		exit 1
+	fi
+
+	BRIEF="$RUN_DIR/round-$ROUND/brief.txt"
+	python3 "$HELPER" brief --findings "$FINDINGS" --decisions "$DECISIONS" \
+		--rejections "$REJECTIONS" --round "$ROUND" \
+		--base "$MERGE_BASE" --head "$HEAD_SHA" >"$BRIEF"
+
+	# The lane that applies the fixes. hermes-implement needs an issue to
+	# work on; the issue is the work item's origin, and the brief is what
+	# this round is about.
+	[[ -n "$ISSUE" ]] || {
+		echo "lane-review: --apply needs --issue N: hermes-implement works on an issue" >&2
+		exit 2
+	}
+	IMPL_ARGS=(--issue "$ISSUE" --worktree "$WORKTREE" --extra "$(cat "$BRIEF")")
+	[[ -n "$REPO" ]] && IMPL_ARGS+=(--repo "$REPO")
+	[[ -n "$PROFILE" ]] && IMPL_ARGS+=(--profile "$PROFILE")
+	IMPLEMENT=${LANE_REVIEW_IMPLEMENT:-$BIN_DIR/hermes-implement}
+	WORK=$("$IMPLEMENT" "${IMPL_ARGS[@]}" | tail -1)
+	echo "lane-review: fix round $ROUND dispatched to a lane; its run directory is $WORK" >&2
+
+	# The round is not over until the lane settles, and the next round
+	# reviews what the lane committed. The driver waits here, because the
+	# next round's review must be of a settled tree.
+	settle || {
+		echo "lane-review: the fix lane has not settled; run lane-review $WORKTREE again when it has" >&2
+		exit 3
+	}
+	NEW_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
+	if [[ "$NEW_HEAD" == "$HEAD_SHA" ]]; then
+		echo "lane-review: the fix lane committed nothing" >&2
+		exit 3
+	fi
+
+	# The ledger line for the round that was decided, written before the
+	# next one starts so a run that dies between rounds keeps the count.
+	python3 "$HELPER" ledger --findings "$FINDINGS" --decisions "$DECISIONS" \
+		--ledger "$LEDGER" --round "$ROUND" --head "$HEAD_SHA" \
+		--base "$MERGE_BASE" --model "$REVIEW_PROFILE" \
+		--brief "$RUN_DIR/round-$ROUND/review-brief.txt" >/dev/null
+
+	state_set round "$NEXT_ROUND"
+	state_set head "$NEW_HEAD"
+	state_set base "$MERGE_BASE"
+	state_set issue "$ISSUE"
+	state_set repo "$REPO"
+	state_set branch "$BRANCH"
+	exit 5
+fi
+
+# ---- the review ------------------------------------------------------------
+
+if [[ "$ROUND" -ge "$MAX_ROUNDS" ]]; then
+	echo "lane-review: $ROUND rounds have run and the cap is $MAX_ROUNDS" >&2
+	exit 1
+fi
+
+# The answers carried into this review: every rejection from the rounds
+# before, so a finding that was decided is not raised again.
+ANSWERS="$RUN_DIR/answers.txt"
+: >"$ANSWERS"
+for r in $(seq 1 $ROUND); do
+	RJ="$RUN_DIR/round-$r/rejections.json"
+	[[ -s "$RJ" ]] || continue
+	python3 "$HELPER" answers --rejections "$RJ" >>"$ANSWERS"
+done
+
+# The review itself. hermes-review-pr's prompt asks for findings in prose;
+# this one asks for the JSON schema finding-check reads, so the findings
+# can be checked against the source rather than taken on trust.
+mkdir -p "$ROUND_DIR"
+PROMPT="$ROUND_DIR/prompt.txt"
+DIFF="$ROUND_DIR/changes.diff"
+git -C "$WORKTREE" diff "$MERGE_BASE...HEAD" >"$DIFF"
+if [[ ! -s "$DIFF" ]]; then
+	echo "lane-review: no changes against $MERGE_BASE; nothing to review" >&2
+	exit 1
+fi
+
+python3 "$HELPER" prompt --diff "$DIFF" --root "$WORKTREE" \
+	--answers "$ANSWERS" --priors "$REVIEW_PRIORS" --out "$PROMPT" || {
+	echo "lane-review: could not write the review prompt" >&2
+	exit 2
+}
+
+PROFILE_ARGS=()
+[[ -n "$REVIEW_PROFILE" ]] && PROFILE_ARGS=(-p "$REVIEW_PROFILE")
+[[ -n "$REVIEW_MODEL" ]] && PROFILE_ARGS=(-m "$REVIEW_MODEL")
+
+acquire_review_slot "${REVIEW_PROFILE:-default}"
+TIMEOUT=$(review_timeout_for "${REVIEW_PROFILE:-default}" "")
+
+set +e
+timeout "$TIMEOUT" "$BASH" -c '
+	. "$1/lib/common.sh"
+	shift
+	hermes_query "$@"
+' bash "$BIN_DIR/.." \
+	"$HERMES -m hermes_cli.main" "$PROMPT" \
+	"$ROUND_DIR/review.stdout" "$ROUND_DIR/review.stderr" \
+	"${PROFILE_ARGS[@]}" -- --skills swe-reviewer --yolo
+RC=$?
+set -e
+exec 9>&-
+
+if [[ "$RC" -ne 0 ]]; then
+	echo "lane-review: the review exited $RC (timeout was ${TIMEOUT}s); no findings were produced" >&2
+	tail -20 "$ROUND_DIR/review.stderr" >&2 || true
+	exit 1
+fi
+
+RAW="$ROUND_DIR/findings.raw.json"
+if ! python3 "$HELPER" extract --stdout "$ROUND_DIR/review.stdout" --out "$RAW"; then
+	echo "lane-review: the review did not answer with findings in the expected JSON" >&2
+	tail -20 "$ROUND_DIR/review.stdout" >&2 || true
+	exit 1
+fi
+
+# The findings, checked against the source. finding-check annotates each
+# one: where the quoted code actually is, whether it is inside the change,
+# and whether the asterisks in it are the reviewer's own redaction.
+FINDINGS="$ROUND_DIR/findings.json"
+if ! "$BIN_DIR/finding-check" "$WORKTREE" "$RAW" --base "$MERGE_BASE" \
+	>"$FINDINGS"; then
+	echo "lane-review: finding-check could not read the findings" >&2
+	exit 1
+fi
+
+python3 "$HELPER" ids --findings "$FINDINGS" >"$ROUND_DIR/ids.txt"
+
+state_set round "$NEXT_ROUND"
+state_set head "$HEAD_SHA"
+state_set base "$MERGE_BASE"
+state_set issue "$ISSUE"
+state_set repo "$REPO"
+state_set branch "$BRANCH"
+
+TOTAL=$(python3 "$HELPER" count --findings "$FINDINGS")
+SURVIVING=$(python3 "$HELPER" count --findings "$FINDINGS" --status located --in-diff)
+
+# The round's ledger line, written now that the review's counts are
+# known. The decisions land later and add to this same line, so the
+# ledger holds one line per round.
+#
+# `brief` is the review's own brief: the priors and the answers already
+# decided, which is what told the reviewer what to judge. It is written
+# beside the round so a later reader can see what the reviewer was told,
+# not only what it said.
+cp "$PROMPT" "$ROUND_DIR/review-brief.txt"
+python3 "$HELPER" ledger --findings "$FINDINGS" --ledger "$LEDGER" \
+	--round "$NEXT_ROUND" --head "$HEAD_SHA" --base "$MERGE_BASE" \
+	--model "$REVIEW_PROFILE" --brief "$ROUND_DIR/review-brief.txt" >/dev/null
+
+echo "lane-review: round $NEXT_ROUND reviewed $HEAD_SHA"
+echo "  findings:  $TOTAL"
+echo "  surviving: $SURVIVING"
+echo "  findings:  $FINDINGS"
+echo "  ids:       $ROUND_DIR/ids.txt"
+echo "  decide in: $ROUND_DIR/decisions.json"
+echo "lane-review: needs decisions: every finding in round $NEXT_ROUND needs one"
+exit 1
