@@ -20,7 +20,9 @@ derived from content survives a re-run of the reviewer; an ordinal does not.
 records the reviewed commit, and a decision whose commit is not the head the
 driver is about to act on is refused. A stale decision authorising a changed
 head is the failure this exists to prevent: the person read one diff and the
-lane is about to fix a different one.
+lane is about to fix a different one. A file that names no commit at all is
+refused too: the head is the one field the driver cannot infer, so a
+decision file without it authorises nothing.
 
 **One malformed entry must not abort the batch around it.** A reviewer's JSON
 can carry any type in any field. A decision file is written by a person under
@@ -70,6 +72,20 @@ def _type_name(value: object) -> str:
 
 # ----- finding ids --------------------------------------------------------
 
+def normalise_snippet(snippet: str) -> str:
+    """The snippet as `finding-check` compares it.
+
+    `finding-check` matches a quoted line after collapsing its
+    whitespace, so two quotes that differ only in indentation are the
+    same line to it. The id has to be derived from the same form: an id
+    that shifted when the reviewer re-indented the line it quoted would
+    name a finding the driver has never seen, and the decision file
+    written against the first run's ids would be refused against the
+    second run's.
+    """
+    return re.sub(r"\s+", " ", snippet.strip())
+
+
 def finding_id(finding: dict) -> str:
     """A stable id for a finding, derived from what identifies it.
 
@@ -78,13 +94,18 @@ def finding_id(finding: dict) -> str:
     is short, stable across runs, and does not shift when another finding
     is added to the batch.
 
+    The snippet goes in normalised, the way `finding-check` locates it:
+    a reviewer that re-indents the line it quotes has raised the same
+    finding, and an id that moved with the indentation would break the
+    decision file written against the earlier run.
+
     The severity and the claim are deliberately not in it: a reviewer who
     disagrees about how bad it is, or restates it in other words, has still
     raised the same finding, and re-deciding it is the point.
     """
     path = str(finding.get("path", ""))
     line = finding.get("line", "")
-    snippet = str(finding.get("snippet", ""))
+    snippet = normalise_snippet(str(finding.get("snippet", "")))
     raw = f"{path}\x1f{line}\x1f{snippet}"
     return hashlib.sha256(raw.encode()).hexdigest()[:12]
 
@@ -129,6 +150,15 @@ def load_decisions(path: Path, expected_ids: list[str]) -> dict:
         report["malformed"].append(
             f"{path}: 'head' must be a string, got {_type_name(head)}")
         head = None
+    elif head is None:
+        # A decision file that names no commit authorises every commit.
+        # The `head` field is the one field the driver cannot infer: it
+        # is the only thing that binds a decision to the diff the
+        # decider read. A file without it is not a decision about this
+        # commit, so it is refused rather than taken as consent.
+        report["malformed"].append(
+            f"{path}: 'head' is missing; a decision file must name the "
+            f"commit it was made about")
     report["head"] = head
 
     entries = raw.get("decisions")
@@ -573,11 +603,16 @@ def cmd_decisions(args) -> int:
                 if isinstance(f, dict)]
     report = load_decisions(Path(args.decisions), expected)
     print(json.dumps(report, indent=2, sort_keys=True))
-    if args.head is not None and report["head"] not in (None, args.head):
+    if args.head is not None and report["head"] is not None \
+            and report["head"] != args.head:
         sys.stderr.write(
             f"lane-review: the decision file is about commit "
             f"{report['head']}, not {args.head}\n")
         return 1
+    # A file that names no commit is refused, and the malformed entry
+    # says so. It is not read as "about this one": the head is the one
+    # field the driver cannot infer, and a decision file without it
+    # authorises nothing.
     ok = not (report["missing"] or report["invalid"] or report["unknown"]
               or report["malformed"])
     return 0 if ok else 1
@@ -630,6 +665,34 @@ def cmd_ids(args) -> int:
         print(f"{finding_id(finding)} {finding.get('path', '?')}"
               f":{finding.get('line', '?')}")
     return 0
+
+
+def cmd_round_head(args) -> int:
+    """Print the commit a round was reviewed at, from the ledger.
+
+    The ledger is the durable record of what each round was about, so it
+    is what a later step reads to learn the commit a round's decisions
+    were made about. The state file's `head` cannot answer it: the state
+    moves on with the rounds, and the `--done` step needs the commit
+    *this* round was reviewed at, not the current tip.
+
+    Exit 0 when the round has a head, 1 when it does not -- a ledger
+    with no line for the round is a refusal, not an empty answer.
+    """
+    for entry in read_ledger(Path(args.ledger)):
+        if entry.get("round") != args.round:
+            continue
+        head = entry.get("head")
+        if isinstance(head, str) and head:
+            print(head)
+            return 0
+        sys.stderr.write(
+            f"lane-review: the ledger's line for round {args.round} "
+            f"names no commit\n")
+        return 1
+    sys.stderr.write(
+        f"lane-review: the ledger holds no line for round {args.round}\n")
+    return 1
 
 
 def cmd_count(args) -> int:
@@ -770,6 +833,12 @@ def main() -> int:
     i = sub.add_parser("ids", help="print each finding's id")
     i.add_argument("--findings", required=True)
     i.set_defaults(func=cmd_ids)
+
+    rh = sub.add_parser("round-head",
+                        help="print the commit a round was reviewed at")
+    rh.add_argument("--ledger", required=True)
+    rh.add_argument("--round", type=int, required=True)
+    rh.set_defaults(func=cmd_round_head)
 
     c = sub.add_parser("count", help="count findings by status")
     c.add_argument("--findings", required=True)

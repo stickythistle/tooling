@@ -87,7 +87,9 @@ needs a judgement.
 
   --done     Refuse unless the last round had no accepted findings. Then
              squash the branch at its fork point, push it, and open the
-             pull request as a Draft saying `Closes #N`.
+             pull request as a Draft saying `Closes #N`. A run that
+             failed after the squash can be run again: the round is
+             still finished against the commit it was reviewed at.
 
   ids        Print the finding ids of the last round, one per line, so
              the decision file can be written without reading the
@@ -110,7 +112,8 @@ Every finding needs a decision.
 
 The `head` field is checked against the commit the round is about: a
 decision file written about a different commit does not authorise this
-one.
+one. It is required: a decision file that names no commit is refused,
+because the driver cannot infer which diff was read.
 
 The state lives under $AGENT_STATE_DIR/lane-review/, never in the
 worktree.
@@ -178,12 +181,18 @@ mkdir -p "$RUN_DIR"
 state_get() { python3 "$HELPER" state-get "$STATE_FILE" "$1" 2>/dev/null || true; }
 state_set() { python3 "$HELPER" state-set "$STATE_FILE" "$1" "$2"; }
 
+# The round the loop is on. Read before anything else, because the
+# settle check below needs it: --done accepts a tree this driver has
+# squashed for the current round, and a run that failed after the squash
+# has to be able to finish the job.
+ROUND=$(state_get round)
+[[ "$ROUND" =~ ^[0-9]+$ ]] || ROUND=0
+
 # `lane-review ids <worktree>` prints the ids of the last round's findings,
 # so a person writing the decision file has them without reading the
 # findings by hand.
 if [[ "$SUBCOMMAND" == "ids" ]]; then
-	ROUND=$(state_get round)
-	[[ "$ROUND" =~ ^[0-9]+$ ]] && [[ "$ROUND" -ge 1 ]] || {
+	[[ "$ROUND" -ge 1 ]] || {
 		echo "lane-review: there is no round yet; run lane-review $WORKTREE first" >&2
 		exit 1
 	}
@@ -227,10 +236,55 @@ settle() {
 	done
 }
 
-settle || {
-	echo "lane-review: the lane has not settled; nothing was reviewed" >&2
-	exit 3
+# The commits --done is allowed to find the tree at.
+#
+# The lane's own settle record names the commit the lane finished on. A
+# squash moves the tip past it, so after a --done that failed between the
+# squash and the pull request the tip is a commit this driver made and
+# the lane's record no longer describes the tree. That is not drift, and
+# refusing it leaves the branch pushed with no pull request and a --done
+# that refuses forever.
+#
+# So --done accepts the tree at the commit the round was reviewed at, or
+# at the commit this driver squashed for that round, and refuses every
+# other tip: that is somebody else's work, and the round's decisions say
+# nothing about it.
+#
+# The reviewed commit is read from the ledger, which records what each
+# round was about. A round the ledger does not know has no commit to
+# accept, so the tip has to be the reviewed one.
+done_accepts_head() {
+	local round="$1" reviewed squashed tip
+	tip=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null) || return 1
+	reviewed=$(python3 "$HELPER" round-head --ledger "$LEDGER" \
+		--round "$round" 2>/dev/null) || reviewed=""
+	squashed=$(state_get "squashed-$round")
+	[[ -n "$reviewed" && "$tip" == "$reviewed" ]] && return 0
+	[[ -n "$squashed" && "$tip" == "$squashed" ]] && return 0
+	return 1
 }
+
+if [[ "$MODE" == "done" ]]; then
+	# --done waits for the lane to stop writing, but it does not refuse
+	# a tree this driver has already squashed. The check is made
+	# against the commits --done accepts, not against the lane's own
+	# record.
+	settle_drift_ok() {
+		done_accepts_head "$ROUND"
+	}
+	if ! settle; then
+		if ! settle_drift_ok; then
+			echo "lane-review: the tree has moved since round $ROUND was reviewed;" >&2
+			echo "  the lane has not settled, and the tree is not where this driver left it" >&2
+			exit 3
+		fi
+	fi
+else
+	settle || {
+		echo "lane-review: the lane has not settled; nothing was reviewed" >&2
+		exit 3
+	}
+fi
 
 HEAD_SHA=$(git -C "$WORKTREE" rev-parse HEAD)
 MERGE_BASE=$(git -C "$WORKTREE" merge-base "$BASE_REF" HEAD 2>/dev/null || true)
@@ -302,13 +356,32 @@ fi
 
 # ---- the rounds ----------------------------------------------------------
 
-ROUND=$(state_get round)
-[[ "$ROUND" =~ ^[0-9]+$ ]] || ROUND=0
 NEXT_ROUND=$((ROUND + 1))
 ROUND_DIR="$RUN_DIR/round-$NEXT_ROUND"
 
 # ---- --done ---------------------------------------------------------------
 
+# --done binds itself to the commit the round was *reviewed* at, not to
+# the current tip.
+#
+# The squash moves the tip, so a run that failed after the squash -- a
+# refused push, a `gh pr create` that failed, a network error -- leaves a
+# tree the lane's own settle record no longer describes. The settle check
+# above would call that drift and refuse: "the lane has not settled;
+# nothing was reviewed", which is not what happened. The branch would be
+# left pushed with no pull request and a --done that refuses forever, and
+# the only escape was to reset the branch by hand and throw the squash
+# away.
+#
+# The ledger records the commit each round was reviewed at, and the
+# decisions are validated against it: a decision about the reviewed diff
+# stays valid after the squash rewrote the branch, which is what makes a
+# retry a retry rather than a new decision.
+#
+# The tree may have moved since the review, but only in a way this driver
+# caused: the squash. A tip that is neither the reviewed commit nor the
+# commit this driver squashed is somebody else's work, and is refused --
+# above, by the settle check.
 if [[ "$MODE" == "done" ]]; then
 	[[ "$ROUND" -ge 1 ]] || {
 		echo "lane-review: there is no round to finish; run lane-review $WORKTREE first" >&2
@@ -326,8 +399,23 @@ if [[ "$MODE" == "done" ]]; then
 		echo "lane-review: round $ROUND has no decisions; nothing is decided yet" >&2
 		exit 1
 	fi
+
+	# The commit this round was reviewed at. The ledger is the durable
+	# record of it; the state file's `head` moves on with the rounds and
+	# cannot answer for a particular one.
+	#
+	# The settle check above has already refused a tree that is neither
+	# this commit nor the commit this driver squashed for this round,
+	# so by here the tip is one of the two.
+	ROUND_HEAD=$(python3 "$HELPER" round-head --ledger "$LEDGER" --round "$ROUND") || {
+		echo "lane-review: the ledger holds no commit for round $ROUND;" >&2
+		echo "  the decisions of that round cannot be checked against a commit" >&2
+		exit 1
+	}
+	CURRENT_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
+
 	if ! python3 "$HELPER" decisions --findings "$FINDINGS" \
-		--decisions "$DECISIONS" --head "$HEAD_SHA" \
+		--decisions "$DECISIONS" --head "$ROUND_HEAD" \
 		>"$RUN_DIR/round-$ROUND/decision-report.json"; then
 		echo "lane-review: the decisions for round $ROUND are not usable:" >&2
 		python3 - "$RUN_DIR/round-$ROUND/decision-report.json" <<'PYEOF' >&2
@@ -355,15 +443,34 @@ PYEOF
 		exit 2
 	}
 
+	# The base the squash is taken against, and the head the commit
+	# message and the pull request body are written from. The reviewed
+	# commit is above the fork point, so the fork point is the same
+	# whether the tree has been squashed or not.
+	HEAD_SHA=$CURRENT_HEAD
+	MERGE_BASE=$(git -C "$WORKTREE" merge-base "$BASE_REF" HEAD 2>/dev/null || true)
+	if [[ -z "$MERGE_BASE" ]]; then
+		echo "lane-review: no merge-base between $BASE_REF and HEAD" >&2
+		echo "  the branch does not fork from $BASE_REF; finish it against a base it shares" >&2
+		exit 3
+	fi
+
 	# The ledger line for this round, whether or not the branch is pushed.
+	# The head on it is the commit the round was reviewed at, so the
+	# ledger keeps naming the reviewed commit rather than the squashed
+	# one -- a retry still finds the round it is finishing.
 	python3 "$HELPER" ledger --findings "$FINDINGS" --decisions "$DECISIONS" \
-		--ledger "$LEDGER" --round "$ROUND" --head "$HEAD_SHA" \
+		--ledger "$LEDGER" --round "$ROUND" --head "$ROUND_HEAD" \
 		--base "$MERGE_BASE" --model "$REVIEW_PROFILE" \
 		--brief "$RUN_DIR/round-$ROUND/review-brief.txt" >/dev/null 2>&1 || true
 
 	# Squash at the fork point. `squash` computes the merge-base itself,
 	# so a base that moved between the review and the squash does not
 	# re-parent the branch onto a different commit.
+	#
+	# The squash is idempotent: a branch already squashed is one commit
+	# on top of the fork, and `squash` says so and exits 0. That is what
+	# makes a retry a retry.
 	MSG_FILE="$RUN_DIR/squash-message.txt"
 	{
 		echo "$BRANCH"
@@ -376,6 +483,12 @@ PYEOF
 		exit 1
 	}
 	SQUASHED=$(git -C "$WORKTREE" rev-parse HEAD)
+	# The squashed commit is recorded before the push, so a run that
+	# fails between here and the pull request can be retried: the retry
+	# recognises the tip as this driver's own squash. It is recorded
+	# against the round, so a squash from an earlier round cannot
+	# authorise this one.
+	state_set "squashed-$ROUND" "$SQUASHED"
 
 	# Push the branch. The push is the point of no return, so everything
 	# that could refuse has already refused above.
@@ -403,6 +516,7 @@ PYEOF
 		if [[ -n "$REMOTE_SHA" ]]; then
 			echo "  the remote branch was at $REMOTE_SHA; nothing was overwritten" >&2
 		fi
+		echo "The branch is squashed but the pull request is not open; run lane-review $WORKTREE --done again." >&2
 		exit 1
 	fi
 
@@ -424,6 +538,7 @@ PYEOF
 	[[ -n "$REPO" ]] && PR_ARGS+=(--repo "$REPO")
 	gh "${PR_ARGS[@]}" >&2 || {
 		echo "lane-review: the pull request could not be opened" >&2
+		echo "The branch is squashed and pushed; run lane-review $WORKTREE --done again to open it." >&2
 		exit 1
 	}
 
@@ -491,7 +606,22 @@ PYEOF
 	[[ -n "$REPO" ]] && IMPL_ARGS+=(--repo "$REPO")
 	[[ -n "$PROFILE" ]] && IMPL_ARGS+=(--profile "$PROFILE")
 	IMPLEMENT=${LANE_REVIEW_IMPLEMENT:-$BIN_DIR/hermes-implement}
-	WORK=$("$IMPLEMENT" "${IMPL_ARGS[@]}" | tail -1)
+	# The implementer's status is captured, not raised. Under `pipefail`
+	# the pipeline's status is the implementer's, and `set -e` would end
+	# the driver there -- with the implementer's code as the driver's own
+	# exit code, and none of the driver's message printed. A caller
+	# switching on the exit code could not then tell "the round needs a
+	# decision" from "the lane refused to run", and could not tell
+	# whether a lane was dispatched at all.
+	#
+	# The implementer's stdout is a run directory on its last line, so
+	# only that line is read; the status is taken from the pipeline.
+	IMPL_RC=0
+	WORK=$("$IMPLEMENT" "${IMPL_ARGS[@]}" | tail -1) || IMPL_RC=$?
+	if [[ "$IMPL_RC" -ne 0 ]]; then
+		echo "lane-review: the fix lane refused to run (exit $IMPL_RC); nothing was dispatched" >&2
+		exit 3
+	fi
 	echo "lane-review: fix round $ROUND dispatched to a lane; its run directory is $WORK" >&2
 
 	# The round is not over until the lane settles, and the next round
@@ -569,11 +699,11 @@ set +e
 timeout "$TIMEOUT" "$BASH" -c '
 	. "$1/lib/common.sh"
 	shift
-	hermes_query "$@"
+	hermes_query "$@" 8>&- 9>&-
 ' bash "$BIN_DIR/.." \
 	"$HERMES -m hermes_cli.main" "$PROMPT" \
 	"$ROUND_DIR/review.stdout" "$ROUND_DIR/review.stderr" \
-	"${PROFILE_ARGS[@]}" -- --skills swe-reviewer --yolo
+	"${PROFILE_ARGS[@]}" -- --skills swe-reviewer --yolo 9>&-
 RC=$?
 set -e
 exec 9>&-

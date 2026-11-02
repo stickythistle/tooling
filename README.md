@@ -112,13 +112,15 @@ A person writes `round-N/decisions.json`. Each finding is `accept`ed with the
 mechanism to use and the wrong mechanism to forbid, `reject`ed with a reason,
 or `defer`red to an issue number. The driver refuses to go on while any
 finding lacks a decision, and refuses a decision file that names another
-commit.
+commit — or none: the file has to say which diff was read.
 
 `--apply` hands the accepted findings to a lane and carries every rejection
 into the next review, so a finding that was decided is not raised again.
 `--done` refuses while the last round accepted anything; then it squashes at
-the fork point, pushes, and opens the pull request as a Draft. Ready stays a
-separate act (`pr-ready`): Ready means no further change is expected.
+the fork point, pushes, and opens the pull request as a Draft. It finishes the
+round it was reviewed against, so a run that failed after the squash can be
+run again. Ready stays a separate act (`pr-ready`): Ready means no further
+change is expected.
 
 Every round appends to the ledger under `$AGENT_STATE_DIR/lane-review/`, with
 the findings, how many survived, how many were the reviewer's false

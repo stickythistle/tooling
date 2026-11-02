@@ -13,9 +13,14 @@ The contract this suite holds:
   not raised again.
 - --apply dispatches only the accepted findings, with the mechanism named
   and the wrong mechanism forbidden.
-- --done refuses while the last round had accepted findings.
+- --done refuses while the last round had accepted findings, and a --done
+  that failed after the squash can be run again.
 - Every round appends one ledger line, and a later round does not damage
   the earlier one.
+- A decision file that names no commit is refused, a finding id does not
+  move when the reviewer re-indents the line it quoted, a failing fix
+  lane is reported under the driver's own exit code, and a surviving
+  review child does not keep the review slot locked.
 
 The lane, the reviewer and `gh` are stubs: the branch is a real git repo in
 a scratch directory, the reviewer writes a canned answer, and `gh` answers
@@ -904,6 +909,276 @@ def case_done_needs_an_issue_before_it_pushes(failures):
                       pushed.stdout.strip(), failures)
 
 
+# ----- the fixes the first review round asked for -------------------------
+
+def case_a_decision_file_without_a_head_is_refused(failures):
+    """A decision file that names no commit authorises nothing.
+
+    The `head` field is the one field the driver cannot infer: it binds
+    a decision to the diff the decider read. Omitting it is not the same
+    as naming the right commit, so a file without it must be refused --
+    and refused before a lane is dispatched.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        # The decision file names no commit at all.
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"decisions": [{"id": fid, "decision": "accept",
+                            "mechanism": "change it", "forbid": "do not"}]}))
+        # The head moves on after the review: somebody committed on top.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\n")
+        git(env.repo, "commit", "-qam", "somebody else committed")
+        env.settle()
+        r = env.run(str(env.repo), "--apply", "--issue", "7",
+                    "--base", "origin/main")
+        assert_eq("no-head: rc is a refusal", 1, r.returncode, failures)
+        assert_in("no-head: says the head is missing", "head",
+                  r.stdout + r.stderr, failures)
+        if env.implementer_log.is_file():
+            fail(failures, "no-head: a lane was dispatched anyway")
+        # The report names the reason, so the operator can read it back.
+        report = json.loads(
+            (env.run_dir() / "round-1" / "decision-report.json").read_text())
+        assert_in("no-head: the report names the missing head",
+                  "'head' is missing",
+                  " ".join(report.get("malformed", [])), failures)
+
+
+def case_the_finding_id_survives_a_reindented_quote(failures):
+    """A finding id does not move when the reviewer re-indents its quote.
+
+    `finding-check` locates a quoted line after collapsing its
+    whitespace, so two quotes that differ only in indentation are the
+    same line to it. The id has to be derived from the same form, or a
+    decision file written against one run's ids is refused against the
+    next run's.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        # The reviewer quotes the line with leading whitespace.
+        env.answer = json.dumps([{
+            "severity": "medium",
+            "path": "base.txt",
+            "line": 2,
+            "snippet": "  changed",
+            "claim": "the changed line is wrong",
+            "settled_by": "reading base.txt",
+            "recommendation": "change it back",
+        }])
+        env.run(str(env.repo), "--base", "origin/main")
+        first = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        # The next round the reviewer quotes the same line without it.
+        env.answer = json.dumps([{
+            "severity": "medium",
+            "path": "base.txt",
+            "line": 2,
+            "snippet": "changed",
+            "claim": "the changed line is wrong",
+            "settled_by": "reading base.txt",
+            "recommendation": "change it back",
+        }])
+        env.run(str(env.repo), "--base", "origin/main")
+        second = (env.run_dir() / "round-2" / "ids.txt").read_text().split()[0]
+        assert_eq("stable-id: the id does not move when the quote is "
+                  "re-indented", first, second, failures)
+        # And a decision file written against the first id still applies.
+        (env.run_dir() / "round-2" / "decisions.json").write_text(json.dumps(
+            {"head": head(env.repo),
+             "decisions": [{"id": first, "decision": "reject",
+                            "reason": "deliberate"}]}))
+        r = env.run(str(env.repo), "--apply", "--issue", "7",
+                    "--base", "origin/main")
+        out = r.stdout + r.stderr
+        assert_not_in("stable-id: the decision file was refused", "no finding has id",
+                      out, failures)
+
+
+def case_apply_reports_a_lane_that_refused_to_run(failures):
+    """--apply reports the implementer's failure under its own exit code.
+
+    The header's exit-code table is the contract a caller reads. The
+    implementer's own codes must not land in it unchanged, or a caller
+    cannot tell "the round needs a decision" from "the lane refused to
+    run" -- and the driver's message about whether a lane was dispatched
+    must be printed either way.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"head": head(env.repo),
+             "decisions": [{"id": fid, "decision": "accept",
+                            "mechanism": "change it", "forbid": "do not"}]}))
+        # An implementer that fails with a code of its own choosing.
+        failing = env.bin / "failing-implement"
+        failing.write_text("#!/usr/bin/env bash\n"
+                           "echo 'hermes-implement: something went wrong' >&2\n"
+                           "exit ${FAKE_IMPL_RC:-3}\n")
+        failing.chmod(0o755)
+        for rc in ("1", "2", "3"):
+            r = env.run(str(env.repo), "--apply", "--issue", "7",
+                        "--base", "origin/main",
+                        env={"LANE_REVIEW_IMPLEMENT": str(failing),
+                             "FAKE_IMPL_RC": rc})
+            # The driver's own code, not the implementer's.
+            assert_eq(f"apply-failure: rc for implementer exit {rc}",
+                      3, r.returncode, failures)
+            assert_in(f"apply-failure: names the implementer's code "
+                      f"for exit {rc}", str(rc), r.stdout + r.stderr, failures)
+            assert_in(f"apply-failure: says nothing was dispatched "
+                      f"for exit {rc}", "nothing was dispatched",
+                      r.stdout + r.stderr, failures)
+        if env.implementer_log.is_file():
+            fail(failures, "apply-failure: a lane was dispatched anyway")
+
+
+def case_the_review_child_does_not_hold_the_review_slot(failures):
+    """A surviving review child must not keep the review slot locked.
+
+    The lock is held against the open file description, so a descendant
+    that inherits fd 9 keeps the slot held after the driver exits, and
+    the next review blocks on it forever. The child is given the slot
+    closed, the way `bin/hermes-review-pr` does.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        # A reviewer that leaves a background child alive. close_fds=False
+        # is the point: a real agent's background child inherits the
+        # open file description.
+        survivor = env.bin / "survivor.sh"
+        survivor.write_text("#!/usr/bin/env bash\n"
+                            "sleep 300 &\n"
+                            "exit 0\n")
+        survivor.chmod(0o755)
+        hermes = env.bin / "hermes"
+        hermes.write_text(textwrap.dedent(f"""\
+            #!/usr/bin/env python3
+            import os, subprocess, sys
+            args = sys.argv[1:]
+            for i, a in enumerate(args):
+                if a == "--query-file":
+                    with open(os.environ["FAKE_REVIEW_PROMPT_LOG"], "w") as f:
+                        f.write(open(args[i + 1]).read())
+            subprocess.Popen(["{survivor}"], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL, close_fds=False)
+            print(os.environ.get("FAKE_REVIEW_ANSWER", "[]"))
+            sys.exit(0)
+        """))
+        hermes.chmod(0o755)
+        env.run(str(env.repo), "--base", "origin/main")
+        # Probe the lock exactly as acquire_review_slot takes it.
+        lock = env.state / "hermes-review-default-1.lock"
+        probe = (
+            "import fcntl, os, sys\n"
+            f"fd = os.open({str(lock)!r}, os.O_RDWR | os.O_CREAT, 0o644)\n"
+            "try:\n"
+            "    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    print('FREE')\n"
+            "except BlockingIOError:\n"
+            "    print('LOCKED')\n"
+        )
+        p = subprocess.run([sys.executable, "-c", probe],
+                           capture_output=True, text=True)
+        assert_in("review-slot: the review slot was released after the "
+                  "driver finished", "FREE", p.stdout + p.stderr, failures)
+
+
+def case_done_can_be_retried_after_the_squash(failures):
+    """A --done that failed after the squash can be run again.
+
+    The squash moves the tip, so a run that failed between the push and
+    the pull request leaves a tree the lane's own settle record no
+    longer describes. The retry has to finish the job: the decisions are
+    checked against the commit the round was reviewed at, and the squash
+    is a no-op the second time.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        # Two commits on the branch, so the squash has something to do.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\n")
+        git(env.repo, "commit", "-qam", "second lane commit")
+        git(env.repo, "push", "-q", "origin", "feature")
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"head": head(env.repo),
+             "decisions": [{"id": fid, "decision": "reject",
+                            "reason": "deliberate"}]}))
+        # A `gh` whose `pr create` fails the first time and works after.
+        gh = env.bin / "gh"
+        gh.write_text(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import json, os, subprocess, sys
+            args = sys.argv[1:]
+            with open(os.environ["FAKE_GH_LOG"], "a") as f:
+                f.write(json.dumps(args) + "\\n")
+            canned = json.load(open(os.environ["FAKE_GH_DATA"]))
+            if args[:2] == ["issue", "view"]:
+                body = canned.get("issue_body", "")
+                if "--jq" in args:
+                    flt = args[args.index("--jq") + 1]
+                    sys.stdout.write(subprocess.run(
+                        ["jq", "-r", flt], input=json.dumps({"body": body}),
+                        capture_output=True, text=True, check=True).stdout)
+                else:
+                    print(json.dumps({"body": body}))
+                sys.exit(0)
+            if args[:2] == ["pr", "create"]:
+                n = len([c for c in open(os.environ["FAKE_GH_LOG"])
+                         if '"create"' in c])
+                if n <= 1:
+                    print("gh: could not create pull request (transient)",
+                          file=sys.stderr)
+                    sys.exit(1)
+                print(canned.get("pr_url", "https://example.invalid/pr/1"))
+                sys.exit(0)
+            sys.exit(0)
+        """))
+        gh.chmod(0o755)
+
+        reviewed = head(env.repo)
+        r1 = env.run(str(env.repo), "--done", "--issue", "7",
+                     "--base", "origin/main")
+        assert_eq("done-retry: the first run failed", 1, r1.returncode,
+                  failures)
+        squashed = head(env.repo)
+        if squashed == reviewed:
+            fail(failures, "done-retry: the branch was not squashed")
+        # The branch was pushed, and the pull request was not opened.
+        pushed = subprocess.run(
+            ["git", "-C", str(env.bare), "rev-parse", "feature"],
+            capture_output=True, text=True)
+        if pushed.returncode != 0:
+            fail(failures, "done-retry: the branch was not pushed",
+                 pushed.stderr)
+        else:
+            assert_eq("done-retry: the pushed head is the squashed one",
+                      squashed, pushed.stdout.strip(), failures)
+        creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+        assert_eq("done-retry: the first run opened no pull request",
+                  1, len(creates), failures)
+
+        # The retry.
+        r2 = env.run(str(env.repo), "--done", "--issue", "7",
+                     "--base", "origin/main")
+        assert_eq("done-retry: the retry succeeded", 0, r2.returncode,
+                  failures)
+        creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+        assert_eq("done-retry: the retry opened the pull request",
+                  2, len(creates), failures)
+        # And the branch did not move again: the squash is a no-op.
+        assert_eq("done-retry: the branch did not move again", squashed,
+                  head(env.repo), failures)
+
+
 def case_the_ledger_names_the_reviewers_brief(failures):
     """The ledger records which brief the reviewer was given."""
     with tempfile.TemporaryDirectory() as t:
@@ -956,6 +1231,12 @@ CASES = (
     case_two_worktrees_keep_separate_state,
     case_misuse_exits_two,
     case_an_unsettled_lane_is_not_reviewed,
+    # The fixes the first review round asked for.
+    case_a_decision_file_without_a_head_is_refused,
+    case_the_finding_id_survives_a_reindented_quote,
+    case_apply_reports_a_lane_that_refused_to_run,
+    case_the_review_child_does_not_hold_the_review_slot,
+    case_done_can_be_retried_after_the_squash,
 )
 
 
@@ -976,7 +1257,8 @@ def main() -> int:
             print(" -", f)
         return 1
     print(f"PASS lane-review: {len(CASES)} cases -- state outside the tree; "
-          "hygiene refusals; the decision contract; --apply; --done; the ledger")
+          "hygiene refusals; the decision contract; --apply; --done; "
+          "the ledger; the review round's fixes")
     return 0
 
 
