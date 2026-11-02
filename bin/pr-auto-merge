@@ -12,6 +12,12 @@ approvals dismissed, the required checks green, linear history. A pull
 request whose protections are unknown is never enabled, because an
 unknown prerequisite is not a satisfied one.
 
+The head is bound to the write itself: GitHub's
+`enablePullRequestAutoMerge` mutation takes the head the decision was
+made about, and refuses the request when the pull request's head has
+moved on. The ruleset holds the merge authority; this is what says
+which commit the authority is being asked about.
+
 Two modes, set per repository in `pr-loop.toml`:
 
 - `shadow` (the default): the would-merge decision is recorded in the
@@ -52,6 +58,11 @@ import merge_ledger  # noqa: E402
 DEFAULT_CONFIG = Path(os.environ.get(
     "PR_LOOP_CONFIG",
     Path.home() / ".config" / "hermes-tools" / "pr-loop.toml"))
+
+# The merge methods GitHub's `enablePullRequestAutoMerge` mutation
+# takes. The GraphQL enum is spelled in capitals, where the REST merge
+# endpoint's `merge_method` is not.
+MERGE_METHOD_ENUMS = {"squash": "SQUASH", "rebase": "REBASE"}
 
 
 class FetchError(Exception):
@@ -228,27 +239,71 @@ def fetch_codeowners(repo: str, ref: str, path: str) -> str | None:
         raise FetchError(f"{endpoint}: the file could not be decoded: {exc}") from exc
 
 
-def enable_auto_merge(repo: str, number: str, method: str) -> None:
-    """Ask GitHub to enable auto-merge for this pull request.
+def enable_auto_merge(repo: str, number: str, method: str,
+                      pull_request_id: str, head: str) -> None:
+    """Ask GitHub to enable auto-merge for this pull request, on this head.
 
     This is the only write this tool makes to the pull request, and it
     is not a merge. GitHub merges later, on its own, when the ruleset
     is satisfied -- and only then.
 
-    The endpoint refuses a merge method the repository does not allow,
-    which is the right answer: the configuration and the ruleset have
-    to agree, and this is where that disagreement surfaces.
+    The request is the GraphQL `enablePullRequestAutoMerge` mutation.
+    There is no REST endpoint for this: `PUT
+    /repos/{owner}/{repo}/pulls/{pull_number}/auto-merge` does not
+    exist, and a request to it answers 404. The mutation is also the
+    only one of the two that can say *which* head it means.
+
+    `expectedHeadOid` is the head the decision was made about. GitHub
+    refuses the mutation when the pull request's head is no longer that
+    commit, so a push between the decision and the write leaves the
+    pull request unarmed instead of arming it for a commit nobody
+    agreed to. The ruleset is what holds the merge authority; this is
+    what binds the write to the commit that was approved.
+
+    The merge method is refused by GitHub when the repository does not
+    allow it, which is the right answer: the configuration and the
+    ruleset have to agree, and this is where that disagreement surfaces.
     """
-    endpoint = f"repos/{repo}/pulls/{number}/auto-merge"
-    proc = subprocess.run(
-        ["gh", "api", "-X", "PUT", endpoint,
-         "-f", f"merge_method={method}"],
-        capture_output=True, text=True,
-    )
+    if method not in MERGE_METHOD_ENUMS:
+        raise FetchError(
+            f"merge method {method!r} is not one GitHub's mutation takes")
+    query = """
+mutation EnableAutoMerge($pullRequestId: ID!, $mergeMethod: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID!) {
+  enablePullRequestAutoMerge(input: {
+    pullRequestId: $pullRequestId,
+    mergeMethod: $mergeMethod,
+    expectedHeadOid: $expectedHeadOid
+  }) {
+    pullRequest { id }
+  }
+}
+"""
+    cmd = ["gh", "api", "graphql",
+           "-f", f"query={query}",
+           "-F", f"pullRequestId={pull_request_id}",
+           "-F", f"mergeMethod={MERGE_METHOD_ENUMS[method]}",
+           "-F", f"expectedHeadOid={head}"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"enablePullRequestAutoMerge: {exc}") from exc
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip().splitlines()
         reason = detail[0] if detail else f"gh exited {proc.returncode}"
-        raise FetchError(f"{endpoint}: {reason}")
+        raise FetchError(f"enablePullRequestAutoMerge: {reason}")
+    # GitHub answers a GraphQL request with HTTP 200 even when the
+    # mutation itself failed, so the body has to be read for errors.
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise FetchError(
+            f"enablePullRequestAutoMerge: response was not JSON: {exc}") from exc
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if errors:
+        first = errors[0] if isinstance(errors, list) and errors else {}
+        message = first.get("message") if isinstance(first, dict) else None
+        raise FetchError(
+            f"enablePullRequestAutoMerge: {message or errors}")
 
 
 def add_label(repo: str, number: str, label: str) -> None:
@@ -339,6 +394,13 @@ def main(argv: list[str] | None = None) -> int:
         head = head.get("sha") if isinstance(head, dict) else None
         if not isinstance(head, str) or not head:
             raise FetchError(f"repos/{repo}/pulls/{number}: no head sha")
+        # The GraphQL node id of the pull request. GitHub's auto-merge
+        # mutation names a pull request by this id, and the REST pull
+        # request object carries it, so it costs no extra fetch.
+        pull_request_id = pr.get("node_id")
+        if not isinstance(pull_request_id, str) or not pull_request_id:
+            raise FetchError(
+                f"repos/{repo}/pulls/{number}: no node id")
 
         reviews = fetch_reviews(repo, number)
         checks = fetch_checks(repo, number)
@@ -355,7 +417,9 @@ def main(argv: list[str] | None = None) -> int:
 
     # The decision is about one exact head. Before anything is written,
     # the head is re-read: a push between the fetch and the write would
-    # otherwise enable auto-merge for a commit nobody agreed to.
+    # otherwise enable auto-merge for a commit nobody agreed to. The
+    # write itself names the head it means, so this re-read narrows
+    # the window rather than closing it.
     if decision.action in ("enable", "shadow"):
         try:
             fresh = gh_json(f"repos/{repo}/pulls/{number}")
@@ -377,7 +441,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if decision.action == "enable":
             try:
-                enable_auto_merge(repo, number, decision.method)
+                enable_auto_merge(repo, number, decision.method,
+                                  pull_request_id, head)
             except FetchError as exc:
                 print(f"ERR {exc}", file=sys.stderr)
                 return 2

@@ -8,6 +8,12 @@ the merge rule itself, and that rule is exactly what a ruleset is for:
 one approving review of the most recent push, stale approvals dismissed,
 the required checks green, linear history.
 
+The head is bound to the write: GitHub's `enablePullRequestAutoMerge`
+mutation takes the head the decision was made about, and refuses the
+request when the pull request's head has moved on. The ruleset holds
+the merge authority; the head is what says which commit that authority
+is being asked about.
+
 Three things decide, and each can refuse:
 
 - **The repository's configuration** (`pr-loop.toml`): the merge method,
@@ -35,7 +41,13 @@ import re
 # The gate's own readers. `pr_gate` holds what a review is and what a
 # check is; this module holds what to do about them. It does not import
 # this one back, so there is no cycle.
-from pr_gate import pending_checks, verdict_reviews
+#
+# `pending_checks` asks only whether a check has finished. A check run
+# that has finished and failed reports `status: "COMPLETED"` with
+# `conclusion: "FAILURE"`, so "finished" is not "green". The green
+# reader is `failing_checks`; `pr-loop-gate` keeps using
+# `pending_checks`, whose question is the one it means to ask.
+from pr_gate import failing_checks, pending_checks, verdict_reviews
 
 # The mode a repository runs in. `shadow` records what the loop *would*
 # have done and leaves the merge to a person. `on` asks GitHub to enable
@@ -50,10 +62,9 @@ MODES = (SHADOW, ON)
 # stacked and rebase where they are, and a merge commit is neither.
 MERGE_METHODS = ("squash", "rebase")
 
-# The labels the loop puts on a pull request. `needs-merge` marks a PR
+# The label the loop puts on a pull request. `needs-merge` marks a PR
 # that a person has to merge, because it touches a path the repository
 # protects or because a protection is missing.
-LABEL_AGREED = "pr-loop:agreed"
 LABEL_NEEDS_MERGE = "pr-loop:needs-merge"
 
 # The ruleset rule types this module reads. A ruleset that carries none
@@ -545,16 +556,61 @@ def decide(config: RepoConfig, pr: dict, reviews: list, checks: list,
             f"the approval is on {verdict['commit_id'][:7]}, not on the head "
             f"{head[:7]}")
 
+    # ----- the ruleset -----
+    #
+    # Resolved before the checks, because the checks the decision
+    # depends on are the ones the configuration names *and* the ones the
+    # ruleset requires. The ruleset is the authority that finally
+    # merges, so a check it requires is a check the decision has to
+    # know about even when the configuration does not list it.
+    #
+    # The ruleset is only *required* in `on` mode. In shadow mode
+    # nothing merges, so a missing ruleset costs nothing: the decision
+    # is still recorded, with the method it knows, because the record
+    # is what the disagreement rate is measured from -- and a
+    # repository nobody configured is a repository whose rate has not
+    # started yet, not one that is refused.
+    if ruleset is None and config.ruleset:
+        ruleset = find_ruleset(rulesets, config.ruleset)
+
     # ----- the checks -----
+    #
+    # A check has to be green, not merely finished. A check run that
+    # has finished and failed reports `status: "COMPLETED"` with
+    # `conclusion: "FAILURE"`, so asking only whether it finished
+    # would let a red pull request through.
     if pending_checks(checks):
         return _block("a required check has not finished")
-    if config.required_checks:
-        names = {c.get("name") or c.get("context")
-                 for c in checks if isinstance(c, dict)}
-        missing = [c for c in config.required_checks if c not in names]
+
+    # The checks the decision depends on: the ones the configuration
+    # names, and the ones the ruleset requires. A ruleset that requires
+    # a check the configuration does not list still has to be
+    # satisfied, because the ruleset is what will do the merging.
+    #
+    # Only an *enforced* ruleset contributes: `disabled` and
+    # `evaluate` hold no authority, so a check such a ruleset names is
+    # not one anybody is waiting for. The refusal that names the
+    # unenforced ruleset is made further down, and it is the truer one.
+    required = list(config.required_checks)
+    if ruleset is not None and ruleset.enforced:
+        for check in ruleset.required_status_checks:
+            if check not in required:
+                required.append(check)
+    if required:
+        # A check that is not in the rollup at all is one nobody has
+        # reported; a check that is in it and did not pass is one that
+        # says no. The two are different problems for the operator, so
+        # they are named differently.
+        reported = {c.get("name") or c.get("context")
+                    for c in checks if isinstance(c, dict)}
+        missing = [c for c in required if c not in reported]
         if missing:
             return _block(
                 f"required check(s) not reported: {', '.join(missing)}")
+        bad = [c for c in failing_checks(checks) if c in required]
+        if bad:
+            return _block(
+                f"required check(s) did not pass: {', '.join(bad)}")
 
     # ----- the protected paths -----
     #
@@ -596,8 +652,9 @@ def decide(config: RepoConfig, pr: dict, reviews: list, checks: list,
         if not config.ruleset:
             return _block("no ruleset is configured for this repository")
 
-        if ruleset is None:
-            ruleset = find_ruleset(rulesets, config.ruleset)
+        # The ruleset was looked up above, where the checks could be
+        # read against it. A repository that names a ruleset which does
+        # not exist has protections that are unknown.
         if ruleset is None:
             return _block(
                 f"the repository has no ruleset named {config.ruleset!r}")

@@ -100,9 +100,11 @@ script:
     the required status checks (Gates)
     linear history
 
-`pr-auto-merge` asks GitHub to enable auto-merge for one exact head. GitHub
-merges later, when the ruleset is satisfied, and a push after the approval
-dismisses it and stops the merge. No script here merges anything.
+`pr-auto-merge` asks GitHub to enable auto-merge for one exact head. The
+request names the head it means, and GitHub refuses it when the pull
+request's head has moved on. GitHub merges later, when the ruleset is
+satisfied, and a push after the approval dismisses it and stops the
+merge. No script here merges anything.
 
     pr-auto-merge <owner/repo> <pr>          # decide, and act
     pr-auto-merge <owner/repo> <pr> --check  # decide, and change nothing
@@ -121,7 +123,7 @@ checks and the mode all live there.
 | `auto_merge` | `"shadow"` (the default) or `"on"` |
 | `merge_method` | `"squash"` or `"rebase"` |
 | `ruleset` | the name of the ruleset that holds the merge authority |
-| `required_checks` | the checks the ruleset must require |
+| `required_checks` | the checks the ruleset must require, and that must be green |
 | `protected_paths` | paths a loop must not merge on its own |
 | `codeowners` | where the CODEOWNERS file lives |
 | `allow_same_family` | whether the implementer and reviewer may share a model family |

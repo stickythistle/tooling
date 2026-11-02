@@ -37,10 +37,16 @@ merge_method = "squash"
 # repository whose ruleset cannot be read never auto-merges.
 ruleset = "loop-merge"
 
-# The checks the ruleset requires. Every one of these must be in the
+# The checks the decision depends on. Every one of these must be in the
 # ruleset's own list, or the tool refuses: a configuration that asks
 # for more than the ruleset enforces is a configuration that believes
 # it is protected where it is not.
+#
+# The check goes both ways. A check the ruleset requires and this file
+# does not name is still required to be green, because the ruleset is
+# what will do the merging. Every check the decision depends on --
+# these and the ruleset's own -- must be reported on the pull request
+# and must have passed.
 required_checks = ["Gates"]
 
 # Paths a loop must not merge on its own, beyond whatever CODEOWNERS

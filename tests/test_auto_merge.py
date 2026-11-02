@@ -56,8 +56,12 @@ def check_run(name="Gates", status="COMPLETED", conclusion: "str | None" = "SUCC
             "conclusion": conclusion, "name": name}
 
 
+PR_NODE_ID = "PR_kwStubRepositoryAAAA"
+
+
 def pr(head=HEAD, state="open", merged=False):
     return {"state": state, "merged": merged, "draft": False,
+            "node_id": PR_NODE_ID,
             "head": {"sha": head}, "base": {"sha": "0" * 40}}
 
 
@@ -256,10 +260,92 @@ def decision_scenarios():
                      checks=[check_run(status="IN_PROGRESS", conclusion=None)]),
                 "block", "has not finished"))
 
+    # A check that has finished and failed. A finished check run reports
+    # `status: "COMPLETED"` with `conclusion: "FAILURE"`, so asking
+    # only whether it has finished would let a red pull request
+    # through: the decision would be `enable`, auto-merge would be
+    # armed on a failing pull request, and GitHub would merge it the
+    # moment the check was re-run green.
+    for bad in ("FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED",
+                "STARTUP_FAILURE"):
+        out.append((f"check_conclusion_{bad}",
+                    dict(cfg=config(mode="on"),
+                         checks=[check_run(conclusion=bad)]),
+                    "block", "did not pass"))
+
+    # A finished check run with no conclusion at all is unknown, and
+    # unknown is not a pass.
+    out.append(("check_conclusion_missing",
+                dict(cfg=config(mode="on"),
+                     checks=[check_run(conclusion=None)]),
+                "block", "did not pass"))
+
+    # A status context that failed. The rollup mixes two shapes, and a
+    # context carries a `state` where a run carries a `conclusion`.
+    out.append(("status_context_failed",
+                dict(cfg=config(mode="on"),
+                     checks=[{"__typename": "StatusContext",
+                              "state": "FAILURE", "context": "Gates"}]),
+                "block", "did not pass"))
+
+    # A status context that succeeded is acceptable.
+    out.append(("status_context_success",
+                dict(cfg=config(mode="on"),
+                     checks=[{"__typename": "StatusContext",
+                              "state": "SUCCESS", "context": "Gates"}]),
+                "enable", ""))
+
     # The required check is not reported at all.
     out.append(("check_missing",
                 dict(cfg=config(mode="on"), checks=[check_run(name="Other")]),
                 "block", "not reported"))
+
+    # The ruleset requires a check the configuration does not name. The
+    # ruleset is the authority that will do the merging, so a check it
+    # requires has to be green whether or not the configuration lists
+    # it.
+    out.append(("ruleset_check_not_in_config",
+                dict(cfg=config(mode="on", checks=("Gates",)),
+                     checks=[check_run(name="Gates")],
+                     rulesets=[ruleset(checks=("Gates", "Nightly"))]),
+                "block", "not reported: Nightly"))
+
+    # The same ruleset check, reported and green.
+    out.append(("ruleset_check_green",
+                dict(cfg=config(mode="on", checks=("Gates",)),
+                     checks=[check_run(name="Gates"),
+                             check_run(name="Nightly")],
+                     rulesets=[ruleset(checks=("Gates", "Nightly"))]),
+                "enable", ""))
+
+    # The same ruleset check, reported and failed. The decision must
+    # refuse it: the ruleset is waiting for it.
+    out.append(("ruleset_check_failed",
+                dict(cfg=config(mode="on", checks=("Gates",)),
+                     checks=[check_run(name="Gates"),
+                             check_run(name="Nightly",
+                                       conclusion="FAILURE")],
+                     rulesets=[ruleset(checks=("Gates", "Nightly"))]),
+                "block", "did not pass: Nightly"))
+
+    # In shadow mode the ruleset's checks count too. The shadow record
+    # is what the disagreement rate is measured from, so it has to
+    # record what `on` mode would have decided.
+    out.append(("shadow_ruleset_check_not_green",
+                dict(cfg=config(mode="shadow", checks=("Gates",)),
+                     checks=[check_run(name="Gates")],
+                     rulesets=[ruleset(checks=("Gates", "Nightly"))]),
+                "block", "not reported: Nightly"))
+
+    # A ruleset that is not enforced holds no authority, so a check it
+    # names is not one anybody is waiting for. The refusal names the
+    # unenforced ruleset, which is the truer reason.
+    out.append(("unenforced_ruleset_does_not_constrain",
+                dict(cfg=config(mode="on", checks=("Gates",)),
+                     checks=[check_run(name="Gates")],
+                     rulesets=[ruleset(checks=("Gates", "Nightly"),
+                                       enforcement="disabled")]),
+                "block", "not enforced"))
 
     # The pull request touches a path the repository protects.
     out.append(("protected_path",
@@ -668,19 +754,37 @@ api() {
   endpoint=""
   method=""
   jq=""
+  args=()
   while [ $# -gt 0 ]; do
     case "$1" in
       -X) method="$2"; shift 2 ;;
       --jq) jq="$2"; shift 2 ;;
       --paginate|--slurp) shift ;;
+      -f|-F)
+        # A GraphQL variable. The mutation's own arguments are
+        # recorded so a test can read back which head and which merge
+        # method the write asked for.
+        args+=("$2")
+        shift 2 ;;
       -*) shift ;;
       *) if [ -z "$endpoint" ]; then endpoint="$1"; fi; shift ;;
     esac
   done
   case "$endpoint" in
+    graphql)
+      # The auto-merge mutation. Only the mutation's own variables are
+      # recorded, so a test can read back which head and which merge
+      # method the write asked for.
+      printf '%s\n' "${args[@]}" > "$STUB_DATA/graphql_vars.log"
+      # A failure is served when the test asks for one; otherwise the
+      # mutation succeeds.
+      if [ -f "$STUB_DATA/graphql_error.json" ]; then
+        cat "$STUB_DATA/graphql_error.json"; exit 0
+      fi
+      printf '%s\n' '{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"id":"PR_stub"}}}}'
+      exit 0 ;;
     */rulesets) cat "$STUB_DATA/rulesets.json"; exit 0 ;;
     */pulls/*/files) cat "$STUB_DATA/files.json"; exit 0 ;;
-    */pulls/*/auto-merge) cat "$STUB_DATA/auto_merge.json"; exit 0 ;;
     */pulls/*/reviews) cat "$STUB_DATA/reviews.json"; exit 0 ;;
     */contents/*)
       if [ -n "$jq" ]; then
@@ -735,8 +839,30 @@ def write_stub_gh(bin_dir: Path) -> None:
     gh.chmod(0o755)
 
 
+def auto_merge_write(data_dir: Path) -> list:
+    """Return the arguments the auto-merge mutation was asked for.
+
+    The stub records every GraphQL variable the driver passed, so this
+    reads back what the write actually asked GitHub for: which pull
+    request, which merge method and which head.
+    """
+    log = data_dir / "graphql_vars.log"
+    if not log.exists():
+        return []
+    out = []
+    for line in log.read_text().splitlines():
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        # The mutation's own text is not an argument.
+        if key.startswith("query"):
+            continue
+        out.append((key, value))
+    return out
+
+
 def install(data_dir: Path, pr_obj, reviews, checks, rulesets, files,
-            contents=None, auto_merge_response=None):
+            contents=None, graphql_error=None):
     (data_dir / "pr.json").write_text(json.dumps(pr_obj))
     (data_dir / "reviews.json").write_text(json.dumps([reviews]))
     (data_dir / "checks.json").write_text(
@@ -753,11 +879,13 @@ def install(data_dir: Path, pr_obj, reviews, checks, rulesets, files,
     else:
         payload = contents
     (data_dir / "contents.json").write_text(json.dumps(payload))
-    (data_dir / "auto_merge.json").write_text(
-        json.dumps(auto_merge_response
-                   if auto_merge_response is not None
-                   else {"auto_merge": {"enabled_by": {"login": REVIEWER}}}))
     (data_dir / "label.json").write_text(json.dumps({}))
+    # A GraphQL mutation that fails. GitHub answers such a request with
+    # HTTP 200 and an `errors` array, so the driver has to read the
+    # body to see the failure.
+    if graphql_error is not None:
+        (data_dir / "graphql_error.json").write_text(
+            json.dumps({"errors": [{"message": graphql_error}]}))
 
 
 def run_driver(data_dir: Path, bin_dir: Path, *extra: str,
@@ -820,14 +948,29 @@ def check_driver(failures):
                 f"{r.stderr.strip()!r}")
         elif not r.stdout.startswith("ENABLE"):
             failures.append(f"the driver printed {r.stdout.strip()!r}")
-        # The write went to GitHub's auto-merge endpoint, not to the
+        # The write went to GitHub's auto-merge mutation, not to the
         # merge endpoint. Nothing in this repository merges a pull
         # request.
         log = (data / "gh.log").read_text()
-        if "auto-merge" not in log:
-            failures.append("the driver did not call the auto-merge endpoint")
-        if "/merge" in log and "auto-merge" not in log:
+        if "graphql" not in log:
+            failures.append("the driver did not call the auto-merge mutation")
+        if "/merge" in log.replace("/merge-async", ""):
             failures.append("the driver called the merge endpoint")
+        # The mutation names the head the decision was made about, and
+        # the merge method the configuration asked for.
+        asked = dict(auto_merge_write(data))
+        if asked.get("expectedHeadOid") != HEAD:
+            failures.append(
+                f"the mutation named head {asked.get('expectedHeadOid')!r}, "
+                f"expected {HEAD!r}")
+        if asked.get("mergeMethod") != "SQUASH":
+            failures.append(
+                f"the mutation named method {asked.get('mergeMethod')!r}, "
+                f"expected 'SQUASH'")
+        if asked.get("pullRequestId") != PR_NODE_ID:
+            failures.append(
+                f"the mutation named pull request "
+                f"{asked.get('pullRequestId')!r}, expected {PR_NODE_ID!r}")
         if ledger.exists():
             entries = merge_ledger.load(ledger)
             if not entries or entries[0].get("decision") != "would_merge":
@@ -848,8 +991,7 @@ def check_driver(failures):
                 f"{r.stderr.strip()!r}")
         elif not r.stdout.startswith("SHADOW"):
             failures.append(f"the driver printed {r.stdout.strip()!r}")
-        log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append("the driver enabled auto-merge in shadow mode")
         entries = merge_ledger.load(ledger) if ledger.exists() else []
         if not entries:
@@ -877,7 +1019,7 @@ def check_driver(failures):
             failures.append(
                 f"the driver printed {r.stdout.strip()!r} for a protected path")
         log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append("the driver enabled auto-merge on a protected path")
         if "pr-loop:needs-merge" not in log:
             failures.append(
@@ -929,8 +1071,7 @@ def check_driver(failures):
             failures.append(
                 f"the driver exited {r.returncode} for an approval on "
                 f"another head; expected 1")
-        log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append("the driver enabled auto-merge on a stale head")
 
         # ---- the head moves between the decision and the write ----
@@ -958,8 +1099,7 @@ def check_driver(failures):
             failures.append(
                 f"the driver did not say the head moved: "
                 f"{r.stdout.strip()!r} {r.stderr.strip()!r}")
-        log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append(
                 "the driver enabled auto-merge after the head moved")
 
@@ -977,8 +1117,7 @@ def check_driver(failures):
             failures.append(
                 f"the driver exited {r.returncode} for a repository with no "
                 f"ruleset; expected 1")
-        log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append(
                 "the driver enabled auto-merge on a repository with no "
                 "ruleset")
@@ -998,7 +1137,7 @@ def check_driver(failures):
             failures.append(
                 f"an unconfigured repository gave {r.stdout.strip()!r}")
         log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append(
                 "the driver enabled auto-merge on an unconfigured repository")
 
@@ -1016,11 +1155,109 @@ def check_driver(failures):
         if r.returncode != 0:
             failures.append(
                 f"--check exited {r.returncode}: {r.stderr.strip()!r}")
-        log = (data / "gh.log").read_text()
-        if "auto-merge" in log:
+        if auto_merge_write(data):
             failures.append("--check enabled auto-merge")
         if ledger.exists():
             failures.append("--check wrote to the ledger")
+
+        # ---- a check that has finished and failed ----
+        #
+        # The decision must refuse a pull request whose required check
+        # has failed, and nothing may be armed. A finished check run
+        # reports `status: "COMPLETED"` with `conclusion: "FAILURE"`.
+        data = tmp / "failed-check"
+        data.mkdir()
+        install(data, pr(), good_reviews, [check_run(conclusion="FAILURE")],
+                [ruleset()], [])
+        config_path = tmp / "failed-check.toml"
+        write_config(config_path, auto_merge="on", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"],
+                     allow_same_family=True)
+        ledger = tmp / "failed-check-ledger.jsonl"
+        r = run_driver(data, bin_dir, config_path=config_path, ledger=ledger)
+        if r.returncode != 1:
+            failures.append(
+                f"the driver exited {r.returncode} for a failed check; "
+                f"expected 1")
+        if "did not pass" not in (r.stdout + r.stderr):
+            failures.append(
+                f"the driver did not say the check did not pass: "
+                f"{r.stdout.strip()!r} {r.stderr.strip()!r}")
+        if auto_merge_write(data):
+            failures.append(
+                "the driver enabled auto-merge on a failed check")
+        if ledger.exists():
+            failures.append(
+                "the driver recorded a decision for a failed check")
+
+        # ---- a check the ruleset requires and the configuration does
+        # not name ----
+        #
+        # The ruleset is the authority that will do the merging, so a
+        # check it requires has to be green whether or not the
+        # configuration lists it.
+        data = tmp / "ruleset-check"
+        data.mkdir()
+        install(data, pr(), good_reviews, [check_run(name="Gates")],
+                [ruleset(checks=("Gates", "Nightly"))], [])
+        config_path = tmp / "ruleset-check.toml"
+        write_config(config_path, auto_merge="on", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"],
+                     allow_same_family=True)
+        ledger = tmp / "ruleset-check-ledger.jsonl"
+        r = run_driver(data, bin_dir, config_path=config_path, ledger=ledger)
+        if r.returncode != 1:
+            failures.append(
+                f"the driver exited {r.returncode} for a pull request "
+                f"missing a check the ruleset requires; expected 1")
+        if "Nightly" not in (r.stdout + r.stderr):
+            failures.append(
+                f"the driver did not name the missing check: "
+                f"{r.stdout.strip()!r} {r.stderr.strip()!r}")
+        if auto_merge_write(data):
+            failures.append(
+                "the driver enabled auto-merge without a check the ruleset "
+                "requires")
+
+        # ---- the mutation fails ----
+        #
+        # GitHub answers a GraphQL request with HTTP 200 even when the
+        # mutation failed, so the driver has to read the body. A failed
+        # mutation is a failure, not a decision, and it records
+        # nothing.
+        data = tmp / "mutation-fails"
+        data.mkdir()
+        install(data, pr(), good_reviews, [check_run()], [ruleset()], [],
+                graphql_error="Auto merge is not allowed on this repository")
+        config_path = tmp / "mutation-fails.toml"
+        write_config(config_path, auto_merge="on", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"],
+                     allow_same_family=True)
+        ledger = tmp / "mutation-fails-ledger.jsonl"
+        r = run_driver(data, bin_dir, config_path=config_path, ledger=ledger)
+        if r.returncode != 2:
+            failures.append(
+                f"the driver exited {r.returncode} when the mutation "
+                f"failed; expected 2")
+        if "Auto merge is not allowed" not in r.stderr:
+            failures.append(
+                f"the driver did not report why the mutation failed: "
+                f"{r.stderr.strip()!r}")
+        if ledger.exists():
+            failures.append(
+                "the driver recorded a decision when the mutation failed")
+
+        # ---- the driver does not use a REST auto-merge endpoint ----
+        #
+        # There is no REST endpoint for this: `PUT
+        # /repos/{owner}/{repo}/pulls/{pull_number}/auto-merge` does
+        # not exist and answers 404. The write is the GraphQL
+        # mutation.
+        driver_text = DRIVER.read_text()
+        if "pulls/{number}/auto-merge" in driver_text:
+            failures.append("the driver calls the REST auto-merge endpoint")
+        if '"-X", "PUT"' in driver_text:
+            failures.append("the driver issues a PUT request")
 
 
 # ----- the ledger and config tools ----------------------------------------
@@ -1168,21 +1405,22 @@ def check_tools(failures):
 def check_no_merge(failures):
     """Nothing in this repository merges a pull request.
 
-    The driver's only write to GitHub is the auto-merge endpoint, and
-    the auto-merge endpoint is not a merge: it asks GitHub to merge
+    The driver's only write to GitHub is the `enablePullRequestAutoMerge`
+    mutation, and that mutation is not a merge: it asks GitHub to merge
     later, under the repository's ruleset. A call to the merge endpoint
     would be a tool holding the merge rule itself, which is the thing
     the ruleset exists to prevent.
     """
     text = DRIVER.read_text()
-    if "/merge" in text.replace("/auto-merge", ""):
-        failures.append("the driver names the merge endpoint")
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("#"):
             continue
         if "pulls/{" in stripped and "/merge" in stripped:
             failures.append(f"the driver calls the merge endpoint: {line!r}")
+    # The merge mutation is the one the driver must not make.
+    if "mergePullRequest" in text:
+        failures.append("the driver calls the merge mutation")
 
 
 def main() -> int:
