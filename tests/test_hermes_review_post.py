@@ -30,6 +30,7 @@ HEAD_SHA = "1111111111111111111111111111111111111111"
 # it was asked to post.
 STUB_GH = r"""#!/usr/bin/env bash
 printf '%s\n' "$*" >> "$STUB_DATA/gh.log"
+printf '%s\n' "${GH_TOKEN:-unset}" >> "$STUB_DATA/gh.token"
 case "$1" in
   pr)
     shift
@@ -65,6 +66,15 @@ case "$1" in
     # The query string is stripped before the endpoint is matched: the
     # paginated endpoints carry one.
     bare="${endpoint%%\?*}"
+    # A scenario can make the review-reading endpoints fail, so the
+    # driver can be seen to refuse rather than review without them.
+    if [ -n "$STUB_CONTEXT_FAILS" ]; then
+      case "$bare" in
+        */reviews|*/pulls/*/comments|*/issues/*/comments)
+          echo "gh: stub failure" >&2
+          exit 1 ;;
+      esac
+    fi
     case "$bare" in
       */reviews/*/comments) cat "$STUB_DATA/review_comments.json" ;;
       */reviews) cat "$STUB_DATA/reviews.json" ;;
@@ -148,6 +158,7 @@ class Harness:
         self.data = root / "data"
         self.data.mkdir()
         (self.data / "gh.log").write_text("")
+        (self.data / "gh.token").write_text("")
         (self.data / "agent.log").write_text("")
         for name in ("reviews.json", "review_comments.json",
                      "pull_comments.json", "issue_comments.json"):
@@ -482,6 +493,47 @@ def case_the_standing_priors_are_folded_in(failures):
             fail(failures, "priors: the priors are not in the prompt")
 
 
+def case_the_context_is_read_with_the_reviewers_token(failures):
+    """A reviewer's own review is not visible to an account that is not
+    the reviewer, so the context is read with the reviewer's token."""
+    with tempfile.TemporaryDirectory() as t:
+        h = Harness(Path(t))
+        h.write_findings([finding()])
+        # The stub gh records the token it was called with.
+        result = h.run()
+        if result.returncode != 0:
+            fail(failures, "token: exit", result.returncode)
+            fail(failures, "token: stderr", result.stderr[-300:])
+            return
+        tokens = h.data.joinpath("gh.token").read_text().splitlines()
+        if not tokens:
+            fail(failures, "token: no gh call recorded a token")
+            return
+        if "the-reviewer-token" not in tokens:
+            fail(failures, "token: the reviewer's token was not used",
+                 tokens[:5])
+
+
+def case_a_context_that_cannot_be_read_is_a_refusal(failures):
+    """A failure to read the previous review is a refusal, not an empty
+    context. A reviewer that sees no previous findings re-raises the
+    ones the implementer already answered."""
+    with tempfile.TemporaryDirectory() as t:
+        h = Harness(Path(t))
+        h.write_findings([finding()])
+        h.env["STUB_CONTEXT_FAILS"] = "1"
+        result = h.run()
+        if result.returncode == 0:
+            fail(failures, "context-fail: exited 0")
+            return
+        if h.posted() is not None:
+            fail(failures, "context-fail: a review was posted anyway")
+            return
+        if "previous review" not in result.stderr:
+            fail(failures, "context-fail: the refusal does not say what "
+                 "could not be read", result.stderr.strip()[:300])
+
+
 def main() -> int:
     if not DRIVER.is_file():
         print(f"FAIL driver not built: {DRIVER}")
@@ -501,7 +553,8 @@ def main() -> int:
     print("PASS hermes-review-post: a defect requests changes; a fixed "
           "branch approves; a head moved during the run posts nothing; a "
           "head moved before the run is not reviewed; matching families "
-          "refused; everything in the prompt; the priors folded in; an "
+          "refused; everything in the prompt; the priors folded in; the "
+          "reviewer's token; a context that cannot be read; an "
           "unlocatable finding is dropped")
     return 0
 
@@ -515,6 +568,8 @@ CASES = (case_a_defect_gets_request_changes,
          case_the_review_text_carries_no_round_numbers,
          case_everything_the_reviewer_needs_is_in_the_prompt,
          case_the_standing_priors_are_folded_in,
+         case_the_context_is_read_with_the_reviewers_token,
+         case_a_context_that_cannot_be_read_is_a_refusal,
          case_an_unlocatable_finding_is_not_posted)
 
 

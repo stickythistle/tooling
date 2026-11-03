@@ -124,11 +124,25 @@ TIMEOUT=$(review_timeout_for "$PROFILE" "$TIMEOUT_OPT")
 # and again before the review is posted: the second read is the one that
 # decides, because a head that moved during the run makes the review
 # about a tree nobody is going to look at.
-read -r HEAD_SHA BASE_REF < <(
+#
+# The read is checked, not just its output. A `gh` call that fails
+# leaves the read empty, and under `set -e` a process substitution that
+# fails takes the script down before the empty check runs -- so a
+# GitHub outage would be an unexplained exit rather than a refusal that
+# says what could not be read.
+HEAD_SHA=""
+BASE_REF=""
+if ! read -r HEAD_SHA BASE_REF < <(
 	gh pr view "$PR" --repo "$REPO" \
 		--json headRefOid,baseRefName --jq '[.headRefOid, .baseRefName] | @tsv'
-)
-[[ -n "${HEAD_SHA:-}" ]] || { echo "could not read the head of PR $PR" >&2; exit 1; }
+); then
+	echo "could not read the head of PR $PR" >&2
+	exit 1
+fi
+if [[ -z "${HEAD_SHA:-}" ]]; then
+	echo "could not read the head of PR $PR" >&2
+	exit 1
+fi
 
 if [[ "$HEAD_SHA" != "$SHA" ]]; then
 	echo "not reviewing: PR $PR is at ${HEAD_SHA:0:12} but the review was asked to run against ${SHA:0:12}" >&2
@@ -140,6 +154,16 @@ fi
 # the tree and nothing else.
 WORK=$(mktemp -d -t hermes-review-post-XXXXXX)
 WT="$WORK/tree"
+# The commit has to be in the checkout. A sha the gate named that this
+# clone does not have is a clone that needs fetching, and a review of
+# the wrong tree is worse than no review.
+if ! git cat-file -e "$SHA^{commit}" 2>/dev/null; then
+	git fetch --quiet origin "$SHA" 2>/dev/null || true
+fi
+if ! git cat-file -e "$SHA^{commit}" 2>/dev/null; then
+	echo "refusing to review: $SHA is not in $REPO_DIR and could not be fetched" >&2
+	exit 1
+fi
 git worktree add --detach "$WT" "$SHA" --quiet
 cleanup() {
 	git -C "$REPO_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true
@@ -173,11 +197,18 @@ git diff "$MERGE_BASE...$SHA" >"$DIFF_FILE"
 
 # What the reviewer has to judge this against: the previous findings, the
 # implementer's answers, and what a person has said since.
+#
+# A failure to read them is a refusal, not an empty context. A reviewer
+# that sees no previous findings re-raises the ones the implementer
+# already answered, and the loop never converges; a refusal says the
+# context could not be read, which is a fact somebody can act on.
 CONTEXT_FILE="$WORK/context.json"
-python3 "$LIB/review_context.py" --repo "$REPO" --pr "$PR" \
-	--reviewer "${REVIEWER_LOGIN:-}" \
-	--implementer "${IMPLEMENTER_LOGIN:-}" >"$CONTEXT_FILE" 2>/dev/null \
-	|| printf '{"findings": [], "answers": [], "comments": []}\n' >"$CONTEXT_FILE"
+if ! python3 "$LIB/review_context.py" --repo "$REPO" --pr "$PR" \
+		--reviewer "${REVIEWER_LOGIN:-}" \
+		--implementer "${IMPLEMENTER_LOGIN:-}" >"$CONTEXT_FILE"; then
+	echo "refusing to review: could not read the pull request's previous review" >&2
+	exit 1
+fi
 
 FINDINGS="$WORK/findings.json"
 PROMPT_FILE="$WORK/prompt.txt"

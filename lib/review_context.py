@@ -25,6 +25,7 @@ reviewer's own review is what is being read.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 from typing import Any, NoReturn
@@ -47,10 +48,16 @@ def die(message: str) -> "NoReturn":
 
 
 def gh_json(endpoint: str, repo: str, token: str | None = None) -> Any:
-    """One `gh api` call, parsed. GitHub's errors are the caller's."""
+    """One `gh api` call, parsed. GitHub's errors are the caller's.
+
+    The token is the reader's own, so the call runs as the role that
+    reads the pull request. A read that fell back to the stored
+    credentials would read whatever account happens to be logged in, and
+    a reviewer's own review is not visible to an account that is not the
+    reviewer.
+    """
     env = None
     if token:
-        import os
         env = dict(os.environ)
         env["GH_TOKEN"] = token
     result = subprocess.run(
@@ -189,7 +196,8 @@ def _severity_of(body: str) -> str:
 
 
 def answers_from_replies(repo: str, pr: int, findings: list[dict],
-                         implementer: str = "") -> list[dict]:
+                         implementer: str = "",
+                         token: str | None = None) -> list[dict]:
     """The implementer's answers to the findings, with their reasons.
 
     An answer is a reply to one of the findings' comments that carries
@@ -203,7 +211,8 @@ def answers_from_replies(repo: str, pr: int, findings: list[dict],
              if f.get("comment_id") is not None}
     if not by_id:
         return []
-    comments = gh_json_pages(f"repos/{repo}/pulls/{pr}/comments", repo)
+    comments = gh_json_pages(f"repos/{repo}/pulls/{pr}/comments", repo,
+                             token)
     answers = []
     for comment in comments:
         if not isinstance(comment, dict):
@@ -289,14 +298,21 @@ def comments_since(reviews: list, comments: list, reviewer: str,
 
 def collect(repo: str, pr: int, reviewer: str = "",
             implementer: str = "") -> dict:
-    """Everything the reviewer has to judge the next round against."""
-    reviews = gh_json_pages(f"repos/{repo}/pulls/{pr}/reviews", repo)
-    comments = gh_json_pages(f"repos/{repo}/pulls/{pr}/comments", repo)
-    issue_comments = gh_json_pages(f"repos/{repo}/issues/{pr}/comments", repo)
+    """Everything the reviewer has to judge the next round against.
+
+    The pull request is read with the reviewer's own token: the
+    reviewer's own review is not visible to an account that is not the
+    reviewer, and the context this returns is the reviewer's own past.
+    """
+    token = (os.environ.get("REVIEWER_GH_TOKEN") or "").strip()
+    reviews = gh_json_pages(f"repos/{repo}/pulls/{pr}/reviews", repo, token)
+    comments = gh_json_pages(f"repos/{repo}/pulls/{pr}/comments", repo, token)
+    issue_comments = gh_json_pages(
+        f"repos/{repo}/issues/{pr}/comments", repo, token)
 
     review = latest_review(reviews, reviewer)
-    findings = findings_from_review(review, repo, pr)
-    answers = answers_from_replies(repo, pr, findings, implementer)
+    findings = findings_from_review(review, repo, pr, token)
+    answers = answers_from_replies(repo, pr, findings, implementer, token)
 
     # A conversation comment is a person's comment too.
     conversation = []
