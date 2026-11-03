@@ -35,9 +35,13 @@ case "$1" in
     shift
     case "$*" in
       *headRefOid*baseRefName*)
+        # The read before the review runs: the head and the base branch
+        # in one call.
         printf '%s\t%s\n' "$STUB_HEAD" "$STUB_BASE" ;;
       *headRefOid*)
-        printf '%s\n' "$STUB_HEAD" ;;
+        # The read before the review is posted. The head can have moved
+        # since the first read, and that is what this one is for.
+        printf '%s\n' "${STUB_HEAD_AFTER_FIRST:-$STUB_HEAD}" ;;
     esac
     ;;
   api)
@@ -269,12 +273,22 @@ def case_a_fixed_branch_gets_an_approval(failures):
 
 def case_a_head_pushed_during_the_run_causes_no_post(failures):
     """The issue's third acceptance: a head pushed during the run causes
-    no post."""
+    no post.
+
+    The head is read twice: once before the review runs and once after.
+    The second read is the one that decides, because a head that moved
+    while the review was running makes the review about a tree nobody is
+    going to look at. The stub moves the head between the two reads, so
+    this case exercises the second check and not the first.
+    """
     with tempfile.TemporaryDirectory() as t:
         h = Harness(Path(t))
         h.write_findings([finding()])
-        # The head has moved by the time the review would post.
-        h.env["STUB_HEAD"] = "2222222222222222222222222222222222222222"
+        # The head moves after the first read and before the second: the
+        # stub answers the first read with the head the review is about,
+        # and every read after that with a different one.
+        h.env["STUB_HEAD_AFTER_FIRST"] = "2222222222222222222222222222222222222222"
+        h.env["STUB_HEAD"] = h.head
         result = h.run()
         if result.returncode != 0:
             fail(failures, "moved: exit", result.returncode)
@@ -282,9 +296,34 @@ def case_a_head_pushed_during_the_run_causes_no_post(failures):
         if h.posted() is not None:
             fail(failures, "moved: a review was posted anyway")
             return
+        # The refusal says the head moved while the review ran, which is
+        # the second check and not the first.
+        if "while the review ran" not in result.stderr:
+            fail(failures, "moved: the refusal does not say the head moved "
+                 "during the run", result.stderr.strip()[:300])
+
+
+def case_a_head_that_moved_before_the_run_causes_no_post(failures):
+    """A head that has already moved when the run starts is not reviewed
+    at all: the review is about the commit the gate named, and the
+    pull request is somewhere else."""
+    with tempfile.TemporaryDirectory() as t:
+        h = Harness(Path(t))
+        h.write_findings([finding()])
+        h.env["STUB_HEAD"] = "2222222222222222222222222222222222222222"
+        result = h.run()
+        if result.returncode != 0:
+            fail(failures, "moved-before: exit", result.returncode)
+            return
+        if h.posted() is not None:
+            fail(failures, "moved-before: a review was posted anyway")
+            return
         if "not reviewing" not in result.stderr:
-            fail(failures, "moved: the refusal does not say what happened",
-                 result.stderr.strip()[:200])
+            fail(failures, "moved-before: the refusal does not say the "
+                 "review was not run", result.stderr.strip()[:300])
+        # The model must not have run: there was nothing to review.
+        if h.data.joinpath("agent.log").read_text().strip():
+            fail(failures, "moved-before: the model ran anyway")
 
 
 def case_matching_families_are_refused_before_the_model_runs(failures):
@@ -460,7 +499,8 @@ def main() -> int:
             print(" -", f)
         return 1
     print("PASS hermes-review-post: a defect requests changes; a fixed "
-          "branch approves; a moved head posts nothing; matching families "
+          "branch approves; a head moved during the run posts nothing; a "
+          "head moved before the run is not reviewed; matching families "
           "refused; everything in the prompt; the priors folded in; an "
           "unlocatable finding is dropped")
     return 0
@@ -469,6 +509,7 @@ def main() -> int:
 CASES = (case_a_defect_gets_request_changes,
          case_a_fixed_branch_gets_an_approval,
          case_a_head_pushed_during_the_run_causes_no_post,
+         case_a_head_that_moved_before_the_run_causes_no_post,
          case_matching_families_are_refused_before_the_model_runs,
          case_the_review_is_posted_as_the_reviewer,
          case_the_review_text_carries_no_round_numbers,
