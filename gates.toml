@@ -260,6 +260,41 @@ name = "finding-check tests"
 when = '^(bin/finding-check|tests/test_finding_check\.py)$'
 run = "python3 tests/test_finding_check.py"
 
+# gh_as is the seam between a role and the account it acts as: the
+# caller's own token, set for one call, and a refusal when it is
+# unset. A review posted as the implementer is not a review, so the
+# token has to be the role's own. The gate names the helper and the
+# suite that pins it.
+[[gates]]
+name = "gh_as tests"
+when = '^(lib/common\.sh|tests/test_gh_as\.py)$'
+run = "python3 tests/test_gh_as.py"
+
+# The review that gets posted: the verdict, the commit it is bound to,
+# and the text, which carries no round numbers and no finding labels
+# because implementers copy them into commit messages and files.
+[[gates]]
+name = "review_post tests"
+when = '^(lib/review_post\.py|tests/test_review_post\.py)$'
+run = "python3 tests/test_review_post.py"
+
+# The refusal that stops a review being run by the author's own model
+# family. It runs before the model does, so it is pinned on its own.
+[[gates]]
+name = "model_family tests"
+when = '^(lib/model_family\.py|tests/test_model_family\.py)$'
+run = "python3 tests/test_model_family.py"
+
+# The posted review, end to end: the real git builds the worktree and
+# the diff, the real finding-check locates the quotes, and the real
+# review_post decides the verdict. Only gh and the agent are stubbed.
+# The gate names the driver and every module it drives, so a change to
+# any of them runs the suite that pins them.
+[[gates]]
+name = "hermes-review-post tests"
+when = '^(bin/hermes-review-post|lib/(review_post|review_prompt|review_context|model_family)\.py|bin/finding-check|tests/test_hermes_review_post\.py)$'
+run = "python3 tests/test_hermes_review_post.py"
+
 [[gates]]
 name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'

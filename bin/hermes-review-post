@@ -1,0 +1,282 @@
+#!/usr/bin/env bash
+# Post a hermes review on a pull request, as a review the loop can act on.
+#
+# The review loop needs a verdict on the pull request itself: a review
+# state the gate can read, a finding on the line it is about, and
+# nothing a later round has to interpret. This driver makes one.
+#
+# The commit under review is the one the gate named. The gate prints
+# `REVIEW <sha>`, and the sha is what the review is about: if the pull
+# request's head has moved by the time the review would be posted, the
+# review is about a tree nobody is going to look at, so nothing is
+# posted.
+#
+# Everything the reviewer needs is in the prompt. The MiniMax lane
+# refuses a procedure it has to read from a file, and treats the file as
+# prompt injection, so the diff, the previous findings, the implementer's
+# answers and a person's comments are all inlined.
+#
+# The findings are checked against the source before anything is posted.
+# A quote that is not in the file is a claim about code nobody could
+# find, and posting it puts something on the pull request that a person
+# has to disprove rather than one they can read.
+#
+# The review is posted as the reviewer, with `commit_id` naming the
+# commit it read. It is REQUEST_CHANGES when something blocking
+# survives, and APPROVE when nothing does.
+set -euo pipefail
+
+# readlink -f: installed as a symlink on PATH, and lib/ sits beside the real file.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+PR=""
+SHA=""
+REPO=""
+REQUESTED_PROFILE=""
+TIMEOUT_OPT=""
+EXTRA=""
+
+usage() {
+	cat <<'EOF'
+usage: hermes-review-post --pr N --sha SHA [--repo OWNER/NAME]
+                           [--profile NAME] [--timeout SECONDS] [--extra TEXT]
+
+  --pr N      The pull request.
+  --sha SHA   The commit under review. It is the sha the gate named: the
+              review is about that tree, and nothing is posted if the
+              pull request's head has moved since.
+  --repo      owner/name. Defaults to the checkout's origin remote.
+  --profile   The reviewer's Hermes profile. Defaults to $REVIEWER_PROFILE.
+  --timeout   Seconds before the review is abandoned. Defaults to the
+              profile's own timeout.
+  --extra     Text folded into the prompt: the change's intent, and the
+              product decisions behind it.
+
+The review is posted as the reviewer: REVIEWER_LOGIN and
+REVIEWER_GH_TOKEN must be set. The reviewer and the implementer must run
+different model families: REVIEWER_MODEL_FAMILY and
+IMPLEMENTER_MODEL_FAMILY must say so. See hosts.env.example.
+EOF
+}
+
+usage_error() {
+	usage >&2
+	exit 2
+}
+
+# Positional collection, so the flags may come in any order and a flag's
+# value is never mistaken for a positional.
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--pr) [ $# -ge 2 ] || usage_error; PR="$2"; shift 2 ;;
+	--sha) [ $# -ge 2 ] || usage_error; SHA="$2"; shift 2 ;;
+	--repo) [ $# -ge 2 ] || usage_error; REPO="$2"; shift 2 ;;
+	--profile) [ $# -ge 2 ] || usage_error; REQUESTED_PROFILE="$2"; shift 2 ;;
+	--timeout) [ $# -ge 2 ] || usage_error; TIMEOUT_OPT="$2"; shift 2 ;;
+	--extra) [ $# -ge 2 ] || usage_error; EXTRA="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) POSITIONAL+=("$1"); shift ;;
+	esac
+done
+[[ ${#POSITIONAL[@]} -eq 0 ]] || { echo "unexpected argument: ${POSITIONAL[0]}" >&2; usage_error; }
+[[ -n "$PR" ]] || { echo "--pr is required" >&2; usage_error; }
+[[ -n "$SHA" ]] || { echo "--sha is required" >&2; usage_error; }
+
+# The reviewer and the implementer must not be the same model family.
+# The check runs before the model does: a refusal now costs a second, and
+# a verdict from the author's own family costs the whole loop.
+[[ -n "${IMPLEMENTER_PROFILE:-}" ]] || { echo "set IMPLEMENTER_PROFILE to the implementer's Hermes profile (see hosts.env.example)" >&2; exit 2; }
+if [[ -n "$REQUESTED_PROFILE" ]]; then
+	PROFILE="$REQUESTED_PROFILE"
+else
+	[[ -n "${REVIEWER_PROFILE:-}" ]] || { echo "set REVIEWER_PROFILE to the reviewer's Hermes profile (see hosts.env.example)" >&2; exit 2; }
+	PROFILE="$REVIEWER_PROFILE"
+fi
+
+if ! python3 "$LIB/model_family.py" --reviewer "$PROFILE" \
+		--implementer "$IMPLEMENTER_PROFILE"; then
+	echo "refusing to review: the reviewer and the implementer must run different model families" >&2
+	exit 2
+fi
+
+# The reviewer's own credentials. A review posted as the implementer is
+# not a review, so this refuses rather than falling back to whatever
+# account gh happens to have.
+gh_role_login reviewer >/dev/null
+
+REPO_DIR=$(git rev-parse --show-toplevel)
+cd "$REPO_DIR"
+
+if [[ -z "$REPO" ]]; then
+	REPO=$(git remote get-url origin | sed -E 's#\.git$##; s#.*[:/]([^/]+/[^/]+)$#\1#')
+fi
+[[ -n "$REPO" ]] || { echo "could not resolve the repository (owner/name)" >&2; exit 1; }
+
+TIMEOUT=$(review_timeout_for "$PROFILE" "$TIMEOUT_OPT")
+
+# The head the pull request is at now. It is read before the review runs
+# and again before the review is posted: the second read is the one that
+# decides, because a head that moved during the run makes the review
+# about a tree nobody is going to look at.
+read -r HEAD_SHA BASE_REF < <(
+	gh pr view "$PR" --repo "$REPO" \
+		--json headRefOid,baseRefName --jq '[.headRefOid, .baseRefName] | @tsv'
+)
+[[ -n "${HEAD_SHA:-}" ]] || { echo "could not read the head of PR $PR" >&2; exit 1; }
+
+if [[ "$HEAD_SHA" != "$SHA" ]]; then
+	echo "not reviewing: PR $PR is at ${HEAD_SHA:0:12} but the review was asked to run against ${SHA:0:12}" >&2
+	exit 0
+fi
+
+# The worktree is detached at the commit under review. A branch would
+# carry a name the gate never mentioned, and the review has to be about
+# the tree and nothing else.
+WORK=$(mktemp -d -t hermes-review-post-XXXXXX)
+WT="$WORK/tree"
+git worktree add --detach "$WT" "$SHA" --quiet
+cleanup() {
+	git -C "$REPO_DIR" worktree remove --force "$WT" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
+# The diff, against the merge-base with the base branch: the fork point,
+# so commits the base gained since do not count as this change.
+#
+# The base is resolved to the fork point, and a base that does not
+# resolve is a refusal rather than an empty diff. A diff against the
+# commit itself is empty on every branch, and a review of an empty diff
+# looks exactly like a review of a change that is not there.
+git fetch --quiet origin "$BASE_REF" 2>/dev/null || true
+MERGE_BASE=$(git merge-base "origin/$BASE_REF" "$SHA" 2>/dev/null || true)
+if [[ -z "$MERGE_BASE" ]]; then
+	# No remote tracking ref for the base branch. The fork point is the
+	# root commit, which is what the change is against when there is
+	# nothing else to be against.
+	MERGE_BASE=$(git rev-list --max-parents=0 "$SHA" | tail -1)
+fi
+[[ -n "$MERGE_BASE" ]] || { echo "could not resolve the base of $SHA" >&2; exit 1; }
+if [[ "$MERGE_BASE" == "$SHA" ]]; then
+	echo "refusing to review: $SHA has no change against its base" >&2
+	exit 1
+fi
+# The diff goes to a file rather than an argument: it can be large, and
+# it can hold quotes and backticks.
+DIFF_FILE="$WORK/changes.diff"
+git diff "$MERGE_BASE...$SHA" >"$DIFF_FILE"
+
+# What the reviewer has to judge this against: the previous findings, the
+# implementer's answers, and what a person has said since.
+CONTEXT_FILE="$WORK/context.json"
+python3 "$LIB/review_context.py" --repo "$REPO" --pr "$PR" \
+	--reviewer "${REVIEWER_LOGIN:-}" \
+	--implementer "${IMPLEMENTER_LOGIN:-}" >"$CONTEXT_FILE" 2>/dev/null \
+	|| printf '{"findings": [], "answers": [], "comments": []}\n' >"$CONTEXT_FILE"
+
+FINDINGS="$WORK/findings.json"
+PROMPT_FILE="$WORK/prompt.txt"
+
+# The prompt is built by the module, so the driver does not assemble
+# prose. The paths are arguments, not a here-string, so a diff with
+# quotes and backticks in it survives intact.
+#
+# The standing priors are folded in: they are the project's domain
+# facts, and a review that rediscovers them is a review that wastes
+# the run.
+PRIOR_TEXT="$EXTRA"
+if [[ -n "${REVIEW_PRIORS:-}" && -r "$REVIEW_PRIORS" ]]; then
+	if [[ -n "$PRIOR_TEXT" ]]; then
+		PRIOR_TEXT="$PRIOR_TEXT
+$(cat "$REVIEW_PRIORS")"
+	else
+		PRIOR_TEXT=$(cat "$REVIEW_PRIORS")
+	fi
+fi
+
+python3 "$LIB/review_prompt.py" \
+	--diff "$DIFF_FILE" \
+	--out "$PROMPT_FILE" \
+	--findings-out "$FINDINGS" \
+	--previous "$CONTEXT_FILE" \
+	--priors "$PRIOR_TEXT" \
+	--head "$SHA" \
+	--base "$MERGE_BASE" \
+	--worktree "$WT"
+
+# The reviewer runs with the review slot and the GPU group lock, so two
+# reviews do not land on one model server and a local profile does not
+# fight the implementer for the card.
+acquire_review_slot "$PROFILE"
+acquire_gpu_lock "$PROFILE"
+
+set +e
+timeout "$TIMEOUT" "$BASH" -c '
+	. "$1/lib/common.sh"
+	shift
+	hermes_query "$@" 8>&- 9>&-
+' bash "$BIN_DIR/.." \
+	"$HERMES -m hermes_cli.main" "$PROMPT_FILE" \
+	"$WORK/stdout.txt" "$WORK/stderr.txt" \
+	-p "$PROFILE" -- --skills swe-reviewer --yolo 9>&-
+RC=$?
+set -e
+exec 9>&-
+exec 8>&-
+if [[ "$RC" -ne 0 ]]; then
+	echo "hermes review exited $RC (timeout was ${TIMEOUT}s)" >&2
+	tail -20 "$WORK/stderr.txt" >&2
+	exit "$RC"
+fi
+
+if [[ ! -s "$FINDINGS" ]]; then
+	echo "the reviewer wrote no findings file" >&2
+	exit 1
+fi
+
+# The findings are checked against the source before anything is posted.
+# An unlocatable finding and a redaction artifact are dropped here.
+LOCATED="$WORK/located.json"
+python3 "$BIN_DIR/finding-check" "$WT" "$FINDINGS" --base "$MERGE_BASE" \
+	>"$LOCATED"
+
+# The review that gets posted: the verdict, the body, and one inline
+# comment per surviving finding.
+REVIEW="$WORK/review.json"
+python3 "$LIB/review_post.py" "$LOCATED" --head "$SHA" --out "$REVIEW"
+
+POST=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["post"])' "$REVIEW")
+if [[ "$POST" != "True" ]]; then
+	REASON=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["reason"])' "$REVIEW")
+	echo "not posting: $REASON" >&2
+	exit 0
+fi
+
+# The head is read again, after the review ran. A head that moved while
+# the review was running makes the review about a tree nobody is going
+# to look at, and posting it would ask the implementer to fix a tree
+# that is no longer there.
+NOW_HEAD=$(gh pr view "$PR" --repo "$REPO" --json headRefOid --jq .headRefOid)
+if [[ "$NOW_HEAD" != "$SHA" ]]; then
+	echo "not posting: the head moved to ${NOW_HEAD:0:12} while the review ran" >&2
+	exit 0
+fi
+
+# The review is posted as the reviewer, with the commit it read. It is
+# one review, so the gate sees one round.
+PAYLOAD="$WORK/payload.json"
+python3 "$LIB/review_post.py" --payload --review "$REVIEW" --out "$PAYLOAD"
+
+if gh_as reviewer api --method POST \
+		"repos/$REPO/pulls/$PR/reviews" --input "$PAYLOAD" >/dev/null; then
+	EVENT=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["event"])' "$REVIEW")
+	echo "posted: $PROFILE reviewed ${SHA:0:12} and the review is $EVENT" >&2
+else
+	echo "could not post the review on PR #$PR" >&2
+	exit 1
+fi
