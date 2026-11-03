@@ -1204,6 +1204,234 @@ def case_the_ledger_names_the_reviewers_brief(failures):
                   "the retry budget is 60s", Path(brief).read_text(), failures)
 
 
+def case_done_refuses_a_commit_the_review_never_saw(failures):
+    """A commit made after the review is not finished under the review's say-so.
+
+    The lane can finish again after the round was reviewed: another
+    implementation commits, and its lane-final record names that new
+    commit. The lane is then settled, so the settle check passes -- but
+    the round was reviewed at the old commit, and the round's decisions
+    say nothing about the new one.
+
+    The decision file here names the *new* commit, the way a decider
+    working from the new tree would write it. So the decisions
+    themselves are usable -- it is the head check that refuses, because
+    the round was reviewed at a different commit. Without that check the
+    branch is squashed and pushed at a commit no review saw.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        reviewed = head(env.repo)
+
+        # The lane runs again and commits on top of the reviewed commit.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\nand more\n")
+        git(env.repo, "commit", "-qam", "a commit the review never saw")
+        committed = head(env.repo)
+        if committed == reviewed:
+            fail(failures, "done-unreviewed: the second commit did not happen")
+            return
+        # The lane records its new head, so the lane is settled.
+        env.settle()
+
+        # The decider wrote the decisions against the new tree.
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"head": committed,
+             "decisions": [{"id": fid, "decision": "reject",
+                            "reason": "deliberate"}]}))
+
+        r = env.run(str(env.repo), "--done", "--issue", "7",
+                    "--base", "origin/main")
+        assert_eq("done-unreviewed: rc is a refusal", 1, r.returncode,
+                  failures)
+        assert_in("done-unreviewed: says why", "moved",
+                  r.stdout + r.stderr, failures)
+        creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+        assert_eq("done-unreviewed: no pull request was opened", 0,
+                  len(creates), failures)
+        # The branch was not pushed either: the commit nobody reviewed
+        # must not reach the remote.
+        pushed = subprocess.run(
+            ["git", "-C", str(env.bare), "rev-parse", "feature"],
+            capture_output=True, text=True)
+        if pushed.returncode == 0:
+            assert_eq("done-unreviewed: the remote branch was not moved",
+                      reviewed, pushed.stdout.strip(), failures)
+
+
+def case_done_refuses_decisions_written_about_another_commit(failures):
+    """A decision file about a commit the round was not reviewed at is refused.
+
+    The decisions of a round are bound to the commit they were made
+    about. When the lane commits again after the review, the decision
+    file names the commit the decider saw, and the round's own commit
+    is a different one. The file must not authorise this one.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        reviewed = head(env.repo)
+        # The decisions name the commit the round was reviewed at.
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"head": reviewed,
+             "decisions": [{"id": fid, "decision": "reject",
+                            "reason": "deliberate"}]}))
+
+        # The lane runs again and commits on top of the reviewed commit.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\nand more\n")
+        git(env.repo, "commit", "-qam", "a commit the review never saw")
+        env.settle()
+
+        r = env.run(str(env.repo), "--done", "--issue", "7",
+                    "--base", "origin/main")
+        assert_eq("done-other-commit: rc is a refusal", 1, r.returncode,
+                  failures)
+        creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+        assert_eq("done-other-commit: no pull request was opened", 0,
+                  len(creates), failures)
+
+
+def case_done_refuses_a_tip_that_is_neither_reviewed_nor_squashed(failures):
+    """A tip that is not the reviewed commit and not this driver's squash is refused.
+
+    The reviewed commit authorises the decisions only when the tip is
+    the commit this driver squashed for this round -- the one case
+    where the tip legitimately differs from the reviewed commit. Any
+    other tip is somebody else's work.
+
+    The squash has happened here: this is the retry path, where the
+    driver already squashed the branch for this round. The licence the
+    squash gives is for *that* commit and no other, so a commit made
+    on top of the squash is somebody else's work even though the round
+    has a squashed commit recorded.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        env = Env(Path(t))
+        env.settle()
+        # Two commits on the branch, so the squash has something to do.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\n")
+        git(env.repo, "commit", "-qam", "second lane commit")
+        env.settle()
+        env.run(str(env.repo), "--base", "origin/main")
+        fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+        (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+            {"head": head(env.repo),
+             "decisions": [{"id": fid, "decision": "reject",
+                            "reason": "deliberate"}]}))
+        reviewed = head(env.repo)
+
+        # A `gh` whose `pr create` fails, so the driver squashes and
+        # pushes the branch but opens no pull request. That leaves the
+        # round with a squashed commit recorded, which is the licence
+        # the retry path uses.
+        gh = env.bin / "gh"
+        gh.write_text(textwrap.dedent("""\
+            #!/usr/bin/env python3
+            import json, os, subprocess, sys
+            args = sys.argv[1:]
+            with open(os.environ["FAKE_GH_LOG"], "a") as f:
+                f.write(json.dumps(args) + "\\n")
+            canned = json.load(open(os.environ["FAKE_GH_DATA"]))
+            if args[:2] == ["issue", "view"]:
+                body = canned.get("issue_body", "")
+                if "--jq" in args:
+                    flt = args[args.index("--jq") + 1]
+                    sys.stdout.write(subprocess.run(
+                        ["jq", "-r", flt], input=json.dumps({"body": body}),
+                        capture_output=True, text=True, check=True).stdout)
+                else:
+                    print(json.dumps({"body": body}))
+                sys.exit(0)
+            if args[:2] == ["pr", "create"]:
+                print("gh: could not create pull request (transient)",
+                      file=sys.stderr)
+                sys.exit(1)
+            sys.exit(0)
+        """))
+        gh.chmod(0o755)
+
+        first = env.run(str(env.repo), "--done", "--issue", "7",
+                        "--base", "origin/main")
+        assert_eq("done-foreign: the first run failed at the pull request",
+                  1, first.returncode, failures)
+        squashed = head(env.repo)
+        if squashed == reviewed:
+            fail(failures, "done-foreign: the branch was not squashed")
+            return
+
+        # Somebody commits on top of the squash. The round's licence is
+        # for the squashed commit and no other.
+        (env.repo / "base.txt").write_text("base\nchanged\nmore\nand more\n")
+        git(env.repo, "commit", "-qam", "somebody else's commit")
+        env.settle()
+
+        r = env.run(str(env.repo), "--done", "--issue", "7",
+                    "--base", "origin/main")
+        assert_eq("done-foreign: rc is a refusal", 1, r.returncode, failures)
+        assert_in("done-foreign: says why", "moved",
+                  r.stdout + r.stderr, failures)
+        creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+        assert_eq("done-foreign: no pull request was opened", 1,
+                  len(creates), failures)
+        pushed = subprocess.run(
+            ["git", "-C", str(env.bare), "rev-parse", "feature"],
+            capture_output=True, text=True)
+        if pushed.returncode == 0:
+            assert_eq("done-foreign: the remote branch was not moved",
+                      squashed, pushed.stdout.strip(), failures)
+
+
+def case_done_refuses_while_the_lane_is_still_running(failures):
+    """A lane that has not finished is never finished by --done.
+
+    The lane's own settle record names the commit the lane finished
+    on. A live active marker means the lane is still writing the tree,
+    and a stale one means it died without recording a final. Neither
+    is drift, and neither may be overridden: the tip is the reviewed
+    commit, so the review's authority would carry a tree that is still
+    being written.
+    """
+    for marker_pid, label in ((os.getpid(), "running"),
+                               (999999, "stale")):
+        with tempfile.TemporaryDirectory() as t:
+            env = Env(Path(t))
+            env.settle()
+            env.run(str(env.repo), "--base", "origin/main")
+            fid = (env.run_dir() / "round-1" / "ids.txt").read_text().split()[0]
+            (env.run_dir() / "round-1" / "decisions.json").write_text(json.dumps(
+                {"head": head(env.repo),
+                 "decisions": [{"id": fid, "decision": "reject",
+                                "reason": "deliberate"}]}))
+            reviewed = head(env.repo)
+
+            import hashlib
+            marker = env.state / "lane-active" / hashlib.sha256(
+                str(env.repo.resolve()).encode()).hexdigest()
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text(f"{marker_pid}\n")
+
+            r = env.run(str(env.repo), "--done", "--issue", "7",
+                        "--base", "origin/main",
+                        env={"LANE_REVIEW_SETTLE_TIMEOUT": "1"})
+            assert_eq(f"done-{label}: rc is a refusal", 3, r.returncode,
+                      failures)
+            assert_in(f"done-{label}: says why", "not settled",
+                      r.stdout + r.stderr, failures)
+            creates = [c for c in env.gh_calls() if c[:2] == ["pr", "create"]]
+            assert_eq(f"done-{label}: no pull request was opened", 0,
+                      len(creates), failures)
+            pushed = subprocess.run(
+                ["git", "-C", str(env.bare), "rev-parse", "feature"],
+                capture_output=True, text=True)
+            if pushed.returncode == 0:
+                assert_eq(f"done-{label}: the remote branch was not moved",
+                          reviewed, pushed.stdout.strip(), failures)
+
+
 CASES = (
     case_state_is_outside_the_worktree,
     case_review_writes_findings_and_exits_needs_decisions,
@@ -1237,6 +1465,12 @@ CASES = (
     case_apply_reports_a_lane_that_refused_to_run,
     case_the_review_child_does_not_hold_the_review_slot,
     case_done_can_be_retried_after_the_squash,
+    # The fixes the re-review asked for: --done finishes a branch only
+    # at a commit this driver is responsible for.
+    case_done_refuses_a_commit_the_review_never_saw,
+    case_done_refuses_decisions_written_about_another_commit,
+    case_done_refuses_a_tip_that_is_neither_reviewed_nor_squashed,
+    case_done_refuses_while_the_lane_is_still_running,
 )
 
 

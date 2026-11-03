@@ -264,21 +264,61 @@ done_accepts_head() {
 	return 1
 }
 
+# The commit this driver squashed for this round, or nothing.
+#
+# This is the one case where the tip legitimately differs from the
+# commit the round was reviewed at: the squash rewrote the branch, and
+# the tree it produced is this driver's own work. A decision about the
+# reviewed diff stays valid across it.
+#
+# The function always succeeds. A command substitution runs in a
+# subshell whose exit status is the function's, and under `set -e` a
+# non-zero status there ends the caller -- so a round with no squash
+# would end the run rather than print nothing.
+done_own_squash() {
+	local round="$1" squashed
+	squashed=$(state_get "squashed-$round")
+	if [[ -n "$squashed" ]]; then
+		printf '%s\n' "$squashed"
+	fi
+	return 0
+}
+
 if [[ "$MODE" == "done" ]]; then
-	# --done waits for the lane to stop writing, but it does not refuse
-	# a tree this driver has already squashed. The check is made
-	# against the commits --done accepts, not against the lane's own
-	# record.
-	settle_drift_ok() {
-		done_accepts_head "$ROUND"
-	}
-	if ! settle; then
-		if ! settle_drift_ok; then
+	# --done waits for the lane to stop writing, and it waits for the
+	# lane to have *finished* -- a lane that is still running, or one
+	# that died without recording a final, is not a tree this driver
+	# may push however the tip compares.
+	#
+	# The one exception is drift: after a squash the tip is a commit
+	# this driver made and the lane's own record no longer describes
+	# the tree. That is not drift, and refusing it leaves a branch
+	# pushed with no pull request and a --done that refuses forever.
+	#
+	# The override is made for the drift case only. The settle code
+	# carries the distinction: 3 is drift, 1 is a lane that has not
+	# finished.
+	set +e
+	"$BIN_DIR/lane-settled" "$WORKTREE"
+	SETTLE_RC=$?
+	set -e
+	case "$SETTLE_RC" in
+	0) ;;
+	3)
+		# The tree has drifted since the lane recorded its final. That
+		# is the one case this driver may override: the tip may be the
+		# commit this driver squashed for this round.
+		if ! done_accepts_head "$ROUND"; then
 			echo "lane-review: the tree has moved since round $ROUND was reviewed;" >&2
 			echo "  the lane has not settled, and the tree is not where this driver left it" >&2
 			exit 3
 		fi
-	fi
+		;;
+	*)
+		echo "lane-review: the lane has not settled; nothing was reviewed" >&2
+		exit 3
+		;;
+	esac
 else
 	settle || {
 		echo "lane-review: the lane has not settled; nothing was reviewed" >&2
@@ -403,10 +443,6 @@ if [[ "$MODE" == "done" ]]; then
 	# The commit this round was reviewed at. The ledger is the durable
 	# record of it; the state file's `head` moves on with the rounds and
 	# cannot answer for a particular one.
-	#
-	# The settle check above has already refused a tree that is neither
-	# this commit nor the commit this driver squashed for this round,
-	# so by here the tip is one of the two.
 	ROUND_HEAD=$(python3 "$HELPER" round-head --ledger "$LEDGER" --round "$ROUND") || {
 		echo "lane-review: the ledger holds no commit for round $ROUND;" >&2
 		echo "  the decisions of that round cannot be checked against a commit" >&2
@@ -414,8 +450,33 @@ if [[ "$MODE" == "done" ]]; then
 	}
 	CURRENT_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
 
+	# The commit the decisions are checked against.
+	#
+	# A decision is bound to the commit it was made about. The commit the
+	# round was reviewed at is that commit -- with one exception: after
+	# this driver squashed the branch, the tip is the commit the squash
+	# produced, and the decision about the reviewed diff still holds
+	# across it. That is the one case where the tip legitimately
+	# differs, because this driver made it.
+	#
+	# Every other tip is somebody else's work: a commit made after the
+	# review, by a lane or by a person. The round's decisions say
+	# nothing about it, so the branch is not finished at it.
+	DECISION_HEAD="$CURRENT_HEAD"
+	SQUASHED_THIS_ROUND=$(done_own_squash "$ROUND")
+	if [[ -n "$SQUASHED_THIS_ROUND" && "$CURRENT_HEAD" == "$SQUASHED_THIS_ROUND" ]]; then
+		DECISION_HEAD="$ROUND_HEAD"
+	elif [[ "$CURRENT_HEAD" != "$ROUND_HEAD" ]]; then
+		echo "lane-review: the branch has moved since round $ROUND was reviewed;" >&2
+		echo "  reviewed commit: $ROUND_HEAD" >&2
+		echo "  current tip:    $CURRENT_HEAD" >&2
+		echo "The decisions of that round are about the reviewed commit, and say" >&2
+		echo "nothing about the current one. Review it again, or undo the commit." >&2
+		exit 1
+	fi
+
 	if ! python3 "$HELPER" decisions --findings "$FINDINGS" \
-		--decisions "$DECISIONS" --head "$ROUND_HEAD" \
+		--decisions "$DECISIONS" --head "$DECISION_HEAD" \
 		>"$RUN_DIR/round-$ROUND/decision-report.json"; then
 		echo "lane-review: the decisions for round $ROUND are not usable:" >&2
 		python3 - "$RUN_DIR/round-$ROUND/decision-report.json" <<'PYEOF' >&2
