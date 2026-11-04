@@ -353,6 +353,25 @@ After a merge, remove the lane's worktree, its local branch, the gate's prove
 worktrees and the bench directories for the branch, each by name. Never by
 pattern, never before the merge.
 
+**Prune the builder's cache in the same step.** The bench directories for a
+merged branch are dead on every lane the branch was built on, and they are
+large: a branch's tree and its `_prove` copy are 35 GB each, and a builder
+that keeps them fills its disk. Run
+
+    remote-prune --prune --tree <tree name>
+
+which removes that tree and its `_prove` copy on every lane in
+`BUILDER_LANES`. The tree name is `tree_name` of the worktree's path — the
+same name `remote-task` gave the builder. Do not prune by pattern and do
+not prune a tree whose branch has not landed: a cache for open work is
+somebody's.
+
+**A builder that is out of room is not a failing test.** `remote-task`
+refuses the build with exit 4 when the builder has no room, and the gate
+reports that as infrastructure. Clear the space — `remote-prune --prune`
+for the landed trees — and re-run. Do not treat it as a defect in the change
+under review, and do not touch the host to make room by hand.
+
 **Pause lanes** means in-flight runs finish and nothing new is dispatched,
 including review rounds and finishing runs, until the user resumes.
 

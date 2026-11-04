@@ -1,0 +1,337 @@
+#!/usr/bin/env bash
+# Check that a builder has room for the build that is about to run.
+#
+# A builder that fills up mid-build does not fail as a build failure. It
+# fails as a linker bus error, an rsync ENOSPC, or a failed .rmeta write --
+# and it takes the database on the same disk down with it. A full disk took
+# a builder's CI Postgres down twice, and the container stayed in restart
+# backoff after the space came back.
+#
+# So the check runs *before* the sync, and it either finds the space or
+# refuses the build. A build that is going to run out of disk never starts.
+#
+# The space needed is the whole of the tree about to be built: the bench
+# tree and its `_prove` copy. A cold gate for one branch is about 70 GB on
+# the project this was written for -- two trees of 35 GB each -- so a check
+# that counted only one of them would pass a build that was going to fill
+# the disk.
+#
+# Exit codes:
+#   0  there is room, or room was found
+#   2  usage
+#   3  the host could not be measured -- unprovable, not a pass
+#   4  the builder is below the threshold and the space could not be freed
+#
+# Exit 4 is the "disk low" code. A gate and a lane report it as
+# infrastructure, not as a test failure: the change under test may be fine,
+# and the host is what is wrong.
+set -euo pipefail
+
+# readlink -f, not `cd -P`: these are installed as symlinks into a bin
+# directory on PATH, and BASH_SOURCE holds the symlink's own path.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() {
+	cat <<'EOF'
+usage: builder-space --host HOST --tree NAME [--min-free-gb N] [--check CMD]
+
+  --host HOST    the builder to measure.
+  --tree NAME    the tree about to be built. The check counts this tree's
+                 space and the space its `_prove` copy will need.
+  --min-free-gb  the free space to insist on, in GB. Default 20.
+  --check CMD    a command to run on the host after space is found. Used
+                 for the database health check: a container that died on
+                 ENOSPC stays in restart backoff after the space comes
+                 back, and the next gate fails against it.
+
+Prints the free space it found, in GB.
+EOF
+}
+
+HOST=""
+TREE=""
+MIN_FREE_GB=${BUILDER_MIN_FREE_GB:-20}
+CHECK_CMD=${BUILDER_DB_CHECK:-}
+
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--host) HOST="$2"; shift 2 ;;
+	--tree) TREE="$2"; shift 2 ;;
+	--min-free-gb) MIN_FREE_GB="$2"; shift 2 ;;
+	--check) CHECK_CMD="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
+	esac
+done
+
+[[ -n "$HOST" ]] || { echo "--host is required" >&2; usage >&2; exit 2; }
+[[ -n "$TREE" ]] || { echo "--tree is required" >&2; usage >&2; exit 2; }
+
+# The tree name is interpolated into a remote command, and this tool asks
+# the host to remove directories. Only the alphabet this tooling produces is
+# accepted; anything else was not made here.
+case "$TREE" in
+*[!A-Za-z0-9._-]*)
+	echo "builder-space: refusing to use the tree name '$TREE'" >&2
+	exit 2
+	;;
+esac
+
+# The space a build of this tree needs, in GB. The bench tree and its
+# `_prove` copy: a prove run uses a scratch worktree named
+# `<caller>-prove`, which becomes `<name>_prove` on the builder, and the
+# two trees are the same size.
+#
+# The estimate is the size of the *existing* trees when there are any, and
+# a configured floor when there are none -- a cold build has no directory to
+# measure. `BUILDER_TREE_GB` is the operator's number for their project.
+TREE_GB=${BUILDER_TREE_GB:-35}
+
+# One remote run measures and, when it has to, frees. Measuring and freeing
+# in separate calls would race another build between them.
+#
+# The free space is read from `df`, and the check asks for the space on the
+# filesystem the bench lives on -- not the root filesystem, which on a host
+# with a separate data disk is a different number.
+#
+# The values travel in the remote command line as an export prefix, not as
+# positional arguments and not through ssh's environment forwarding (which
+# is off by default). A remote command that carries them as positional
+# parameters is at the mercy of how the host wraps it: one that runs the
+# command through `bash -c` leaves $1 unset, and the script then fails with
+# "unbound variable" instead of answering.
+#
+# The script itself is in a QUOTED heredoc, so nothing in it is expanded
+# here. An unquoted one expands every $ in it on this side, which quietly
+# turned "$tree" into the empty string and made the remote script measure
+# the wrong trees.
+SPACE_ENV="BUILDER_SPACE_TREE=$(printf '%q' "$TREE") BUILDER_SPACE_MIN_GB=$(printf '%q' "$MIN_FREE_GB") BUILDER_SPACE_TREE_GB=$(printf '%q' "$TREE_GB") BUILDER_SPACE_HOST=$(printf '%q' "$HOST")"
+
+# Ask `remote-prune` for space on the builder that was measured.
+#
+# `remote-prune` runs here, on the dispatching host, because that is where
+# the caller's worktrees and `git cherry` are: it judges each tree against
+# them and takes the bench lock a build holds, so a tree in flight is
+# never a candidate.
+#
+# The builder being measured is named by its ssh target, and `remote-prune`
+# names builders by lane. So the lane whose `HOST_BUILDER_<LANE>` is that
+# target is the one to prune. When no lane matches -- the default builder,
+# or a host configured some other way -- the default builder is pruned,
+# and a host that is none of them gets no prune at all.
+prune_for_space() {
+	local prune_bin lane target
+	prune_bin="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/remote-prune"
+	[ -x "$prune_bin" ] || return 0
+	# `remote-prune` reads the repo's worktrees, so it needs the repo.
+	# The caller is normally inside it -- `remote-task` runs this check
+	# from the project directory -- but a check invoked from elsewhere
+	# must still prune the right worktrees.
+	local repo
+	repo=$(git rev-parse --show-toplevel 2>/dev/null || true)
+	local -a prune_args=(--prune)
+	if [ -n "$repo" ]; then
+		prune_args+=("$repo")
+	fi
+	local -a lanes=()
+	read -ra lanes <<<"${BUILDER_LANES:-}"
+	for lane in ${lanes[@]+"${lanes[@]}"}; do
+		[ -n "$lane" ] || continue
+		local var="HOST_BUILDER_$(env_name "$lane")"
+		target="${!var:-}"
+		[ -n "$target" ] || continue
+		if [ "$target" = "$HOST" ]; then
+			echo "==> pruning lane $lane on $HOST" >&2
+			REMOTE_LANE="$lane" "$prune_bin" "${prune_args[@]}" >&2 || return 0
+			return 0
+		fi
+	done
+	# The default builder, when that is the host measured.
+	if [ "${HOST_BUILDER:-}" = "$HOST" ]; then
+		echo "==> pruning the default builder on $HOST" >&2
+		"$prune_bin" "${prune_args[@]}" >&2 || return 0
+	fi
+	return 0
+}
+
+# Measure the builder.
+#
+# `bash`, not `bash -s`: the remote shell runs the command, and a command
+# of `bash -s` is not a valid command line -- the -s wants an argument it
+# does not get. A plain `bash` reads the script from stdin, which is
+# where it is sent.
+measure_space() {
+	RESULT=$(ssh "$HOST" "$SPACE_ENV bash" <<'REMOTE_SPACE' 2>&1
+set -uo pipefail
+tree="$BUILDER_SPACE_TREE"
+min_free_gb="$BUILDER_SPACE_MIN_GB"
+tree_gb="$BUILDER_SPACE_TREE_GB"
+# The builder's name, for the message. It travels with the other values
+# because a local variable does not reach the far side: the script read
+# an unset $HOST and, under set -u, died instead of answering.
+host="$BUILDER_SPACE_HOST"
+
+bench="$HOME/bench"
+# The filesystem the bench is on. `df -P` gives POSIX output, one line per
+# filesystem; the last field is the mount point.
+bench_fs=$(df -P "$bench" 2>/dev/null | awk 'NR==2 {print $6}')
+[ -n "$bench_fs" ] || bench_fs="/"
+
+free_gb() {
+	df -P "$bench_fs" 2>/dev/null | awk 'NR==2 {printf "%.2f", $4/1048576}'
+}
+
+# The trees this build will touch. The bench tree, and the `_prove` copy
+# that a prove run beside it creates.
+prove_tree="${tree}_prove"
+
+report() { printf '%s\n' "$1"; }
+
+free=$(free_gb)
+[ -n "$free" ] || { report "UNMEASURABLE"; exit 3; }
+
+# The space this build needs: the two trees, at the estimate each.
+need_gb=$((tree_gb * 2))
+
+echo "==> builder $host: ${free}G free on $bench_fs, need ${need_gb}G for ${tree} and ${prove_tree}" >&2
+
+# The test is not "is there room now" but "will there be room after the
+# build". The build writes need_gb, so what matters is what is left
+# afterwards: free - need must still clear the floor. A check that only
+# compared free against the floor passed a build that was going to fill
+# the disk -- which is how a host with 60 GB free and a 70 GB build
+# reached 100%.
+#
+# The builder reports the shortfall and frees nothing. Which trees are
+# free to go is the dispatching host's call: the worktrees live there,
+# not here, so every tree looks abandoned on a builder, and a guess
+# deleted a second branch's tree while that branch was compiling. The
+# caller prunes with `remote-prune` -- which judges trees against the
+# caller's worktrees and `git cherry`, under the bench lock -- and asks
+# again.
+if awk "BEGIN{exit !(($free - $need_gb) < $min_free_gb)}"; then
+	echo "==> below the ${min_free_gb}G floor; asking for space" >&2
+	report "DISK_LOW $free"
+	exit 4
+fi
+
+report "OK $free"
+REMOTE_SPACE
+)
+}
+
+# Read the builder's answer.
+#
+# The answer is the LAST line, not the whole output: the measurement
+# script prints its progress to stderr, and a host that merges the two
+# streams puts that progress in front of the answer. The answer is the
+# one line with a known first word.
+#
+# The grep is allowed to find nothing: a host that answered with
+# something else has not answered at all, and that is the `*)` case
+# below. Under `set -e` a failing grep in a pipeline would end the
+# script with the grep's own status, which is 1 and reads like a usage
+# error.
+#
+# The answer's first word says what the builder found: `OK` for room,
+# `DISK_LOW` for a shortfall. The free space is the second field either
+# way.
+#
+# The status is a global rather than a return value: the answer is read
+# in a command substitution, and a subshell cannot set the caller's
+# variable. The free space comes back in `MEASURE_FREE`.
+MEASURE_STATUS=""
+MEASURE_FREE=""
+measure() {
+	measure_space
+	ANSWER=$(printf '%s\n' "$RESULT" | grep -E '^(OK|DISK_LOW|UNMEASURABLE)( |$)' | tail -1 || true)
+	case "$ANSWER" in
+	OK\ *)
+		MEASURE_STATUS=ok
+		MEASURE_FREE=$(printf '%s' "$ANSWER" | awk '{print $2}')
+		;;
+	DISK_LOW\ *)
+		MEASURE_STATUS=low
+		MEASURE_FREE=$(printf '%s' "$ANSWER" | awk '{print $2}')
+		;;
+	UNMEASURABLE)
+		MEASURE_STATUS=unmeasurable
+		return 3
+		;;
+	*)
+		MEASURE_STATUS=unanswerable
+		echo "builder-space: unexpected answer from $HOST:" >&2
+		printf '%s\n' "$RESULT" >&2
+		return 3
+		;;
+	esac
+}
+
+set +e
+measure
+rc=$?
+set -e
+
+if [ "$rc" -ne 0 ]; then
+	echo "builder-space: could not measure free space on $HOST; refusing to guess" >&2
+	exit 3
+fi
+
+FREE="$MEASURE_FREE"
+
+if [ "$MEASURE_STATUS" = low ]; then
+	# Below the floor. The space has to come from somewhere, but the
+	# builder cannot decide what is free: worktrees live on the hosts
+	# that dispatch builds, not on the builder, so every tree looks
+	# abandoned there. A guess deleted a second branch's tree while
+	# that branch was compiling.
+	#
+	# So the prune is asked for here, where the caller's worktrees and
+	# `git cherry` are known. `remote-prune` decides which trees are
+	# free to go and takes the bench lock a build holds, so a tree in
+	# flight is never a candidate. Then the space is measured again.
+	echo "==> builder $HOST: ${FREE}G free, below the ${MIN_FREE_GB}G floor; pruning" >&2
+	set +e
+	prune_for_space
+	prune_rc=$?
+	set -e
+	if [ "$prune_rc" -eq 0 ]; then
+		set +e
+		measure
+		rc=$?
+		set -e
+		if [ "$rc" -ne 0 ]; then
+			echo "builder-space: could not measure free space on $HOST; refusing to guess" >&2
+			exit 3
+		fi
+		FREE="$MEASURE_FREE"
+	fi
+fi
+
+# Still short: the build would fill the disk. Refuse it here, where the
+# refusal is about the host, rather than letting it fail halfway through a
+# compile and take a database with it.
+if [ "$MEASURE_STATUS" != ok ]; then
+	echo "builder-space: builder disk low on $HOST: ${FREE}G free, below the ${MIN_FREE_GB}G floor; refusing the build" >&2
+	exit 4
+fi
+
+# The database health check. A container that died on ENOSPC stays in
+# restart backoff after the space comes back, and the next gate fails
+# against it with "container is not running" -- which reads as a project
+# failure rather than the infrastructure failure it is.
+if [[ -n "$CHECK_CMD" ]]; then
+	set +e
+	ssh "$HOST" "$CHECK_CMD"
+	check_rc=$?
+	set -e
+	if [[ "$check_rc" -ne 0 ]]; then
+		echo "builder-space: the health check on $HOST failed (exit $check_rc)" >&2
+		exit 4
+	fi
+	# Silent on success, like the space check itself.
+fi
+
+exit 0

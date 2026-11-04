@@ -108,10 +108,14 @@ fi
 # The remote half of what this job already does locally; a bench directory
 # outlives the worktree it mirrors and nothing else asks.
 #
+# --all-lanes: the lanes are separate hosts with separate benches, and a
+# prune that reached only HOST_BUILDER left the other lanes filling up.
+# That is how six gates failed out of disk across three lanes while one
+# lane looked fine.
 # Its exit code cannot end this run: the builder can be down, which says nothing
 # about the worktrees this job cleaned.
 if command -v remote-prune >/dev/null 2>&1; then
-	prune_out=$(remote-prune --prune "$REPO" 2>&1) || true
+	prune_out=$(remote-prune --prune --all-lanes "$REPO" 2>&1) || true
 	[ -n "$prune_out" ] && printf '%s\n' "$prune_out"
 else
 	echo "remote-prune not on PATH; the builder's bench was not pruned"

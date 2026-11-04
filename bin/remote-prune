@@ -27,15 +27,33 @@ LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 # worktree.
 BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 
-usage() { echo "usage: remote-prune [--prune] [--task NAME] [worktree]" >&2; exit 2; }
+usage() {
+	cat <<'EOF'
+usage: remote-prune [--prune] [--task NAME] [--all-lanes] [--tree NAME]
+                    [worktree]
+
+  --prune      act. Without it this is a dry run and nothing is deleted.
+  --task NAME  the task whose role names the builder. Default: bench.
+  --all-lanes  measure every lane in BUILDER_LANES, not just the default
+               builder, and report each one separately.
+  --tree NAME  prune only this tree, on every lane. This is the landing
+               path: a branch that merged has a dead cache on every
+               builder it was built on, and the trees to remove are known
+               by name rather than guessed from `git cherry`.
+EOF
+}
 
 PRUNE=0
 TASK=bench
+ALL_LANES=0
+TREE=""
 ARGS=()
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--prune) PRUNE=1; shift ;;
 	--task) [ $# -ge 2 ] || usage; TASK=$2; shift 2 ;;
+	--all-lanes) ALL_LANES=1; shift ;;
+	--tree) [ $# -ge 2 ] || usage; TREE="$2"; shift 2 ;;
 	-h | --help) usage ;;
 	*) ARGS+=("$1"); shift ;;
 	esac
@@ -50,18 +68,11 @@ REPO=$(git -C "$SRC" worktree list --porcelain 2>/dev/null | awk '/^worktree / {
 
 # Captured to a variable rather than eval'd inline so the reader's non-zero
 # exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0,
-# so the manifest's refusal would otherwise reach the next access to a
-# TASK_* variable as a "unbound variable" shell error pointing at the bash
-# line, not at the manifest field that is missing.
+# so the manifest's refusal would otherwise reach the next access to a TASK_*
+# variable as a "unbound variable" shell error pointing at the bash line, not
+# at the manifest field that is missing.
 output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
 eval "$output"
-REMOTE=$(host_for "$TASK_ROLE")
-
-if [ "$PRUNE" = 1 ]; then
-	echo "==> pruning $REMOTE (role=$TASK_ROLE, task=$TASK)"
-else
-	echo "==> dry run: $REMOTE (role=$TASK_ROLE, task=$TASK); re-run with --prune to act"
-fi
 
 # Walk the local worktrees once and build a `tree_name -> path` table. The
 # remote `bench/$NAME` directory only has a branch we can ask about when
@@ -79,25 +90,6 @@ done < <(git -C "$REPO" worktree list --porcelain | awk '/^worktree / {print $2}
 # here rather than from inside the per-worktree loop, because one fetch
 # covers every worktree the repo knows about.
 git -C "$REPO" fetch --quiet origin
-
-# List the remote bench directories through ssh and let bash parse the
-# output, not awk: each name is a single token on its own line, and a
-# word-split keeps the script readable. The capture is split so the
-# ssh exit code reaches us; `mapfile < <(...)` discards the inner rc
-# (the one that matters), and an unreachable host would otherwise read
-# as "bench is empty" -- which is a wrong, actionable lie.
-set +e
-BENCH_OUT=$(ssh "$REMOTE" "ls -1 \$HOME/bench 2>/dev/null")
-ssh_rc=$?
-set -e
-if [ "$ssh_rc" -ne 0 ]; then
-	echo "remote-prune: cannot reach $REMOTE (ssh exit $ssh_rc); cannot measure the bench" >&2
-	exit 3
-fi
-# A here-string of an empty variable is still one empty line, so testing the
-# array's length here answers a question that is never true. The per-entry
-# guard in the loop below is what actually skips it.
-mapfile -t BENCH_DIRS <<<"$BENCH_OUT"
 
 # Three-way, not two: 0 landed, 1 carrying work, 2 unreadable. A cherry that
 # cannot read its refs must not share a path with a clean "everything landed".
@@ -181,100 +173,225 @@ branch_created_at() {
 # cleaner would call stale is one this one will look at.
 IDLE_DAYS=${REMOTE_PRUNE_IDLE_DAYS:-${PIPELINE_STALE_DAYS:-3}}
 
-landed=() uncertain=() idle=() trunk=() refused=() carrying=()
-landed_bytes=0 idle_bytes=0
-for name in "${BENCH_DIRS[@]}"; do
-	[ -n "$name" ] || continue
-	# Every name below is interpolated into a remote command string, and this
-	# tool's whole purpose is `rm -rf`. The listing comes from the builder's
-	# filesystem, so a directory nobody here created decides what that string
-	# says. `tree_name` only ever produces this alphabet; anything else was
-	# not made by this tooling and is exactly the case the issue's rule covers.
-	case "$name" in
-	*[!A-Za-z0-9._-]*)
-		refused+=("$name")
-		continue
-		;;
+# The base tree a `_prove` directory belongs to.
+#
+# gate-prove runs in a scratch worktree named `<caller>-prove`, and
+# tree_name turns that into `<name>_prove`. The pair is one branch's worth
+# of build cache twice over: the bench tree and its prove copy, each 35-40 GB
+# on a project of this size. They belong to the same branch, so they are
+# pruned together -- a `_prove` directory has no worktree behind it, and
+# "no worktree means keep" would otherwise keep the largest trees on the
+# builder forever.
+prove_base() {
+	case "$1" in
+	*_prove) printf '%s\n' "${1%_prove}" ;;
+	*) printf '\n' ;;
 	esac
-	wt=${WT_BY_NAME[$name]:-}
-	if [ -z "$wt" ]; then
-		uncertain+=("$name")
-		continue
+}
+
+# Measure one builder and, with --prune, clear what it can.
+#
+# The whole per-host body is a function so that --all-lanes can run it once
+# per lane: the lanes are separate hosts with separate benches, and a prune
+# that measured only one of them left the others filling up.
+prune_host() { # <lane name, or empty for the default host>
+	local lane="$1" REMOTE
+	# host_for resolves HOST_BUILDER, or HOST_BUILDER_<LANE> when
+	# REMOTE_LANE names one. The lane is set for the call and restored
+	# after, so one caller's loop does not leak into the next.
+	local saved_lane="${REMOTE_LANE:-}"
+	if [ -n "$lane" ]; then
+		REMOTE_LANE="$lane"
 	fi
-	# The trunk checkout answers the cherry test trivially -- every commit on
-	# main is on main -- so it reads as landed and its bench dir, the warmest
-	# one on the builder, would be removed on every run. "Landed" means a
-	# branch whose work reached the trunk, which the trunk is not.
-	branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
-	if [ "$branch" = "${TRUNK_BRANCH:-main}" ]; then
-		trunk+=("$name")
-		continue
+	REMOTE=$(host_for "$TASK_ROLE") || return 3
+	if [ -n "$lane" ]; then
+		REMOTE_LANE="$saved_lane"
 	fi
+
+	if [ "$PRUNE" = 1 ]; then
+		echo "==> pruning $REMOTE (role=$TASK_ROLE, task=$TASK${lane:+, lane=$lane})"
+	else
+		echo "==> dry run: $REMOTE (role=$TASK_ROLE, task=$TASK${lane:+, lane=$lane}); re-run with --prune to act"
+	fi
+
+	# List the remote bench directories through ssh and let bash parse the
+	# output, not awk: each name is a single token on its own line, and a
+	# word-split keeps the script readable. The capture is split so the
+	# ssh exit code reaches us; `mapfile < <(...)` discards the inner rc
+	# (the one that matters), and an unreachable host would otherwise read
+	# as "bench is empty" -- which is a wrong, actionable lie.
+	local ssh_rc
 	set +e
-	cherry_landed "$wt"
-	cherry_rc=$?
+	BENCH_OUT=$(ssh "$REMOTE" "ls -1 \$HOME/bench 2>/dev/null")
+	ssh_rc=$?
 	set -e
-	case "$cherry_rc" in
-	0)
-		# Cherry says every commit on this branch is on main, which is
-		# also what a branch with no commits at all says, so the other
-		# signals decide whether the work is really done.
-		#
-		# The bench dir's mtime and its size come from one call. The
-		# mtime is NOT the sync time: the sync is `rsync -a`, which
-		# preserves the source's mtimes, directories included, so it is
-		# the local worktree root's mtime as of the last sync. Against
-		# the branch's creation time it answers "does the bench dir
-		# predate the branch?". A dir that cannot be measured has no
-		# mtime, which counts as carrying work.
+	if [ "$ssh_rc" -ne 0 ]; then
+		echo "remote-prune: cannot reach $REMOTE (ssh exit $ssh_rc); cannot measure the bench" >&2
+		return 3
+	fi
+	# A here-string of an empty variable is still one empty line, so testing the
+	# array's length here answers a question that is never true. The per-entry
+	# guard in the loop below is what actually skips it.
+	mapfile -t BENCH_DIRS <<<"$BENCH_OUT"
+
+	# The landing path: a named tree and its `_prove` copy.
+	#
+	# A branch that merged has a dead cache on every builder it was built
+	# on, and the trees to remove are known by name -- there is no
+	# `git cherry` guess to make, because the caller knows the branch
+	# landed. The `_prove` copy goes with it: it is the same branch's
+	# build cache a second time over, and it is the larger of the two.
+	#
+	# `--prune` gates the removal, like every other path. Without it the
+	# candidates are printed and nothing is deleted: this tool is a dry
+	# run by default, and a landing path that removed a tree on every
+	# lane from a bare `--tree` would delete a build cache nobody asked
+	# to delete.
+	if [ -n "$TREE" ]; then
+		local want=("$TREE" "${TREE}_prove")
+		local found=0
+		for name in "${want[@]}"; do
+			case "$name" in
+			*[!A-Za-z0-9._-]*) continue ;;
+			esac
+			# Only a directory the bench actually holds is removed, and
+			# only under the lock a build holds.
+			if ssh "$REMOTE" "test -d \$HOME/bench/$name"; then
+				found=1
+			else
+				continue
+			fi
+			if [ "$PRUNE" != 1 ]; then
+				echo "  would remove \$HOME/bench/$name"
+				continue
+			fi
+			echo "  rm -rf \$HOME/bench/$name"
+			ssh "$REMOTE" "flock \$HOME/bench/.lock rm -rf \$HOME/bench/$name"
+		done
+		if [ "$found" -eq 0 ]; then
+			echo "==> nothing to prune for ${TREE} on $REMOTE"
+		elif [ "$PRUNE" != 1 ]; then
+			echo "==> dry run: re-run with --prune to remove them"
+		else
+			echo "==> done"
+		fi
+		return 0
+	fi
+
+	landed=() uncertain=() idle=() trunk=() refused=() carrying=()
+	landed_bytes=0 idle_bytes=0
+	for name in "${BENCH_DIRS[@]}"; do
+		[ -n "$name" ] || continue
+		# Every name below is interpolated into a remote command string, and this
+		# tool's whole purpose is `rm -rf`. The listing comes from the builder's
+		# filesystem, so a directory nobody here created decides what that string
+		# says. `tree_name` only ever produces this alphabet; anything else was
+		# not made by this tooling and is exactly the case the issue's rule covers.
+		case "$name" in
+		*[!A-Za-z0-9._-]*)
+			refused+=("$name")
+			continue
+			;;
+		esac
+		# A `_prove` directory is judged by the tree it belongs to. Its base
+		# tree may itself be absent from the bench -- a prove run that
+		# outlived its tree -- and then there is nothing to pair it with, so
+		# it stays.
+		local base
+		base=$(prove_base "$name")
+		local look="$name"
+		if [ -n "$base" ]; then
+			# The base tree's own verdict decides. If the base is not in
+			# this bench listing, the pair cannot be judged: keep.
+			local found=0 candidate
+			for candidate in "${BENCH_DIRS[@]}"; do
+				[ "$candidate" = "$base" ] && { found=1; break; }
+			done
+			if [ "$found" -eq 0 ]; then
+				uncertain+=("$name")
+				continue
+			fi
+			look="$base"
+		fi
+		wt=${WT_BY_NAME[$look]:-}
+		if [ -z "$wt" ]; then
+			uncertain+=("$name")
+			continue
+		fi
+		# The trunk checkout answers the cherry test trivially -- every commit on
+		# main is on main -- so it reads as landed and its bench dir, the warmest
+		# one on the builder, would be removed on every run. "Landed" means a
+		# branch whose work reached the trunk, which the trunk is not.
+		branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD 2>/dev/null || true)
+		if [ "$branch" = "${TRUNK_BRANCH:-main}" ]; then
+			trunk+=("$name")
+			continue
+		fi
 		set +e
-		bench_info=$(ssh "$REMOTE" bash -s -- "$name" <<'REMOTE_BENCH'
+		cherry_landed "$wt"
+		cherry_rc=$?
+		set -e
+		case "$cherry_rc" in
+		0)
+			# Cherry says every commit on this branch is on main, which is
+			# also what a branch with no commits at all says, so the other
+			# signals decide whether the work is really done.
+			#
+			# The bench dir's mtime and its size come from one call. The
+			# mtime is NOT the sync time: the sync is `rsync -a`, which
+			# preserves the source's mtimes, directories included, so it is
+			# the local worktree root's mtime as of the last sync. Against
+			# the branch's creation time it answers "does the bench dir
+			# predate the branch?". A dir that cannot be measured has no
+			# mtime, which counts as carrying work.
+			set +e
+			bench_info=$(ssh "$REMOTE" bash -s -- "$name" <<'REMOTE_BENCH'
 d="$HOME/bench/$1"
 mtime=$(stat -c %Y "$d" 2>/dev/null || echo "")
 size=$(du -sb "$d" 2>/dev/null | awk '{print $1}')
 printf '%s %s\n' "$mtime" "${size:-0}"
 REMOTE_BENCH
-		)
-		set -e
-		bench_mtime=${bench_info%% *}
-		size=${bench_info##* }
-		[ -n "$bench_mtime" ] || bench_mtime=""
-		case "$bench_mtime" in
-		'' | *[!0-9]*) bench_mtime="" ;;
+			)
+			set -e
+			bench_mtime=${bench_info%% *}
+			size=${bench_info##* }
+			[ -n "$bench_mtime" ] || bench_mtime=""
+			case "$bench_mtime" in
+			'' | *[!0-9]*) bench_mtime="" ;;
+			esac
+			set +e
+			carrying_work "$wt" "$bench_mtime"
+			work_rc=$?
+			set -e
+			if [ "$work_rc" -eq 0 ]; then
+				# Carrying work: the tree is not done, so its bench dir
+				# stays whole -- the warm cache with it. A lane that is
+				# not building right now is not protected by the lock.
+				carrying+=("$name")
+				continue
+			else
+				# `du -sb` rather than `du -sh`: the bytes go into a sum,
+				# not a label, and the report quotes them in a single
+				# human-readable line. One invocation per dir; the bench
+				# is shallow.
+				landed+=("$name")
+				landed_bytes=$((landed_bytes + ${size:-0}))
+				continue
+			fi
+			;;
+		2)	uncertain+=("$name")
+			continue
+			;;
 		esac
-		set +e
-		carrying_work "$wt" "$bench_mtime"
-		work_rc=$?
-		set -e
-		if [ "$work_rc" -eq 0 ]; then
-			# Carrying work: the tree is not done, so its bench dir
-			# stays whole -- the warm cache with it. A lane that is
-			# not building right now is not protected by the lock.
-			carrying+=("$name")
-			continue
-		else
-			# `du -sb` rather than `du -sh`: the bytes go into a sum,
-			# not a label, and the report quotes them in a single
-			# human-readable line. One invocation per dir; the bench
-			# is shallow.
-			landed+=("$name")
-			landed_bytes=$((landed_bytes + ${size:-0}))
-			continue
-		fi
-		;;
-	2)	uncertain+=("$name")
-		continue
-		;;
-	esac
 
-	# Carrying work: only the incremental subdir is a candidate, and only
-	# when it has not been touched in IDLE_DAYS. A target dir whose mtime is
-	# fresh means a build is still running; dropping incremental underneath
-	# it is the bug the lock is supposed to stop. A heredoc keeps the script
-	# readable and lets the remote shell see the $s and $(...) it needs to
-	# run, with no escape-level confusion for the local one.
-	set +e
-	inc_bytes=$(ssh "$REMOTE" bash -s -- "$name" "$IDLE_DAYS" <<'REMOTE_INC'
+		# Carrying work: only the incremental subdir is a candidate, and only
+		# when it has not been touched in IDLE_DAYS. A target dir whose mtime is
+		# fresh means a build is still running; dropping incremental underneath
+		# it is the bug the lock is supposed to stop. A heredoc keeps the script
+		# readable and lets the remote shell see the $s and $(...) it needs to
+		# run, with no escape-level confusion for the local one.
+		set +e
+		inc_bytes=$(ssh "$REMOTE" bash -s -- "$name" "$IDLE_DAYS" <<'REMOTE_INC'
 name=$1
 days=$2
 d="$HOME/bench/$name/target/debug/incremental"
@@ -283,12 +400,87 @@ age_days=$(( ( $(date +%s) - $(stat -c %Y "$d") ) / 86400 ))
 [ "$age_days" -ge "$days" ] || exit 1
 du -sb "$d" | awk '{print $1}'
 REMOTE_INC
-	)
-	set -e
-	[ -n "$inc_bytes" ] || continue
-	idle+=("$name")
-	idle_bytes=$((idle_bytes + ${inc_bytes:-0}))
+		)
+		set -e
+		[ -n "$inc_bytes" ] || continue
+		idle+=("$name")
+		idle_bytes=$((idle_bytes + ${inc_bytes:-0}))
+	done
+
+	# advisory exit code 0 -- a tool that runs through every case and has
+	# nothing to report is not a failure.
+	if [ ${#landed[@]} -eq 0 ] && [ ${#idle[@]} -eq 0 ] && [ ${#uncertain[@]} -eq 0 ] && [ ${#trunk[@]} -eq 0 ] && [ ${#refused[@]} -eq 0 ] && [ ${#carrying[@]} -eq 0 ]; then
+		echo "==> nothing to prune"
+		return 0
+	fi
+
+	if [ ${#carrying[@]} -gt 0 ]; then
+		echo
+		echo "==> left alone, carrying unlanded work (${#carrying[@]} tree(s)):"
+		printf '  %s\n' "${carrying[@]}"
+	fi
+
+	if [ ${#landed[@]} -gt 0 ]; then
+		echo
+		echo "==> landed, safe to remove (${#landed[@]} tree(s)):"
+		printf '  %s\n' "${landed[@]}"
+		report_bytes "$landed_bytes" "  reclaimable from landed"
+	fi
+	if [ ${#refused[@]} -gt 0 ]; then
+		echo
+		echo "==> left alone, name is not one this tooling produces (${#refused[@]}):"
+		printf '  %q\n' "${refused[@]}"
+	fi
+	if [ ${#trunk[@]} -gt 0 ]; then
+		echo
+		echo "==> left alone, trunk checkout (${#trunk[@]} tree(s)):"
+		printf '  %s\n' "${trunk[@]}"
+	fi
+	if [ ${#uncertain[@]} -gt 0 ]; then
+		echo
+		echo "==> left alone, no local worktree (${#uncertain[@]} tree(s)):"
+		printf '  %s\n' "${uncertain[@]}"
+	fi
+	if [ ${#idle[@]} -gt 0 ]; then
+		echo
+		echo "==> idle >= ${IDLE_DAYS}d, incremental cache droppable (${#idle[@]} tree(s)):"
+		printf '  %s\n' "${idle[@]}"
+		report_bytes "$idle_bytes" "  reclaimable from incremental"
+	fi
+
+	if [ "$PRUNE" -eq 0 ]; then
+		return 0
+	fi
+
+	# `flock` is blocking: a concurrent run holds the lock for its whole build and
+	# we wait. The lock lives on the remote, because agents reach the builder from
+	# more than one machine.
+	echo
+	echo "==> acquiring \$HOME/bench/.lock on $REMOTE"
+
+	# The heredoc carries both halves of the prune into one flocked session:
+	# landed dirs disappear outright, and the idle trees lose only the
+	# incremental cache. `rm -rf` on the landed side, `rm -rf` on the
+	# incremental side -- one per candidate, so a permission failure on one
+	# does not silently skip the rest.
+	ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_PRUNE
+cd \$HOME/bench
+for name in ${landed[@]+"${landed[@]}"}; do
+	[ -d "\$name" ] || continue
+	echo "  rm -rf \$name"
+	rm -rf "\$name"
 done
+for name in ${idle[@]+"${idle[@]}"}; do
+	d=\$name/target/debug/incremental
+	[ -d "\$d" ] || continue
+	echo "  rm -rf \$d"
+	rm -rf "\$d"
+done
+REMOTE_PRUNE
+
+	echo "==> done"
+	return 0
+}
 
 # Formats the byte sum into a line a human can sanity-check against
 # `du -sh` of the same paths. Nothing here interprets the values; `du -sb`
@@ -308,75 +500,44 @@ report_bytes() {
 	fi
 }
 
-# advisory exit code 0 -- a tool that runs through every case and has nothing
-# to report is not a failure.
-if [ ${#landed[@]} -eq 0 ] && [ ${#idle[@]} -eq 0 ] && [ ${#uncertain[@]} -eq 0 ] && [ ${#trunk[@]} -eq 0 ] && [ ${#refused[@]} -eq 0 ] && [ ${#carrying[@]} -eq 0 ]; then
-	echo "==> nothing to prune"
-	exit 0
+# Run the prune over every configured builder lane.
+#
+# The lanes are separate hosts with separate benches. A prune that measured
+# only HOST_BUILDER left the other lanes filling up, which is how six gates
+# failed out of disk across three lanes while one lane looked fine.
+#
+# Each lane is reported separately: a reader has to know which host the
+# candidates are on. An unreachable lane is reported and the others still
+# run -- one dead host must not stop the rest from being pruned.
+run_all_lanes() {
+	local lane rc=0 any=0
+	local -a lanes=()
+	read -ra lanes <<<"$BUILDER_LANES"
+	if [ ${#lanes[@]} -eq 0 ]; then
+		# No lanes configured: the host has one builder, and it is
+		# HOST_BUILDER. Pruning it is the whole job.
+		echo "==> no BUILDER_LANES configured; pruning the default builder"
+		prune_host ""
+		return $?
+	fi
+	for lane in "${lanes[@]}"; do
+		[ -n "$lane" ] || continue
+		any=1
+		echo
+		echo "==> lane: $lane"
+		prune_host "$lane" || rc=$?
+	done
+	[ "$any" -eq 1 ] || return 3
+	return "$rc"
+}
+
+if [ "$ALL_LANES" -eq 1 ] || [ -n "$TREE" ]; then
+	# A named tree is pruned on every lane: the branch was built on
+	# whichever lane was idle, and a cache left on one lane is space
+	# that stays gone.
+	run_all_lanes
+	exit $?
 fi
 
-if [ ${#carrying[@]} -gt 0 ]; then
-	echo
-	echo "==> left alone, carrying unlanded work (${#carrying[@]} tree(s)):"
-	printf '  %s\n' "${carrying[@]}"
-fi
-
-if [ ${#landed[@]} -gt 0 ]; then
-	echo
-	echo "==> landed, safe to remove (${#landed[@]} tree(s)):"
-	printf '  %s\n' "${landed[@]}"
-	report_bytes "$landed_bytes" "  reclaimable from landed"
-fi
-if [ ${#refused[@]} -gt 0 ]; then
-	echo
-	echo "==> left alone, name is not one this tooling produces (${#refused[@]}):"
-	printf '  %q\n' "${refused[@]}"
-fi
-if [ ${#trunk[@]} -gt 0 ]; then
-	echo
-	echo "==> left alone, trunk checkout (${#trunk[@]} tree(s)):"
-	printf '  %s\n' "${trunk[@]}"
-fi
-if [ ${#uncertain[@]} -gt 0 ]; then
-	echo
-	echo "==> left alone, no local worktree (${#uncertain[@]} tree(s)):"
-	printf '  %s\n' "${uncertain[@]}"
-fi
-if [ ${#idle[@]} -gt 0 ]; then
-	echo
-	echo "==> idle >= ${IDLE_DAYS}d, incremental cache droppable (${#idle[@]} tree(s)):"
-	printf '  %s\n' "${idle[@]}"
-	report_bytes "$idle_bytes" "  reclaimable from incremental"
-fi
-
-if [ "$PRUNE" -eq 0 ]; then
-	exit 0
-fi
-
-# `flock` is blocking: a concurrent run holds the lock for its whole build and
-# we wait. The lock lives on the remote, because agents reach the builder from
-# more than one machine.
-echo
-echo "==> acquiring \$HOME/bench/.lock on $REMOTE"
-
-# The heredoc carries both halves of the prune into one flocked session:
-# landed dirs disappear outright, and the idle trees lose only the
-# incremental cache. `rm -rf` on the landed side, `rm -rf` on the
-# incremental side -- one per candidate, so a permission failure on one
-# does not silently skip the rest.
-ssh "$REMOTE" "flock \$HOME/bench/.lock bash -euo pipefail -s" <<REMOTE_PRUNE
-cd \$HOME/bench
-for name in ${landed[@]+"${landed[@]}"}; do
-	[ -d "\$name" ] || continue
-	echo "  rm -rf \$name"
-	rm -rf "\$name"
-done
-for name in ${idle[@]+"${idle[@]}"}; do
-	d=\$name/target/debug/incremental
-	[ -d "\$d" ] || continue
-	echo "  rm -rf \$d"
-	rm -rf "\$d"
-done
-REMOTE_PRUNE
-
-echo "==> done"
+prune_host ""
+exit $?

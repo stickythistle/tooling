@@ -47,6 +47,8 @@ trap verdict EXIT
 # resolves symlinks inside the path it is given, not the script's location, so
 # ../lib resolved against the link and landed outside the checkout.
 LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# The tools beside this one, for the space check that runs before the sync.
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 # shellcheck source=../lib/common.sh
 . "$LIB/common.sh"
 
@@ -124,6 +126,33 @@ if [ -n "$TASK_DB_CONTAINER" ]; then
 fi
 
 DEST="bench/$NAME"
+
+# The space check, before anything is written to the builder.
+#
+# A build that fills the disk fails halfway through, as a linker bus error
+# or an rsync ENOSPC, and it takes the database on the same disk with it.
+# The check counts the bench tree and its `_prove` copy together, because
+# a cold gate for one branch is two trees of 35 GB.
+#
+# A builder below the floor is a refusal with its own exit code, so the
+# gate and the lane report it as infrastructure rather than as a failing
+# test. Exit 4 here is that code.
+SPACE_ARGS=(--host "$REMOTE" --tree "$NAME")
+if [ -n "${BUILDER_MIN_FREE_GB:-}" ]; then
+	SPACE_ARGS+=(--min-free-gb "$BUILDER_MIN_FREE_GB")
+fi
+if [ -n "${BUILDER_DB_CHECK:-}" ]; then
+	SPACE_ARGS+=(--check "$BUILDER_DB_CHECK")
+fi
+set +e
+"$BIN_DIR/builder-space" "${SPACE_ARGS[@]}"
+space_rc=$?
+set -e
+if [ "$space_rc" -ne 0 ]; then
+	FAIL_REASON="builder disk low on $REMOTE (exit $space_rc)"
+	echo "remote-task: $FAIL_REASON" >&2
+	exit 4
+fi
 
 echo "==> syncing $SRC to $REMOTE:$DEST"
 ssh "$REMOTE" "mkdir -p $DEST"
