@@ -34,8 +34,13 @@ review    Do the review. --answers FILE is folded into the prompt above the
           standing priors, so a decision made once does not have to be
           rediscovered.
 
-Both phases write to $REVIEW_WT_ROOT/review-pr-N, branched from the PR head.
-Nothing is pushed.
+Both phases write to $REVIEW_WT_ROOT/review-pr-N-PROFILE, on the branch
+review/pr-N-PROFILE, branched from the PR head. Nothing is pushed.
+
+The branch and the worktree name the profile, so two profiles can review the
+same PR at the same time from one clone -- which is how two reviewers'
+findings are compared. A profile name must match
+^[A-Za-z0-9][A-Za-z0-9_-]*$, or the run stops.
 
 REVIEW_WT_ROOT, REVIEW_PRIORS and REVIEW_PROFILE must be set in the operator's
 env file. See hosts.env.example.
@@ -78,6 +83,14 @@ else
 	PROFILE="$REVIEW_PROFILE"
 fi
 
+# The profile goes into a branch, a worktree path and a lock file, so it
+# has to be one component of a path and of a git ref at once. Any other
+# name is refused here, by name.
+if ! profile_name_ok "$PROFILE"; then
+	echo "profile name '$PROFILE' must match ^[A-Za-z0-9][A-Za-z0-9_-]*\$" >&2
+	exit 2
+fi
+
 require_env REVIEW_WT_ROOT "the directory review worktrees live under"
 WT_ROOT="$REVIEW_WT_ROOT"
 
@@ -115,8 +128,17 @@ read -r HEAD_REF BASE_REF < <(
 
 git fetch --quiet origin "$HEAD_REF" "$BASE_REF"
 
-WT="$WT_ROOT/review-pr-$PR"
-BRANCH="review/pr-$PR"
+# The review's branch and worktree name the profile as well as the PR.
+#
+# Two profiles may review the same PR at the same time from one clone --
+# that is how two reviewers' findings are compared -- and a branch named
+# for the PR alone would collide. The worktree path names the profile for
+# the same reason: one worktree holds the other reviewer's findings.
+#
+# The profile name was checked above, so it is one path and ref
+# component as it is.
+WT="$WT_ROOT/review-pr-$PR-$PROFILE"
+BRANCH="review/pr-$PR-$PROFILE"
 # The PR head the worktree was built from. By the review phase the worktree's
 # HEAD is a readback or findings commit, and an ancestor check passes a head
 # force-pushed back to an ancestor, so the review compares against this exactly.

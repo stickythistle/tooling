@@ -32,6 +32,19 @@ manifest() { python3 "$TOOLS_LIB/manifest.py" "$@"; }
 # becomes OWNER_NAME, matching what an env var holding a path expects.
 env_name() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]' | tr -c '[:alnum:]' '_' | tr -s '_'; }
 
+# `profile_name_ok` -- whether a profile name may be used as one component
+# of a path or a git ref.
+#
+# A profile name goes into a branch, a worktree path and a lock file, so
+# it has to be one path component and one git ref component at once.
+#
+# Sanitising it would map two different profiles onto the same name --
+# `review.a` and `reviewa` both become `reviewa` -- and they would then
+# share a branch, a worktree and a slot lock. So the name is checked.
+profile_name_ok() { # <profile>
+	[[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]]
+}
+
 # Roles are named for what a host can do, so a project asks for `cluster` and
 # never for anyone's hostname.
 #
@@ -401,6 +414,8 @@ acquire_review_slot() {
 	slots=${!slots_var:-1}
 	dir="${AGENT_STATE_DIR:-$HOME/.local/state/agent-tools}"
 	mkdir -p "$dir"
+	# The lock file is a path, so the profile name is one component of
+	# it. The name is used as it is given.
 	while true; do
 		for ((i = 1; i <= slots; i++)); do
 			lock="$dir/hermes-review-${profile}-${i}.lock"
