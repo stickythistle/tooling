@@ -111,6 +111,13 @@ PROFILE_ARGS=()
 # merged skill change stops at the repository until it reaches the
 # profile's tree.
 SKILLS=${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}
+# A brief is composed with the skill that carries the work out: the brief
+# skill defines the format, and the other skill still knows how to
+# implement, verify and commit. The brief skill is dispatched, so it is
+# checked like every other dispatched skill.
+if [[ -n "$BRIEF" ]]; then
+	SKILLS="brief,$SKILLS"
+fi
 IFS=',' read -ra SKILL_NAMES <<<"$SKILLS"
 SKILL_NAMES=("${SKILL_NAMES[@]}")
 # The profile whose tree the lane loads its skills from. The agent's own
@@ -202,14 +209,6 @@ BLOCKED.md in the worktree and stop rather than guess.
 The brief's format is defined by the brief skill. Load it alongside the
 one you are already using:
 "
-fi
-
-# The skills the lane runs with. A brief is composed with the skill that
-# carries the work out: the brief skill defines the format, and the other
-# skill still knows how to implement, verify and commit.
-SKILLS="${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}"
-if [[ -n "$BRIEF_PATH" ]]; then
-	SKILLS="brief,$SKILLS"
 fi
 
 # The retry names the brief too. A resumed attempt that has lost the
