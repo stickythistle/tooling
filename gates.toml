@@ -268,6 +268,16 @@ name = "finding-check tests"
 when = '^(bin/finding-check|tests/test_finding_check\.py)$'
 run = "python3 tests/test_finding_check.py"
 
+# The lane-review driver and the JSON contract behind it. The suite
+# drives the tool end to end against a scratch git repository with
+# stubbed `gh`, reviewer and lane, so the refusals it pins -- a
+# redaction artifact, a file the issue never mentioned, a decision
+# about another commit -- are the tool's behaviour and not its source.
+[[gates]]
+name = "lane-review tests"
+when = '^(bin/lane-review|lib/lane_review\.py|tests/test_lane_review\.py)$'
+run = "python3 tests/test_lane_review.py"
+
 [[gates]]
 name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'

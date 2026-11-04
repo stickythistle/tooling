@@ -60,6 +60,13 @@ When an agent lane implemented the branch, the review repeats until it finds
 nothing, and every edit goes through a lane. Your attention goes on judging
 findings; the lanes do the typing.
 
+`bin/lane-review` drives this loop for a lane's branch and stops at every step
+that needs a judgement: the findings it gathers are in `finding-check`'s JSON
+schema, the decisions are in a `decisions.json` you write, and the steps in
+between -- settling, the hygiene checks, the review, the fix dispatch -- run
+without you. Read the steps below to know what it is doing, and use it when
+the loop is the whole task rather than part of one.
+
 1. **Review the lane's commit** with `hermes-scrutinize.sh --base origin/main
    --profile <reviewer>`, and verify the findings as above. `--extra` carries
    the domain: what the change is for, who calls it and how, and the product

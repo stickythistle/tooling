@@ -39,6 +39,22 @@ itself whether anything had changed, the agent produced five duplicate reviews
 out of fourteen and three stray clones of the repository inside its own working
 directory.
 
+**Tools establish facts, models answer one closed question over facts the tool
+gathered, and decisions stay with whoever can be held to them.** The layering
+is what makes a loop that nobody watches still trustworthy. `lane-review` asks
+the tool for the facts: whether the lane has settled, whether the commit
+carries an agent's redaction rewrite, which files the issue never
+mentioned,
+where the reviewer's quoted code actually is. It then asks a model exactly one
+question -- what is wrong with this diff -- and hands the answer back to
+`finding-check`, which checks it against the source rather than taking it on
+trust. What to do about each finding is not the model's to decide and not the
+tool's either: a person writes `round-N/decisions.json`, and the driver
+refuses to go on while any finding lacks one. The decision file names the
+commit it was made about, so a decision about one diff cannot authorise a
+later one. Every step that needed no judgement runs; every step that did
+stops, with the reason named.
+
 ## Layout
 
     bin/       the gates, and the drivers that dispatch an issue to an agent
@@ -67,10 +83,50 @@ the first failure.
 | `pg-explain`      | show whether an index is usable by a query, and whether the planner picks it |
 | `pr-ready`        | take a PR out of draft, refusing while the work behind it is unfinished |
 | `issue-grade`     | grade open issues by size and context, and route each to a lane |
+| `lane-review`     | review a lane's branch and stop at every step that needs a judgement |
 
 Exit 3 means *unprovable*: the gate gathered no evidence either way.
 `gate-verify` reports it on its own line, because a gate that measured nothing
 must not appear in a list headed "passed".
+
+## The lane review loop
+
+`lane-review <worktree>` takes a branch an agent lane wrote to a draft pull
+request, running the steps that need no judgement and stopping at the ones
+that do.
+
+    lane-review <wt>              # check the commit, review it, write round-N/findings.json
+    lane-review ids <wt>          # the finding ids a decision file refers to
+    lane-review <wt> --apply      # dispatch the accepted fixes to a lane
+    lane-review <wt> --done       # squash, push, and open the pull request as a Draft
+
+The first run refuses a commit that carries an agent's redaction rewrite, or
+that
+changes a file the issue never mentioned; it waits for the lane to settle
+first, because a review of a moving tree reviews nothing. It then asks a
+reviewer for findings in the JSON schema `finding-check` reads, checks each
+one against the source, and writes `round-N/findings.json`. It exits 1: the
+findings need decisions.
+
+A person writes `round-N/decisions.json`. Each finding is `accept`ed with the
+mechanism to use and the wrong mechanism to forbid, `reject`ed with a reason,
+or `defer`red to an issue number. The driver refuses to go on while any
+finding lacks a decision, and refuses a decision file that names another
+commit — or none: the file has to say which diff was read.
+
+`--apply` hands the accepted findings to a lane and carries every rejection
+into the next review, so a finding that was decided is not raised again.
+`--done` refuses while the last round accepted anything; then it squashes at
+the fork point, pushes, and opens the pull request as a Draft. It finishes the
+round it was reviewed against, so a run that failed after the squash can be
+run again. Ready stays a separate act (`pr-ready`): Ready means no further
+change is expected.
+
+Every round appends to the ledger under `$AGENT_STATE_DIR/lane-review/`, with
+the findings, how many survived, how many were the reviewer's false
+assertions, and which model reviewed what — so which reviewer to trust can be
+decided from measurement. The state lives outside the worktree: a review's
+findings are not part of the change under review.
 
 ## Setup
 
