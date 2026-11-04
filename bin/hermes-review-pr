@@ -21,11 +21,12 @@ ANSWERS=""
 REQUESTED_PROFILE=""
 TIMEOUT_PASSED=""
 TIMEOUT_OPT=""
+STACK=0
 
 usage() {
 	cat <<'EOF'
 usage: hermes-review-pr --pr N [--phase readback|review] [--answers FILE]
-                        [--profile NAME] [--timeout SECONDS]
+                        [--profile NAME] [--timeout SECONDS] [--stack]
 
 readback  Ask what it thinks the scope is, what it will check, what it treats as
           out of scope, and what it cannot settle alone. Writes READBACK.md and
@@ -33,6 +34,12 @@ readback  Ask what it thinks the scope is, what it will check, what it treats as
 review    Do the review. --answers FILE is folded into the prompt above the
           standing priors, so a decision made once does not have to be
           rediscovered.
+
+--stack   Review the top of the PR's stack against the default branch, once,
+          and attribute each finding to the PR whose diff introduced the line
+          it cites; a line no PR changed belongs to the stack as a whole.
+          The stack is found from the PR's own base, and naming any PR of it
+          reviews the top. Writes REVIEW_NOTES.md and STACK_ATTRIBUTION.json.
 
 Both phases write to $REVIEW_WT_ROOT/review-pr-N-PROFILE, on the branch
 review/pr-N-PROFILE, branched from the PR head. Nothing is pushed.
@@ -54,6 +61,7 @@ while [[ $# -gt 0 ]]; do
 	--answers) ANSWERS="$2"; shift 2 ;;
 	--profile) REQUESTED_PROFILE="$2"; shift 2 ;;
 	--timeout) TIMEOUT_PASSED=1; TIMEOUT_OPT="$2"; shift 2 ;;
+	--stack) STACK=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -63,6 +71,15 @@ case "$PHASE" in
 readback | review) ;;
 *) echo "--phase must be readback or review" >&2; exit 2 ;;
 esac
+
+# The readback phase briefs the reviewer on one PR's diff. In stack mode the
+# review is of the whole stack, so a readback would brief it on the wrong
+# thing: the brief has to name the combined tree.
+if [[ "$STACK" == 1 && "$PHASE" == readback ]]; then
+	echo "--stack applies to the review phase; a stack is reviewed as one change" >&2
+	exit 2
+fi
+
 
 [[ -n "$PR" ]] || { echo "--pr is required" >&2; usage >&2; exit 2; }
 
@@ -126,7 +143,32 @@ read -r HEAD_REF BASE_REF < <(
 )
 [[ -n "${HEAD_REF:-}" && -n "${BASE_REF:-}" ]] || { echo "could not resolve refs for PR $PR" >&2; exit 1; }
 
-git fetch --quiet origin "$HEAD_REF" "$BASE_REF"
+# In stack mode the review is of the whole stack: the head reviewed is the
+# top of the stack, the base is the default branch, both from stack-plan.
+STACK_PLAN=""
+if [[ "$STACK" == 1 ]]; then
+	STACK_PLAN=$(mktemp -t hermes-stack-XXXXXX.json)
+	if ! python3 "$BIN_DIR/stack-plan" --repo "$SLUG" --pr "$PR" >"$STACK_PLAN"; then
+		rm -f "$STACK_PLAN"
+		exit 2
+	fi
+	TOP_REF=$(jq -r '.top.head' "$STACK_PLAN")
+	DEFAULT_REF=$(jq -r '.default_branch' "$STACK_PLAN")
+	HEAD_REF="$TOP_REF"
+	BASE_REF="$DEFAULT_REF"
+fi
+
+# Every ref the review and the attribution need. A stack is a set of branches,
+# and a fetch that leaves one behind shows the review a tree that is not the
+# stack's.
+FETCH_REFS=("$HEAD_REF" "$BASE_REF")
+if [[ "$STACK" == 1 ]]; then
+	while IFS= read -r _ref; do
+		[[ -n "$_ref" ]] && FETCH_REFS+=("$_ref")
+	done < <(jq -r '.stack[] | .head, .base' "$STACK_PLAN")
+fi
+
+git fetch --quiet origin "${FETCH_REFS[@]}"
 
 # The review's branch and worktree name the profile as well as the PR.
 #
@@ -163,11 +205,12 @@ fi
 
 exec 8>&-
 
-commit_artifact() { # path subject
+commit_artifact() { # path... subject
+	local subject="${!#}"
 	REVIEWED_SHA=$(git rev-parse --short "$(git config --get "$HEAD_KEY")")
-	git -C "$WT" add "$1"
+	git -C "$WT" add -- "${@:1:$#-1}"
 	git -C "$WT" -c user.name="hermes-review" -c user.email="hermes@localhost" \
-		commit --quiet -m "$2
+		commit --quiet -m "$subject
 
 $HEAD_REF at $REVIEWED_SHA, against $BASE_REF, with $PROFILE."
 }
@@ -244,8 +287,38 @@ fi
 FINDINGS=$(cd "$WT" && "$SCRUTINIZE" "${SCRUTINIZE_ARGS[@]}")
 
 cp "$FINDINGS" "$WT/REVIEW_NOTES.md"
-commit_artifact REVIEW_NOTES.md "review(pr-$PR): findings against $HEAD_REF"
+
+if [[ "$STACK" == 1 ]]; then
+	# The attribution is computed against the worktree, the tree the reviewer
+	# saw, over the plan the review was set up from: rediscovering the stack
+	# here would attribute over whatever it changed into mid-review.
+	ATTRIB=$(mktemp -t hermes-stack-attrib-XXXXXX.json)
+	if ! python3 "$BIN_DIR/stack-attrib" \
+		--plan "$STACK_PLAN" \
+		--repo-path "$WT" \
+		--findings "$FINDINGS" >"$ATTRIB"; then
+		rm -f "$ATTRIB"
+		echo "stack attribution failed" >&2
+		exit 1
+	fi
+	cp "$ATTRIB" "$WT/STACK_ATTRIBUTION.json"
+	rm -f "$ATTRIB"
+	# The per-pull-request breakdown, so the operator sees which PR of the
+	# stack each finding belongs to without reading the JSON.
+	echo "stack:"
+	jq -r '.stack[] | "  #\(.number) \(.head) -- \(.title)"' "$WT/STACK_ATTRIBUTION.json"
+	echo "attribution:"
+	jq -r '.findings[] | "  \(.path):\(.line) -> PR \(.pr // "stack") (\(.reason))"' \
+		"$WT/STACK_ATTRIBUTION.json"
+	echo "tally: $(jq -c '.tally' "$WT/STACK_ATTRIBUTION.json")"
+	commit_artifact REVIEW_NOTES.md STACK_ATTRIBUTION.json \
+		"review(pr-$PR): findings against $HEAD_REF, attributed across the stack"
+else
+	commit_artifact REVIEW_NOTES.md "review(pr-$PR): findings against $HEAD_REF"
+fi
 
 echo "worktree: $WT"
 echo "branch:   $BRANCH (from origin/$HEAD_REF, not pushed)"
 echo "findings: $WT/REVIEW_NOTES.md"
+[[ "$STACK" == 1 ]] && echo "attribution: $WT/STACK_ATTRIBUTION.json"
+exit 0

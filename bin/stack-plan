@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Print the shape of a pull request's stack, as JSON.
+
+A stacked pull request is based on another open pull request's head branch,
+so the stack is found by walking the bases: downwards to the floor, then
+upwards to the top. The top carries every change below it and is the one a
+stack review reads.
+
+The output is the plan the review driver reads:
+
+    {
+      "default_branch": "main",
+      "top": {"number": 2, "head": "feat/b", "base": "feat/a"},
+      "stack": [
+        {"number": 1, "head": "feat/a", "base": "main", "title": "..."},
+        {"number": 2, "head": "feat/b", "base": "feat/a", "title": "..."}
+      ]
+    }
+
+A pull request based on anything that is neither the default branch nor an
+open pull request's head is refused, and so is a stack that forks.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import stack_attrib  # noqa: E402
+
+
+def plan(repo: str, number: int) -> dict:
+    """The stack's shape."""
+    base = stack_attrib.default_branch(repo)
+    prs = stack_attrib.open_pull_requests(repo)
+    stack = stack_attrib.discover_stack(prs, number, base)
+    stack_attrib.stack_floor(stack, base)
+    top = stack[-1]
+    return {
+        "default_branch": base,
+        "top": {
+            "number": top.number,
+            "head": top.head_ref,
+            "base": top.base_ref,
+        },
+        "stack": [
+            {
+                "number": pr.number,
+                "head": pr.head_ref,
+                "base": pr.base_ref,
+                "title": pr.title,
+            }
+            for pr in stack
+        ],
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Print the shape of a pull request's stack."
+    )
+    parser.add_argument("--repo", required=True, help="owner/name")
+    parser.add_argument("--pr", required=True, type=int,
+                        help="any pull request of the stack")
+    args = parser.parse_args()
+    try:
+        result = plan(args.repo, args.pr)
+    except stack_attrib.StackError as exc:
+        sys.stderr.write(f"stack-plan: {exc}\n")
+        return 2
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Attribute a stack's findings to the pull requests that introduced them.
+
+Reads the reviewer's findings and the plan `stack-plan` printed before the
+review ran. The plan is an input: a PR opened, closed or retargeted during
+the review cannot make this attribute over a different stack than the one
+reviewed. A finding on a line no PR of the stack changed belongs to the
+stack as a whole.
+
+The findings are text and their `path:line` references are parsed out of
+them. The output:
+
+    {
+      "stack": [ {"number": 1, "head": "feat/a", "title": "..."}, ... ],
+      "findings": [
+        {"path": "src/x.rs", "line": 42, "pr": 1, "reason": "introduced"},
+        {"path": "src/y.rs", "line": 7,  "pr": null, "reason": "stack"}
+      ],
+      "tally": {"introduced": 1, "stack": 1, "unattributable": 0}
+    }
+
+`reason` is `introduced` (the named PR introduced the cited line), `stack`
+(no PR of the stack changed it), or `unattributable` (the path is not in
+the reviewed tree).
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import stack_attrib  # noqa: E402
+
+
+def stack_from_plan(plan: dict) -> list[stack_attrib.PullRequest]:
+    """The plan's stack, bottom first."""
+    try:
+        stack = [
+            stack_attrib.PullRequest(
+                number=entry["number"],
+                head_ref=entry["head"],
+                base_ref=entry["base"],
+                title=entry.get("title", ""),
+            )
+            for entry in plan["stack"]
+        ]
+    except (KeyError, TypeError) as exc:
+        raise stack_attrib.StackError(
+            f"the plan is not a stack-plan document: missing {exc}"
+        ) from exc
+    if not stack:
+        raise stack_attrib.StackError("the plan holds no pull requests")
+    return stack
+
+
+def resolve_ref(repo_path: str, branch: str) -> str:
+    """The local ref a remote branch is at.
+
+    The review fetched the stack's branches as `origin/<branch>`; a local
+    branch of the same name may be stale, so only the remote ref resolves.
+    A branch with no remote ref is refused: attributing against a branch
+    behind the remote would name the wrong pull request.
+    """
+    for candidate in (f"origin/{branch}", f"refs/remotes/origin/{branch}"):
+        result = subprocess.run(
+            ["git", "-C", repo_path, "rev-parse", "--verify",
+             "--quiet", candidate],
+            capture_output=True, text=True, check=False,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return candidate
+    raise stack_attrib.StackError(
+        f"branch {branch!r} is not fetched in {repo_path}; the review cannot "
+        f"attribute a finding to a pull request whose branch is missing"
+    )
+
+
+def attribute_findings(repo_path: str, findings_text: str,
+                       stack: list[stack_attrib.PullRequest],
+                       final_tree: str) -> dict:
+    """Attribute every `path:line` the findings cite."""
+    members = []
+    for pr in stack:
+        members.append(stack_attrib.StackMember(
+            number=pr.number,
+            head_ref=resolve_ref(repo_path, pr.head_ref),
+            base_ref=resolve_ref(repo_path, pr.base_ref),
+            title=pr.title,
+        ))
+    owner = stack_attrib.introduced_by(repo_path, members, final_tree)
+    tree = stack_attrib.tree_paths(repo_path, final_tree)
+
+    findings = []
+    for path, line in stack_attrib.parse_references(findings_text):
+        if path not in tree:
+            pr, reason = None, "unattributable"
+        else:
+            pr = owner.get(path, {}).get(line)
+            reason = "introduced" if pr is not None else "stack"
+        findings.append({
+            "path": path,
+            "line": line,
+            "pr": pr,
+            "reason": reason,
+        })
+
+    tally = {"introduced": 0, "stack": 0, "unattributable": 0}
+    for finding in findings:
+        tally[finding["reason"]] += 1
+
+    return {
+        "stack": [
+            {"number": pr.number, "head": pr.head_ref, "base": pr.base_ref,
+             "title": pr.title}
+            for pr in stack
+        ],
+        "findings": findings,
+        "tally": tally,
+    }
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Attribute a stack's review findings to its pull requests."
+    )
+    parser.add_argument("--plan", required=True,
+                        help="the plan file stack-plan printed for this review")
+    parser.add_argument("--repo-path", required=True,
+                        help="the local checkout the review ran against")
+    parser.add_argument("--findings", required=True,
+                        help="the findings file the reviewer wrote")
+    args = parser.parse_args()
+
+    try:
+        plan = json.loads(Path(args.plan).read_text())
+        if not isinstance(plan, dict):
+            raise stack_attrib.StackError(
+                "the plan is not a stack-plan document"
+            )
+        stack = stack_from_plan(plan)
+        floor = plan.get("default_branch")
+        if not floor:
+            raise stack_attrib.StackError(
+                "the plan is not a stack-plan document: no default_branch"
+            )
+        stack_attrib.stack_floor(stack, floor)
+        findings_text = Path(args.findings).read_text(errors="replace")
+        # The reviewed tree is the top of the stack, as the local ref it was
+        # fetched to.
+        final_tree = resolve_ref(args.repo_path, stack[-1].head_ref)
+        result = attribute_findings(
+            args.repo_path, findings_text, stack, final_tree,
+        )
+    except stack_attrib.StackError as exc:
+        sys.stderr.write(f"stack-attrib: {exc}\n")
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(f"stack-attrib: {exc}\n")
+        return 2
+
+    json.dump(result, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

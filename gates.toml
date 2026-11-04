@@ -50,6 +50,13 @@ name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'
 run = "python3 tests/test_gates_workflow.py"
 
+# The stack review: the driver, its two helper tools, and the attribution
+# library the suite pins.
+[[gates]]
+name = "stack review tests"
+when = '^(bin/hermes-review-pr|bin/stack-attrib|bin/stack-plan|lib/stack_attrib\.py|tests/test_review_stack\.py)$'
+run = "python3 tests/test_review_stack.py"
+
 [[gates]]
 name = "lane-settled tests"
 when = '^(bin/lane-settled|bin/hermes-implement|bin/gate-verify|tests/test_lane_settled\.py)$'
