@@ -33,6 +33,12 @@ refuses to push unless the lane added commits on top of the PR's head, left the
 tree clean, and the gate passes. Pushes fast-forward only. A lane that pushes
 back on every comment commits nothing; its replies are posted all the same.
 
+A commit that names the round -- "Round 2: ...", "B1 (round 3) -- ..." -- is
+refused before the push. The pattern matches the narration shape rather
+than the word: a round is named by a number next to it, so "Round 2" and
+"review 3" are refusals and "Round-robin" is not. A reviewer reads a commit
+as the change, not as the journey that produced it.
+
 The implementer is $PIPELINE_IMPLEMENTER, required, called as `<implementer> --issue N --worktree PATH --repo OWNER/NAME
 --extra BRIEF [--profile NAME]`, printing its run directory, which holds
 HANDOVER.md, as the last line. --profile passes through unread.
@@ -330,6 +336,33 @@ elif [[ -n "$MODELS_CMD" ]]; then
 fi
 
 verdict="" pushed=false gate=skipped
+# A commit that narrates the round rather than the change is refused
+# before the push: a reviewer reads the commit as the change, not as the
+# journey that produced it. A lane is a subprocess, so nothing else will
+# refuse it.
+#
+# The pattern matches the narration shape, not the word: a round is named
+# by a number next to it. "Round 2" and "review 3" are refusals;
+# "Round-robin" and "math.Round" pass, and a refusal the lane cannot fix
+# costs a round for nothing.
+#
+# Only the commit message is checked. The source a lane adds carries the
+# same words for its own reasons -- a test fixture, a summary this loop
+# prints, a standard library's rounding -- and a guard that refuses those
+# cannot be worked around by the lane.
+lane_messages_clean() { # start end
+	local start=$1 end=$2 hits
+	# The commit messages: subject and body.
+	hits=$(git -C "$WORKTREE" log --format='%H %s%n%b' "$start..$end" 2>/dev/null |
+		grep -nE '\b[Rr]ound [0-9]+\b|\breview [0-9]+\b|\(round [0-9]+\)' || true)
+	if [[ -n "$hits" ]]; then
+		echo "agent-fix-pr: the lane's commit message names the round:" >&2
+		printf '%s\n' "$hits" >&2
+		echo "A commit subject says what the code now does." >&2
+		return 1
+	fi
+	return 0
+}
 # Map the verifier's exit code to a verdict. Code 1 is identity refusal;
 # codes 2-5 are other failures (rewritten history, unresolvable base,
 # tree-changing rebase, rebase could not start). A non-zero verifier
@@ -356,6 +389,8 @@ elif ! git -C "$WORKTREE" merge-base --is-ancestor "$START" "$END"; then
 	verdict="history rewritten"
 elif [[ -n "$(git -C "$WORKTREE" status --porcelain)" ]]; then
 	verdict="uncommitted changes"
+elif ! lane_messages_clean "$START" "$END"; then
+	verdict="round message refused"
 elif ! "$VERIFY_BIN" "$WORKTREE" >"$LEDGER_DIR/round-$ROUND.gate.log" 2>&1; then
 	gate=fail verdict="gate failed"
 else
