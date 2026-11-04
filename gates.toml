@@ -305,6 +305,17 @@ name = "review-execute tests"
 when = '^(bin/review-execute|lib/review_execute\.py|bin/hermes-review-pr|tests/test_review_execute\.py)$'
 run = "python3 tests/test_review_execute.py"
 
+# A retried attempt resumes this run's session, by name. A bare
+# `--continue` lets the CLI pick the session -- its breadcrumb, or the
+# most recent one in the workspace, or the most recent one anywhere --
+# so two runs in one worktree can resume each other's session. The run
+# fixes the name before the first attempt, because the session id the
+# agent reports is gone on an attempt the timeout killed.
+[[gates]]
+name = "hermes-implement session resume tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_session\.py)$'
+run = "python3 tests/test_hermes_implement_session.py"
+
 # Syntax floor for the two review drivers; their shared logic is in
 # lib/common.sh and the review script, which the suite above pins.
 [[gates]]
