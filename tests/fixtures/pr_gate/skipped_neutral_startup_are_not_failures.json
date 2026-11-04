@@ -1,0 +1,43 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "5555555555555555555555555555555555555555"
+    },
+    "mergeable": true
+  },
+  "reviews": [],
+  "comments": [],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SKIPPED",
+      "name": "Gates"
+    },
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "NEUTRAL",
+      "name": "Gates"
+    },
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "STARTUP_FAILURE",
+      "name": "Gates"
+    }
+  ],
+  "trees": {},
+  "compares": {},
+  "patch_equal": null,
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "REVIEW 1111111111111111111111111111111111111111"
+}

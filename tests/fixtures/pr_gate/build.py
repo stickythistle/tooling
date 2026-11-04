@@ -18,6 +18,7 @@ HEAD = "1111111111111111111111111111111111111111"
 HEAD2 = "2222222222222222222222222222222222222222"
 COMMIT_A = "3333333333333333333333333333333333333333"
 COMMIT_B = "4444444444444444444444444444444444444444"
+BASE = "5555555555555555555555555555555555555555"
 TREE_1 = "aaaaaaaa00000000000000000000000000000000"
 TREE_2 = "bbbbbbbb00000000000000000000000000000000"
 
@@ -33,10 +34,10 @@ def review(rid, state, commit, submitted, login=REVIEWER, body="a review"):
     }
 
 
-def comment(cid, created, login, body="a comment"):
+def comment(cid, created, login, body="a comment", user_type="User"):
     return {
         "id": cid,
-        "user": {"login": login, "type": "User"},
+        "user": {"login": login, "type": user_type},
         "created_at": created,
         "body": body,
     }
@@ -55,10 +56,49 @@ def check_run(status="COMPLETED", conclusion="SUCCESS", name="Gates"):
             "conclusion": conclusion, "name": name}
 
 
-def pr(state="open", merged=False, head=HEAD):
-    return {"state": state, "merged": merged, "draft": False,
-            "head": {"sha": head}, "base": {"sha": COMMIT_B},
-            "mergeable": "MERGEABLE"}
+# The patch a compare reports. A rebase shifts the hunk header's line
+# numbers and changes nothing else.
+PATCH_BODY = ("--- a/lib/x.py\n"
+              "+++ b/lib/x.py\n"
+              "@@ -10,3 +10,3 @@ def f():\n"
+              "-old line\n"
+              "+new line\n"
+              " keep\n")
+
+# The blob sha of a compare-reported file: git's object name for its
+# content, so the same content always carries the same sha.
+BLOB_SHA = "cccccccc00000000000000000000000000000000"
+OTHER_BLOB_SHA = "dddddddd00000000000000000000000000000000"
+
+# The sha value meaning "this file carries no sha at all", as opposed to
+# "not chosen yet".
+NO_SHA = ""
+
+
+def compare_files(patch: str | None = PATCH_BODY, filename="lib/x.py",
+                  sha: str | None = None):
+    """Return one file of a compare response.
+
+    `sha` of None picks the sha that goes with the filename; NO_SHA
+    leaves the field out, as the API reports for a file it has no
+    content for.
+    """
+    chosen = sha
+    if chosen is None:
+        chosen = OTHER_BLOB_SHA if filename != "lib/x.py" else BLOB_SHA
+    entry = {"filename": filename, "status": "modified"}
+    if chosen != NO_SHA:
+        entry["sha"] = chosen
+    if patch is not None:
+        entry["patch"] = patch
+    return [entry]
+
+
+def pr(state="open", merged=False, head=HEAD, draft=False,
+       mergeable: bool | None = True, base=BASE):
+    return {"state": state, "merged": merged, "draft": draft,
+            "head": {"sha": head}, "base": {"sha": base},
+            "mergeable": mergeable}
 
 
 # The four shapes the issue names, plus the ones the rules need.
@@ -90,7 +130,7 @@ FIXTURES = {
         ],
         "checks": [check_run()],
         "trees": {HEAD: TREE_1},
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + HEAD,
     },
     # person_comment_after_approval
     "person_comment_after_approval": {
@@ -103,7 +143,7 @@ FIXTURES = {
         ],
         "checks": [check_run()],
         "trees": {HEAD: TREE_1},
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + HEAD,
     },
     # The head moved while a review was in flight. The verdict now says
     # nothing about the head.
@@ -115,7 +155,10 @@ FIXTURES = {
         "comments": [],
         "checks": [check_run()],
         "trees": {HEAD2: TREE_2, COMMIT_A: TREE_1},
-        "expected": "REVIEW " + HEAD2,
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD2}": compare_files(filename="lib/y.py")},
+        "patch_equal": False,
+        "expected": "REVIEW " + HEAD2 + " " + COMMIT_A,
     },
     # The squash case: the branch was rewritten, the approval was
     # dismissed, and the work did not change.
@@ -144,7 +187,7 @@ FIXTURES = {
         ],
         "checks": [check_run()],
         "trees": {HEAD: TREE_1, COMMIT_A: TREE_1},
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
     },
     # The caller's own unsubmitted review, alongside a verdict. The
     # pending review carries no submitted_at and is dropped.
@@ -175,7 +218,10 @@ FIXTURES = {
         "comments": [],
         "checks": [check_run()],
         "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
-        "expected": "REVIEW " + HEAD,
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files(filename="lib/y.py")},
+        "patch_equal": False,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
     },
     # A marker naming an older review leaves the round in hand open.
     "marker_names_older": {
@@ -254,7 +300,7 @@ FIXTURES = {
         "checks": [check_run()],
         "trees": {HEAD: TREE_1},
         "implementers": [IMPLEMENTER],
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + HEAD,
     },
     # The reviewer's own marker.
     "marked_post_by_reviewer": {
@@ -269,7 +315,7 @@ FIXTURES = {
         "checks": [check_run()],
         "trees": {HEAD: TREE_1},
         "implementers": [IMPLEMENTER],
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + HEAD,
     },
     # An empty implementer set trusts nothing.
     "marked_post_no_implementers": {
@@ -284,7 +330,7 @@ FIXTURES = {
         "checks": [check_run()],
         "trees": {HEAD: TREE_1, COMMIT_A: TREE_1},
         "implementers": [],
-        "expected": "REVIEW " + HEAD,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
     },
     # The same marked post from a listed implementer: no third-party
     # trip, so the squash shortcut stands.
@@ -318,6 +364,226 @@ FIXTURES = {
         "implementers": [IMPLEMENTER],
         "expected": "FIX 77",
     },
+    "draft_waits": {
+        "pr": pr(draft=True),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {},
+        "expected": "WAIT draft",
+    },
+    # A failed CheckRun alongside a successful one is a failure.
+    "failed_check_run": {
+        "pr": pr(),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run(conclusion="SUCCESS"),
+                   check_run(conclusion="FAILURE")],
+        "trees": {},
+        "expected": "FIX checks",
+    },
+    # A failed StatusContext is a failure.
+    "failed_status_context": {
+        "pr": pr(),
+        "reviews": [],
+        "comments": [],
+        "checks": [{"__typename": "StatusContext", "state": "ERROR",
+                    "context": "ci"}],
+        "trees": {},
+        "expected": "FIX checks",
+    },
+    # A cancelled run is no evidence against the branch: every push
+    # cancels the run it supersedes.
+    "cancelled_check_is_not_a_failure": {
+        "pr": pr(),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run(conclusion="CANCELLED")],
+        "trees": {},
+        "expected": "REVIEW " + HEAD,
+    },
+    # The base conflicts with the head.
+    "mergeable_false_is_a_conflict": {
+        "pr": pr(mergeable=False),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {},
+        "expected": "FIX conflict",
+    },
+    # A null `mergeable` is unknown, not a conflict: GitHub returns it
+    # for seconds after every push.
+    "mergeable_null_is_not_a_conflict": {
+        "pr": pr(mergeable=None),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {},
+        "expected": "REVIEW " + HEAD,
+    },
+    # A rebase that leaves the patch equal carries the approval: the tree
+    # moved, the work did not.
+    "rebased_equal_patch_reapproves": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files()},
+        "patch_equal": True,
+        "expected": "REAPPROVE " + HEAD,
+    },
+    # The same rebase, but the verdict asked for changes. The request
+    # still stands, so the fix stays in hand.
+    "rebased_equal_patch_keeps_the_fix": {
+        "pr": pr(),
+        "reviews": [
+            review(801, "CHANGES_REQUESTED", COMMIT_A,
+                   "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files()},
+        "patch_equal": True,
+        "expected": "FIX 801",
+    },
+    # A person objected since the verdict.
+    "rebased_equal_patch_with_objection": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", "a-person"),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files()},
+        "patch_equal": True,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
+    },
+    # A file the API cannot show a patch for, with equal blob shas:
+    # equal. A binary file or one too large to diff still carries a sha,
+    # so a missing patch text must not stall the comparison.
+    "file_without_a_patch_is_equal": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files(patch=None)},
+        "patch_equal": True,
+        "expected": "REAPPROVE " + HEAD,
+    },
+    # A file the API reports no content for: not equal. The blob sha is
+    # what says the two commits left the same content, and without it
+    # there is nothing to compare.
+    "file_without_a_sha_is_not_equal": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files(sha=NO_SHA)},
+        "patch_equal": False,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
+    },
+    # The impostor: the approval was for a change to one function, the
+    # head changes a different one. Same changed text, different file
+    # content, so the approval does not carry.
+    "changed_function_is_not_equal": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {
+            f"{BASE}...{COMMIT_A}": compare_files(),
+            f"{BASE}...{HEAD}": compare_files(
+                sha=OTHER_BLOB_SHA,
+                patch=PATCH_BODY.replace("@@ -10,3 +10,3 @@ def f():",
+                                         "@@ -10,3 +10,3 @@ def g():")),
+        },
+        "patch_equal": False,
+        "expected": "REVIEW " + HEAD + " " + COMMIT_A,
+    },
+    # A bot's post is never a third party's: the approval carries.
+    "bot_comment_does_not_interrupt": {
+        "pr": pr(),
+        "reviews": [
+            review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            comment(1, "2026-10-20T01:00:00Z", "ci-bot",
+                    body="the build finished", user_type="Bot"),
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_2, COMMIT_A: TREE_1},
+        "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                     f"{BASE}...{HEAD}": compare_files()},
+        "patch_equal": True,
+        "expected": "REAPPROVE " + HEAD,
+    },
+    # A draft that has already been merged is still DONE merged: the
+    # draft rule sits below the DONE rules.
+    "draft_merged": {
+        "pr": pr(state="closed", merged=True, draft=True),
+        "reviews": [],
+        "comments": [],
+        "checks": [],
+        "trees": {},
+        "expected": "DONE merged",
+    },
+    # A draft with a failing check still waits: the draft rule is above
+    # the check rules.
+    "draft_beats_failed_checks": {
+        "pr": pr(draft=True),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run(conclusion="FAILURE")],
+        "trees": {},
+        "expected": "WAIT draft",
+    },
+    # SKIPPED, NEUTRAL and STARTUP_FAILURE are no evidence against the
+    # branch either.
+    "skipped_neutral_startup_are_not_failures": {
+        "pr": pr(),
+        "reviews": [],
+        "comments": [],
+        "checks": [check_run(conclusion="SKIPPED"),
+                   check_run(conclusion="NEUTRAL"),
+                   check_run(conclusion="STARTUP_FAILURE")],
+        "trees": {},
+        "expected": "REVIEW " + HEAD,
+    },
+    # No `user.type` at all.
+    "comment_without_a_type_is_a_person": {
+        "pr": pr(),
+        "reviews": [
+            review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z"),
+        ],
+        "comments": [
+            {"id": 1, "user": {"login": "someone-else"},
+             "created_at": "2026-10-20T01:00:00Z", "body": "a comment"},
+        ],
+        "checks": [check_run()],
+        "trees": {HEAD: TREE_1},
+        "expected": "REVIEW " + HEAD + " " + HEAD,
+    },
 }
 
 
@@ -333,6 +599,11 @@ def main() -> int:
             "comments": data["comments"],
             "checks": data["checks"],
             "trees": data["trees"],
+            # The compare responses the gate reads, keyed by
+            # "<base>...<commit>".
+            "compares": data.get("compares", {}),
+            # What the decision is told the patch comparison found.
+            "patch_equal": data.get("patch_equal"),
             # The logins whose answer markers this scenario trusts. The
             # suite passes them as --implementer, exactly as the host
             # config would.

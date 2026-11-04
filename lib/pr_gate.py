@@ -46,6 +46,20 @@ PASSING_CHECK_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED")
 # answers the same vocabulary as the check runs, in upper case.
 PASSING_STATUS_STATES = ("SUCCESS", "NEUTRAL", "SKIPPED")
 
+# A `CheckRun` conclusion that is evidence against the branch. A
+# superseded run is cancelled, a check with nothing to say is skipped,
+# and a runner that never came up is the runner's account.
+FAILING_CHECK_CONCLUSIONS = ("FAILURE", "TIMED_OUT")
+
+# A `StatusContext` state that is evidence against the branch.
+FAILING_STATUS_STATES = ("FAILURE", "ERROR")
+
+# The `user.type` of a comment that counts as a person. A comment from
+# a `Bot` is never a third-party post, and a comment with no `type` is
+# read as a person.
+USER_TYPE = "User"
+BOT_TYPE = "Bot"
+
 
 class Malformed(Exception):
     """A fetched entry carries a shape outside the API's.
@@ -195,6 +209,9 @@ def failed_check_names(checks: list) -> list[str]:
     `state`), told apart by `__typename`. A running check is never named.
 
     Only `success`, `neutral` and `skipped` count as evidence.
+
+    The merge gate asks for evidence for the branch, so a cancelled or
+    startup-failed run is named.
     """
     failed: list[str] = []
     for entry in checks:
@@ -224,6 +241,48 @@ def failed_check_names(checks: list) -> list[str]:
     return failed
 
 
+def failed_checks(checks: list) -> bool:
+    """True when a check on the head concluded against the branch.
+
+    A `CheckRun` is failed by its `conclusion`, a `StatusContext` by
+    its `state`.
+
+    The loop asks for evidence against the branch, so a cancelled run
+    is not: every push cancels the run it supersedes.
+    """
+    for entry in checks:
+        if not isinstance(entry, dict):
+            continue
+        typename = entry.get("__typename")
+        if typename == "CheckRun":
+            conclusion = entry.get("conclusion")
+            if (isinstance(conclusion, str)
+                    and conclusion in FAILING_CHECK_CONCLUSIONS):
+                return True
+        elif typename == "StatusContext":
+            state = entry.get("state")
+            if isinstance(state, str) and state in FAILING_STATUS_STATES:
+                return True
+    return False
+
+
+def _user_type(entry: dict, endpoint: str, index: int) -> str:
+    """Return the author's `user.type`, reading a missing one as a person.
+
+    The field is absent from some responses; a post with no `type` is a
+    person's.
+    """
+    user = _require(entry, "user", endpoint, index)
+    if not isinstance(user, dict):
+        raise Malformed(endpoint, index)
+    kind = user.get("type")
+    if kind is None:
+        return USER_TYPE
+    if not isinstance(kind, str):
+        raise Malformed(endpoint, index)
+    return kind
+
+
 def validate_comments(comments: list) -> list:
     """Return the comments as a list of checked records.
 
@@ -236,12 +295,14 @@ def validate_comments(comments: list) -> list:
         if not isinstance(entry, dict):
             raise Malformed("comments", index)
         login = _login(entry, "comments", index)
+        kind = _user_type(entry, "comments", index)
         created = entry.get("created_at")
         if not isinstance(created, str) or not created:
             raise Malformed("comments", index)
         out.append({
             "id": entry.get("id"),
             "user": login,
+            "type": kind,
             "created_at": created,
             "body": _text(entry, "comments", index),
         })
@@ -268,12 +329,14 @@ def third_party_post(comments: list, reviewer: str, after: str | None,
                      implementers=frozenset()) -> bool:
     """True when someone other than the reviewer spoke after the verdict.
 
-    A *third-party post* is an issue or inline comment created after the
-    verdict that speaks for itself: a marker counts only from a listed
-    implementer.
+    A *third-party post* is a comment created after the verdict that
+    speaks for itself. A marker counts only from a listed implementer,
+    and a bot's post never does.
     """
     for entry in comments:
         if after is not None and entry["created_at"] <= after:
+            continue
+        if entry.get("type") == BOT_TYPE:
             continue
         marked = bool(MARKER_RE.search(entry["body"])
                       or STATUS_MARKER_RE.search(entry["body"]))
@@ -304,14 +367,88 @@ def answered_review(comments: list, review_id, reviewer: str,
     return False
 
 
-def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
-           reviewer: str, max_rounds: int = 4,
-           implementers=frozenset()) -> str:
-    """Return the one line that says what the pull request needs next.
+# The API lists at most this many files in a compare. A response that
+# long is truncated, so it cannot be compared.
+MAX_COMPARE_FILES = 300
 
-    `pr` is the parsed `repos/R/pulls/N` object; `reviews`, `comments`
-    and `checks` are the fetched lists; `implementers` are the logins
-    whose markers are trusted.
+
+def _files_by_name(files) -> dict | None:
+    """The compare response's files keyed by filename.
+
+    None when the response cannot be compared: not a list, truncated at
+    MAX_COMPARE_FILES, an entry that is not an object, or a file listed
+    twice, with no name, or with no `sha`.
+    """
+    if not isinstance(files, list) or len(files) >= MAX_COMPARE_FILES:
+        return None
+    out: dict[str, dict] = {}
+    for entry in files:
+        if not isinstance(entry, dict):
+            return None
+        filename = entry.get("filename")
+        sha = entry.get("sha")
+        if not isinstance(filename, str) or not filename:
+            return None
+        if not isinstance(sha, str) or not sha:
+            return None
+        if filename in out:
+            return None
+        out[filename] = entry
+    return out
+
+
+def same_patch(left_files, right_files) -> bool:
+    """True when two compare responses carry the same work.
+
+    Equal when both list the same files and every file's blob sha is
+    equal. The blob sha names the file's content, so a file the API
+    will not show a patch for -- binary, or too large to diff -- still
+    compares.
+
+    Anything else is not equal. A false equality merges unreviewed
+    work; a false difference costs one review.
+    """
+    left = _files_by_name(left_files)
+    right = _files_by_name(right_files)
+    if left is None or right is None:
+        return False
+    if set(left) != set(right):
+        return False
+
+    for name, entry in left.items():
+        if entry["sha"] != right[name]["sha"]:
+            return False
+    return True
+
+
+def _same_work(trees: dict, head: str, review_commit: str,
+               patch_equal) -> bool:
+    """True when the head carries the same work as the reviewed commit.
+
+    Equal trees are the same work. Failing that, an equal patch is: a
+    rebase over a base that left the file alone replays the change
+    byte for byte.
+    """
+    head_tree = trees.get(head)
+    review_tree = trees.get(review_commit)
+    if head_tree is not None and head_tree == review_tree:
+        return True
+    return patch_equal is True
+
+
+def early_decision(pr: dict, reviews: list, comments: list, checks: list,
+                   reviewer: str, implementers=frozenset()):
+    """Return what the pull request needs, if the first rules settle it.
+
+    The rules are in the order `decide` applies them. The first seven
+    need nothing beyond the pull request, its reviews, comments and
+    checks, so a caller can answer from them alone and skip the requests
+    the later rules need.
+
+    Returns `(line, verdict)`: `line` is the answer, or None when the
+    later rules are needed. `verdict` is the reviewer's latest verdict
+    review, or None; returned so the caller can look up the trees the
+    later rules compare without re-deriving which review is the verdict.
     """
     head = _pr_head(pr)
     state = pr.get("state")
@@ -323,23 +460,64 @@ def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
     # Rule 1: merged -> DONE merged. Before `closed` because a merged
     # pull request is closed too, and "merged" is the more useful answer.
     if merged is True:
-        return "DONE merged"
+        return "DONE merged", None
     # Rule 2: closed without a merge -> DONE closed.
     if state == "closed":
-        return "DONE closed"
-    # Rule 3: checks still running -> WAIT checks. A verdict on a head
+        return "DONE closed", None
+    # Rule 3: a draft waits. The reviewer reads only ready pull requests.
+    if pr.get("draft") is True:
+        return "WAIT draft", None
+    # Rule 4: checks still running -> WAIT checks. A verdict on a head
     # whose CI has not finished gets reversed when the CI finishes. An
     # empty rollup counts as finished: a repository with no CI would
     # otherwise wait forever.
     if pending_checks(checks):
-        return "WAIT checks"
+        return "WAIT checks", None
+    # Rule 5: a check concluded against the branch -> FIX checks. The
+    # implementer reads the failing job's log.
+    if failed_checks(checks):
+        return "FIX checks", None
+    # Rule 6: the base conflicts with the head -> FIX conflict. A null
+    # `mergeable` is unknown, not a conflict: GitHub returns it for
+    # seconds after every push.
+    if pr.get("mergeable") is False:
+        return "FIX conflict", None
 
     verdicts = _verdicts(checked_reviews, reviewer)
-    # Rule 4: no verdict review exists -> REVIEW <head>.
+    # Rule 7: no verdict review exists -> REVIEW <head>.
     if not verdicts:
-        return f"REVIEW {head}"
+        return f"REVIEW {head}", None
 
-    verdict = verdicts[-1]
+    return None, verdicts[-1]
+
+
+def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
+           reviewer: str, max_rounds: int = 4,
+           implementers=frozenset(), patch_equal=None) -> str:
+    """Return the one line that says what the pull request needs next.
+
+    `pr` is the parsed `repos/R/pulls/N` object; `reviews`, `comments`
+    and `checks` are the fetched lists; `implementers` are the logins
+    whose markers are trusted. `patch_equal` says whether the head and
+    the reviewed commit carry the same patch; None means no comparison
+    was made.
+
+    The rules that need nothing but the pull request and its reviews
+    come from `early_decision`.
+    """
+    head = _pr_head(pr)
+
+    line, verdict = early_decision(pr, reviews, comments, checks,
+                                   reviewer, implementers)
+    if line is not None:
+        return line
+    # `early_decision` returns a verdict whenever it returns no line: the
+    # only way past rule 7 is to have a verdict to rule on.
+    assert verdict is not None
+
+    checked_reviews = validate_reviews(reviews)
+    checked_comments = validate_comments(comments)
+
     review_commit = verdict["commit_id"]
 
     # Someone other than the reviewer spoke after the verdict. Their words
@@ -348,43 +526,39 @@ def decide(pr: dict, reviews: list, comments: list, checks: list, trees: dict,
     interrupted = third_party_post(checked_comments, reviewer,
                                     verdict["submitted_at"], implementers)
 
-    # Rule 5: the verdict is stale, the tree is unchanged, and nobody has
-    # objected since -> REAPPROVE <head>. The squash case: a squash
-    # rewrites the branch, so the review's `commit_id` differs from the
-    # head while the tree matches.
-
-    # Trees are compared as whole shas: an abbreviated one 404s, and a
-    # prefix collides.
-    if (review_commit != head and verdict["state"] == "APPROVED"
-            and not interrupted):
-        head_tree = trees.get(head)
-        review_tree = trees.get(review_commit)
-        if head_tree is not None and head_tree == review_tree:
+    # Rule 8: the verdict is stale, nobody has objected since, and the
+    # work is the same -> the verdict carries, with no model run. A
+    # squash leaves the tree equal; a rebase leaves the patch equal.
+    stale = review_commit != head
+    if stale and not interrupted and _same_work(trees, head, review_commit,
+                                                patch_equal):
+        if verdict["state"] == "APPROVED":
             return f"REAPPROVE {head}"
+        # A request for changes still stands. Carry on with the rules
+        # below as though the verdict were on the head.
+    elif stale:
+        # Rule 9: the verdict is on an older commit -> REVIEW <head>
+        # <V>. It says nothing about the head.
+        return f"REVIEW {head} {review_commit}"
 
-    # Rule 6: the verdict is on an older commit -> REVIEW <head>. It says
-    # nothing about the head.
-    if review_commit != head:
-        return f"REVIEW {head}"
-
-    # Rule 7: a third party spoke after the verdict -> REVIEW <head>.
+    # Rule 10: a third party spoke after the verdict -> REVIEW <head> <V>.
     if interrupted:
-        return f"REVIEW {head}"
+        return f"REVIEW {head} {review_commit}"
 
-    # Rule 8: the verdict approved -> AGREED <head>.
+    # Rule 11: the verdict approved -> AGREED <head>.
     if verdict["state"] == "APPROVED":
         return f"AGREED {head}"
 
-    # Rule 9: the verdict was answered without a commit -> REVIEW <head>.
-    # The rejections need a ruling.
+    # Rule 12: the verdict was answered without a commit -> REVIEW <head>
+    # <V>. The rejections need a ruling.
     if answered_review(checked_comments, verdict["id"], reviewer, implementers):
-        return f"REVIEW {head}"
+        return f"REVIEW {head} {review_commit}"
 
-    # Rule 10: too many rounds -> ESCALATE max-rounds.
+    # Rule 13: too many rounds -> ESCALATE max-rounds.
     if changes_requested_count(checked_reviews, reviewer) >= max_rounds:
         return "ESCALATE max-rounds"
 
-    # Rule 11: the verdict asked for changes -> FIX <review-id>.
+    # Rule 14: the verdict asked for changes -> FIX <review-id>.
     return f"FIX {verdict['id']}"
 
 

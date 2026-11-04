@@ -7,9 +7,9 @@
       "sha": "1111111111111111111111111111111111111111"
     },
     "base": {
-      "sha": "4444444444444444444444444444444444444444"
+      "sha": "5555555555555555555555555555555555555555"
     },
-    "mergeable": "MERGEABLE"
+    "mergeable": true
   },
   "reviews": [],
   "comments": [],
@@ -22,6 +22,8 @@
     }
   ],
   "trees": {},
+  "compares": {},
+  "patch_equal": null,
   "implementers": [
     "harbord-st"
   ],

@@ -106,6 +106,38 @@ def check_tools(gates: list, bin_dir: Path) -> list[str]:
     return failures
 
 
+def suite_pins(suite: str) -> list[str]:
+    """Return the tool a suite runs, read from the suite's own source,
+    so the rule needs no hand maintenance and a suite that stops driving
+    a tool stops demanding a gate for it.
+
+    Only a tool that exists counts, found two ways:
+
+      * the path a suite builds to run it --
+        `REPO_ROOT / "bin" / "pr-loop-gate"`; and
+      * a module the suite imports from `lib/`, which is the code the
+        tool is built from.
+    """
+    path = TESTS / suite
+    try:
+        text = path.read_text()
+    except OSError:
+        return []
+    found = set()
+    # The path a suite builds to run the tool: REPO_ROOT / "bin" / "name".
+    for match in re.finditer(
+            r"""REPO_ROOT\s*/\s*"bin"\s*/\s*"([\w./-]+)\"""", text):
+        found.add(f"bin/{match.group(1)}")
+    # The module a suite imports: `import pr_gate` pins lib/pr_gate.py,
+    # which is the code the tool is built from.
+    for match in re.finditer(r"^\s*import\s+([\w]+)\b", text, re.M):
+        module = match.group(1)
+        candidate = REPO_ROOT / "lib" / f"{module}.py"
+        if candidate.is_file():
+            found.add(f"lib/{module}.py")
+    return sorted(tool for tool in found if (REPO_ROOT / tool).is_file())
+
+
 def main() -> int:
     doc = tomllib.loads(GATES.read_text())
     gates = doc.get("gates", [])
@@ -176,6 +208,22 @@ def main() -> int:
         if not any(g.get("when") and re.search(g["when"], rel) for g in gates):
             failures.append(
                 f"{rel} is named by no gate, so breaking gate selection runs nothing")
+
+    # A suite and the tool it pins share a `when`, so editing either runs
+    # the test. A `when` naming only the suite runs nothing when the tool
+    # changes -- and a change to the tool is the change the suite exists
+    # to cover. The rule is per suite: the gate that runs a suite is the
+    # one that must also name the tool.
+    for suite in suites:
+        rel = f"tests/{suite}"
+        running = [g for g in gates
+                   if g.get("when") and re.search(g["when"], rel)]
+        for tool in suite_pins(suite):
+            if not any(g.get("when") and re.search(g["when"], tool)
+                       for g in running):
+                failures.append(
+                    f"{rel} pins {tool}, but the gate that runs it names "
+                    "neither, so a change to the tool runs nothing")
 
     if failures:
         for f in failures:

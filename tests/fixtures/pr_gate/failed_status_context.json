@@ -1,0 +1,30 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": false,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "5555555555555555555555555555555555555555"
+    },
+    "mergeable": true
+  },
+  "reviews": [],
+  "comments": [],
+  "checks": [
+    {
+      "__typename": "StatusContext",
+      "state": "ERROR",
+      "context": "ci"
+    }
+  ],
+  "trees": {},
+  "compares": {},
+  "patch_equal": null,
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "FIX checks"
+}
