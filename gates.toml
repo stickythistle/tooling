@@ -240,6 +240,16 @@ name = "hermes-implement no-commit tests"
 when = '^(bin/hermes-implement|tests/test_hermes_implement_nocommit\.py)$'
 run = "python3 tests/test_hermes_implement_nocommit.py"
 
+# The builder's disk guard: the space check before a build, the lane
+# loop, and the _prove pairing. The gate names the suite and the tools
+# it drives: builder-space is the check, remote-prune is the lane loop
+# and the landing path, and remote-task is what runs the check before a
+# sync.
+[[gates]]
+name = "builder space tests"
+when = '^(tests/test_builder_space\.py|bin/builder-space|bin/remote-prune|bin/remote-task)$'
+run = "python3 tests/test_builder_space.py"
+
 # Syntax floor for the two review drivers; their shared logic is in
 # lib/common.sh and the review script, which the suite above pins.
 [[gates]]

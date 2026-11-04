@@ -60,6 +60,8 @@ the first failure.
 |---|---|
 | `remote-task`     | sync the tree to a host, run a project command under a lock, fetch artefacts back |
 | `remote-run`      | send part of the tree to a host that has a tool this one lacks, run the project's recipe there |
+| `remote-prune`    | clear what a builder no longer needs: landed trees, their `_prove` copies, and idle incremental caches |
+| `builder-space`   | refuse a build the builder has no room for, before it starts |
 | `lane-watch`      | follow a running hermes lane's conversation as it happens |
 | `gate-prove`      | revert the source, keep the tests, require a failure — the tests depend on the change, not that the change is right |
 | `gate-untested`   | fail a branch that adds surface with no test anywhere |
@@ -71,6 +73,46 @@ the first failure.
 Exit 3 means *unprovable*: the gate gathered no evidence either way.
 `gate-verify` reports it on its own line, because a gate that measured nothing
 must not appear in a list headed "passed".
+
+## A builder that fills up
+
+A builder that fills its disk mid-build does not fail as a build failure. It
+fails as a linker bus error, an rsync `ENOSPC`, or a failed `.rmeta` write —
+and it takes the CI Postgres on the same disk down with it. The container
+stayed in restart backoff after the space came back, so the next gate failed
+against it with "container is not running": an infrastructure failure wearing
+a project's clothes.
+
+Four things guard against it.
+
+**The space check runs before the sync.** `builder-space` asks the builder
+how much room it has and refuses the build when the answer is no. What
+matters is what is left *after* the build, so the check counts the tree
+being built and its `_prove` copy: a cold gate for one branch is two trees
+of 35 GB, and a host with 60 GB free does not have room for it. Below the
+floor the check drops the caches that belong to no open work, oldest first,
+under the same lock a build holds; if it still cannot make room the build is
+refused with **exit 4**, which a gate and a lane report as infrastructure
+rather than as a failing test.
+
+**The prune reaches every lane.** `remote-prune --all-lanes` measures each
+lane in `BUILDER_LANES` and reports them separately. The lanes are separate
+hosts with separate benches, and a prune that measured only `HOST_BUILDER`
+left the others filling up — which is how six gates failed out of disk
+across three lanes while one lane looked fine.
+
+**A `_prove` tree goes with its tree.** `gate-prove` runs in a scratch
+worktree named `<caller>-prove`, and the builder holds it as `<name>_prove`:
+the same branch's build cache a second time over, and the larger of the two.
+It has no worktree behind it, so "no worktree means keep" used to apply to
+it and the biggest trees on the builder were kept forever. Now the pair is
+judged together — pruned when the tree lands, and dropped with the tree's
+incremental cache when the tree is idle.
+
+**And on landing.** A branch that merged has a dead cache on every builder
+it was built on, and the trees are known by name rather than guessed from
+`git cherry`. `remote-prune --prune --tree <name>` removes that tree and
+its `_prove` copy on every lane, in the same coordinator step as the merge.
 
 ## Setup
 

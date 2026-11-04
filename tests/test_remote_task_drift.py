@@ -144,6 +144,23 @@ mkdir -p "$root"
 # the verb and the first non-flag arg; everything past that goes
 # straight to the verb implementation.
 cmdline="$1"
+# The space check that runs before every build asks the host how much
+# room it has. The fakes below run the command verbatim, so without this
+# the check would measure the TEST MACHINE's real disk and refuse the
+# build -- a failure that has nothing to do with what the test is about.
+# The answer is "plenty of room", which is what a healthy builder looks
+# like. FAKE_FREE_GB makes it something else when a test wants to see the
+# refusal path.
+if [[ "$cmdline" == *"BUILDER_SPACE_TREE="*" bash" ]]; then
+  script=$(cat)
+  case "$script" in
+    *bench_fs*)
+      echo "==> builder $host: ${FAKE_FREE_GB:-100}G free, need space" >&2
+      printf 'OK %s\n' "${FAKE_FREE_GB:-100}"
+      exit 0
+      ;;
+  esac
+fi
 # Verb: the first whitespace-separated word.
 verb="${cmdline%% *}"
 # The build's command starts `CALLER=... flock`, so map it onto the flock verb.
@@ -232,8 +249,19 @@ def make_fakebin(tmpdir: Path, extra: dict | None = None,
     fake = tmpdir / "fakebin"
     fake.mkdir()
     scripts = {
-        # The drift test must not touch a host or move a tree.
-        "ssh": "#!/bin/sh\nexit 0\n",
+        # The drift test must not touch a host or move a tree. The one
+        # thing it must answer is the space check that runs before the
+        # sync: a fake that said nothing would leave the check
+        # unprovable, and the run would fail for a reason that has
+        # nothing to do with the drift being tested.
+        "ssh": "#!/bin/sh\n"
+               "# The space check's script comes on stdin; answer it with\n"
+               "# plenty of free space, which is what a builder with room\n"
+               "# looks like.\n"
+               "case \"$(cat)\" in\n"
+               "  *bench_fs*) echo 'OK 100' ;;\n"
+               "  *) exit 0 ;;\n"
+               "esac\n",
         "rsync": "#!/bin/sh\nexit 0\n",
     }
     if stateful:
@@ -243,7 +271,44 @@ def make_fakebin(tmpdir: Path, extra: dict | None = None,
         p = fake / name
         p.write_text(body)
         p.chmod(0o755)
+    # Every ssh -- including one a case supplied for its own purpose --
+    # has to answer the space check, because the check runs before
+    # anything else. A case that replaces ssh to make one stage fail
+    # would otherwise fail at the space check instead, and the run's
+    # exit status would be the space check's rather than the one the
+    # case is about.
+    #
+    # The wrapper answers the space check and delegates everything else
+    # to the script the case supplied.
+    _wrap_space_answer(fake / "ssh")
     return fake
+
+
+def _wrap_space_answer(ssh_script: Path) -> None:
+    """Make an ssh stand-in answer the space check, and delegate the rest.
+
+    The check's command is an export prefix followed by `bash`, and its
+    script arrives on stdin. The wrapper answers it with free space and
+    exits; every other command goes to the original script.
+    """
+    original = ssh_script.read_text()
+    body = original.split("\n", 1)[1] if "\n" in original else ""
+    wrapper = (
+        "#!/bin/bash\n"
+        "cmdline=\"$2\"\n"
+        "if [[ \"$cmdline\" == *\"BUILDER_SPACE_TREE=\"*\" bash\" ]]; then\n"
+        "  script=$(cat)\n"
+        "  case \"$script\" in\n"
+        "    *bench_fs*)\n"
+        "      printf 'OK %s\\n' \"${FAKE_FREE_GB:-100}\"\n"
+        "      exit 0\n"
+        "      ;;\n"
+        "  esac\n"
+        "fi\n"
+        + body
+    )
+    ssh_script.write_text(wrapper)
+    ssh_script.chmod(0o755)
 
 
 def remote_task_env(project: Path, fakebin: Path, repo_bin: bool,
@@ -868,6 +933,23 @@ RUN_LOCAL_FAKE_SSH = r"""#!/bin/bash
 export HOME="$FAKE_SSH_HOME"
 host="$1"; shift
 cmdline="$1"
+# The space check that runs before every build asks the host how much
+# room it has. The fakes below run the command verbatim, so without this
+# the check would measure the TEST MACHINE's real disk and refuse the
+# build -- a failure that has nothing to do with what the test is about.
+# The answer is "plenty of room", which is what a healthy builder looks
+# like. FAKE_FREE_GB makes it something else when a test wants to see the
+# refusal path.
+if [[ "$cmdline" == *"BUILDER_SPACE_TREE="*" bash" ]]; then
+  script=$(cat)
+  case "$script" in
+    *bench_fs*)
+      echo "==> builder $host: ${FAKE_FREE_GB:-100}G free, need space" >&2
+      printf 'OK %s\n' "${FAKE_FREE_GB:-100}"
+      exit 0
+      ;;
+  esac
+fi
 # Only the build dispatch carries the flock under CALLER; preparatory
 # ssh calls (mkdir, fingerprint read, touch, ...) are short-lived and
 # must not race the test for the pidfile. A stale PID from a finished
@@ -902,6 +984,23 @@ RUN_LOCAL_FAKE_SSH_VERBATIM = r"""#!/bin/bash
 export HOME="$FAKE_SSH_HOME"
 host="$1"; shift
 cmdline="$1"
+# The space check that runs before every build asks the host how much
+# room it has. The fakes below run the command verbatim, so without this
+# the check would measure the TEST MACHINE's real disk and refuse the
+# build -- a failure that has nothing to do with what the test is about.
+# The answer is "plenty of room", which is what a healthy builder looks
+# like. FAKE_FREE_GB makes it something else when a test wants to see the
+# refusal path.
+if [[ "$cmdline" == *"BUILDER_SPACE_TREE="*" bash" ]]; then
+  script=$(cat)
+  case "$script" in
+    *bench_fs*)
+      echo "==> builder $host: ${FAKE_FREE_GB:-100}G free, need space" >&2
+      printf 'OK %s\n' "${FAKE_FREE_GB:-100}"
+      exit 0
+      ;;
+  esac
+fi
 # Same narrowing as RUN_LOCAL_FAKE_SSH: only the build dispatch carries
 # the flock under CALLER. Without it, a test reading the pidfile while
 # the build is still running captures the prep ssh's pid instead.
@@ -929,6 +1028,23 @@ RUN_LOCAL_FAKE_SSH_SLOW_PREP = r"""#!/bin/bash
 export HOME="$FAKE_SSH_HOME"
 host="$1"; shift
 cmdline="$1"
+# The space check that runs before every build asks the host how much
+# room it has. The fakes below run the command verbatim, so without this
+# the check would measure the TEST MACHINE's real disk and refuse the
+# build -- a failure that has nothing to do with what the test is about.
+# The answer is "plenty of room", which is what a healthy builder looks
+# like. FAKE_FREE_GB makes it something else when a test wants to see the
+# refusal path.
+if [[ "$cmdline" == *"BUILDER_SPACE_TREE="*" bash" ]]; then
+  script=$(cat)
+  case "$script" in
+    *bench_fs*)
+      echo "==> builder $host: ${FAKE_FREE_GB:-100}G free, need space" >&2
+      printf 'OK %s\n' "${FAKE_FREE_GB:-100}"
+      exit 0
+      ;;
+  esac
+fi
 # Same narrowing as RUN_LOCAL_FAKE_SSH: only the build dispatch writes
 # to the pidfile. The sleep on the prep branch is what makes the bug
 # the old behaviour hid reproducible here.
