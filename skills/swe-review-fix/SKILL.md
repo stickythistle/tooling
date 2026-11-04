@@ -50,6 +50,17 @@ it would widen the PR.
   numbers, or reviewer names in commits or source.
 - Run the verification command the brief gives until it passes, as in
   `swe-updater`'s Phase 4.
+- **Experiments happen in a scratch copy, never in the worktree you are
+  changing.** A fake, a helper, a destructive git command — a
+  `git commit --amend`, a `git reset --hard`, a `git clean` — runs in a
+  `mktemp -d` copy. A fake given an empty worktree path acts on the
+  current directory instead: it amends *this* branch and takes your
+  uncommitted work with it.
+- **Do not export `GIT_*` or driver settings in the shell you commit from.**
+  An export persists into every later command in that shell, so a
+  `GIT_AUTHOR_NAME` you exported to try something out is the identity
+  your commits carry. Set it for one command, or in a subshell, or not at
+  all.
 
 ## Replies
 
