@@ -37,6 +37,14 @@ name = "pr-loop-gate tests"
 when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
 run = "python3 tests/test_pr_loop_gate.py"
 
+# The parent-green comparison: whether a commit broke the branch it
+# landed on. `lib/main_watch.py` is in the `when` because the decision is
+# what the suite pins, and a change to it alone has to run the suite.
+[[gates]]
+name = "main watch tests"
+when = '^(bin/main-watch|lib/main_watch\.py|tests/test_main_watch\.py)$'
+run = "python3 tests/test_main_watch.py"
+
 [[gates]]
 name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'

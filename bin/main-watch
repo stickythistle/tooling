@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""Say whether a commit broke the branch it landed on.
+
+    main-watch <owner/repo> <commit> [--json]
+
+The base is the commit the merge landed on, found by walking first
+parents until a commit whose checks completed turns up.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from main_watch import (  # noqa: E402
+    GREEN,
+    Malformed,
+    PENDING,
+    RED,
+    UNATTRIBUTED,
+    collect_checks,
+    compare,
+    overall_state,
+)
+
+
+class FetchError(Exception):
+    """A `gh` call failed. `endpoint` names what was being asked for."""
+
+
+def gh(endpoint: str, *args: str) -> str:
+    """Run one `gh api` call and return its stdout.
+
+    A non-zero exit is a failure naming the endpoint.
+    """
+    cmd = ["gh", "api", endpoint, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"{endpoint}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"{endpoint}: {reason}")
+    return proc.stdout
+
+
+def gh_json(endpoint: str, *args: str):
+    """Run one `gh api` call and parse its stdout as JSON."""
+    out = gh(endpoint, *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"{endpoint}: response was not JSON: {exc}") from exc
+
+
+def fetch_commit(repo: str, sha: str) -> dict:
+    """One commit's object, with its parents."""
+    payload = gh_json(f"repos/{repo}/commits/{sha}")
+    if not isinstance(payload, dict):
+        raise FetchError(f"repos/{repo}/commits/{sha}: not a commit")
+    return payload
+
+
+def first_parent(commit: dict) -> str:
+    """The commit's first parent.
+
+    For a merge commit the first parent is the tip of the branch it was
+    merged into. For a squash or a rebase the single parent is the
+    commit before it.
+    """
+    parents = commit.get("parents")
+    if not isinstance(parents, list) or not parents:
+        return ""
+    first = parents[0]
+    if not isinstance(first, dict):
+        return ""
+    sha = first.get("sha")
+    return sha if isinstance(sha, str) else ""
+
+
+def fetch_checks(repo: str, sha: str) -> dict:
+    """Every check on a commit, by name.
+
+    Two endpoints: the check runs, and the commit statuses. A check
+    reported by neither is a check nobody ran.
+    """
+    runs = gh_json(f"repos/{repo}/commits/{sha}/check-runs")
+    statuses = gh_json(f"repos/{repo}/commits/{sha}/status")
+
+    if not isinstance(runs, dict):
+        raise FetchError(f"repos/{repo}/commits/{sha}/check-runs: not an object")
+    run_list = runs.get("check_runs")
+    if run_list is None:
+        run_list = []
+    if not isinstance(run_list, list):
+        raise FetchError(
+            f"repos/{repo}/commits/{sha}/check-runs: check_runs was not a list")
+
+    if not isinstance(statuses, dict):
+        raise FetchError(f"repos/{repo}/commits/{sha}/status: not an object")
+    status_list = statuses.get("statuses")
+    if status_list is None:
+        status_list = []
+    if not isinstance(status_list, list):
+        raise FetchError(
+            f"repos/{repo}/commits/{sha}/status: statuses was not a list")
+
+    return collect_checks(run_list, status_list)
+
+
+def base_for(repo: str, sha: str):
+    """The commit the merge landed on, and the state of its checks.
+
+    The base is found by walking first parents until a commit whose
+    checks have *completed* turns up.
+    """
+    seen: set[str] = set()
+    current = sha
+    while current and current not in seen:
+        seen.add(current)
+        commit = fetch_commit(repo, current)
+        parent = first_parent(commit)
+        if not parent:
+            # The first commit on the branch. Nothing behind it.
+            return None, UNATTRIBUTED
+        checks = fetch_checks(repo, parent)
+        state = overall_state(checks)
+        if state == GREEN or state == RED:
+            # The checks have finished. This is the commit the merge
+            # landed on.
+            return parent, state
+        if checks:
+            # The checks exist but have yet to finish. The base is
+            # unknown.
+            return parent, PENDING
+        # No checks at all: this commit never ran anything. Keep
+        # walking.
+        current = parent
+    return None, UNATTRIBUTED
+
+
+def verdict_for(repo: str, sha: str):
+    """The verdict on one commit."""
+    commit = fetch_commit(repo, sha)
+    commit_checks = fetch_checks(repo, sha)
+    parent = first_parent(commit)
+    if not parent:
+        # The first commit on the branch. Nothing behind it can have
+        # been green, so nothing is attributed to it: the commit cannot
+        # be shown to have broken a branch that did not exist yet.
+        verdict = compare(commit_checks, {})
+        verdict.parent_state = PENDING
+        return verdict
+    base, base_state = base_for(repo, sha)
+    if base is None:
+        # No ancestor with completed checks. Nothing was proved about
+        # the base, so the redness is attributed to nothing.
+        return compare(commit_checks, {}, UNATTRIBUTED)
+    base_checks = fetch_checks(repo, base)
+    return compare(commit_checks, base_checks, base_state)
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="main-watch",
+        description="Say whether a commit broke the branch it landed on.",
+    )
+    parser.add_argument("repo", help="owner/repo")
+    parser.add_argument("commit", help="the commit sha")
+    parser.add_argument("--json", action="store_true",
+                        help="print the whole verdict as JSON")
+    args = parser.parse_args(argv)
+
+    if "/" not in args.repo:
+        print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+        return 2
+    if not args.commit.strip():
+        print("ERR commit: no commit given", file=sys.stderr)
+        return 2
+
+    try:
+        verdict = verdict_for(args.repo, args.commit)
+    except FetchError as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 1
+    except Malformed as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 1
+
+    if args.json:
+        payload = {
+            "commit": args.commit,
+            "kind": verdict.kind,
+            "broke": verdict.broke,
+            "parent_state": verdict.parent_state,
+            "failing": [
+                {"name": c.name, "url": c.url} for c in verdict.failing
+            ],
+            "uncompared": verdict.uncompared,
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return 0
+
+    # The one line. The check names follow, so the caller can say which
+    # check failed without parsing the JSON.
+    names = ",".join(c.name for c in verdict.failing)
+    print(f"{verdict.kind.upper()} {args.commit} {names}".rstrip())
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
