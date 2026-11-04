@@ -185,6 +185,14 @@ name = "hermes-skills-sync syntax"
 when = '^(bin/hermes-skills-sync)$'
 run = "bash -n bin/hermes-skills-sync"
 
+# The install that puts the repository's skills into the trees a lane loads
+# them from. The check refuses a dispatch whose skill differs from the
+# repository's copy. The suite runs against an isolated HERMES_HOME.
+[[gates]]
+name = "hermes-skills-sync tests"
+when = '^(bin/hermes-skills-sync|lib/common\.sh|bin/hermes-implement|bin/agent-fix-pr|pipeline/review\.sh|install/live-checkout/setup\.sh|tests/test_hermes_skills_sync\.py)$'
+run = "python3 tests/test_hermes_skills_sync.py"
+
 [[gates]]
 name = "hermes-triage syntax"
 when = '^(bin/hermes-triage)$'

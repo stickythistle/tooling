@@ -101,6 +101,18 @@ printf '%s' "$PROMPT" >"$PROMPT_FILE"
 # the timeout, so a swap queued behind a reviewer cannot drain the timeout.
 acquire_gpu_lock "$PROFILE"
 
+# The reviewer's own skill, checked against the repository before the agent
+# is woken. A merged change to a skill never reaches the profile's tree
+# unless something installs it, and the reviewer would then review under
+# rules the repository has replaced.
+#
+# The refusal is the same shape as the unlinked-PR refusal: the phase stops
+# before the agent starts, naming the skill that differs.
+if ! check_skill_versions "${SKILLS_REPO:-$PIPELINE_DIR/..}" "$PROFILE" swe-reviewer; then
+	echo "review $HEAD_SHA: refusing to start; swe-reviewer is not the repository's copy (run hermes-skills-sync)" >&2
+	exit 1
+fi
+
 # timeout wraps the call. PIPELINE_AGENT is the generic name the phases
 # share, and the helper takes the agent command as $1 so the same path
 # serves any agent the operator chooses.

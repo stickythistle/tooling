@@ -134,6 +134,21 @@ if pid=$(running_pid); then
 	exit 5
 fi
 
+# The lane's skills, checked against the ones this repository ships. A
+# merged skill change stops at the repository until something copies it
+# into the profile's tree.
+SKILLS=${AGENT_FIX_PR_SKILLS:-${HERMES_IMPLEMENT_SKILLS:-swe-review-fix,swe-updater}}
+IFS=',' read -ra SKILL_NAMES <<<"$SKILLS"
+SKILL_NAMES=("${SKILL_NAMES[@]}")
+# The repository whose skills the round must be running. This checkout's own
+# copy by default. A host whose rounds run from a live checkout names that
+# checkout in SKILLS_REPO.
+SKILLS_SOURCE=${SKILLS_REPO:-$BIN_DIR/..}
+if ! check_skill_versions "$SKILLS_SOURCE" "$PROFILE" "${SKILL_NAMES[@]}"; then
+	echo "agent-fix-pr: refusing to start the round; a dispatched skill is not the repository's copy (run hermes-skills-sync)" >&2
+	exit 6
+fi
+
 # A resumed line repeats its round's checks; only lanes count.
 ROUNDS_RUN=$( [[ -s "$LEDGER" ]] && jq -s 'map(select(.resumed != true)) | length' "$LEDGER" || echo 0)
 ROUND=$((ROUNDS_RUN + 1))

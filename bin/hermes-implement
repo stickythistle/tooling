@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Hand a GitHub issue to the local Hermes agent's swe-updater skill.
 #
-# Hermes writes the change in a worktree this script does not create: the
-# caller decides the branch point, so a failed run is thrown away by deleting
-# the tree rather than by unwinding commits.
+# Hermes writes the change in a worktree this script does not create. The
+# caller decides the branch point, so a failed run is thrown away by
+# deleting the tree rather than by unwinding commits.
 #
-# Exit codes. 0 finished, 2 usage, 3 the lane identity would not pin, and
-# 6 a previous attempt's agent would not let go of the session lease: the
-# run stopped rather than resuming the session on top of a live writer.
+# Exit codes. 0 finished, 2 usage, 3 the lane identity would not pin,
+# 4 a dispatched skill's installed copy differs from the repository's copy
+# (run hermes-skills-sync), and 6 a previous attempt's agent would not let
+# go of the session lease: the run stopped rather than resuming the
+# session on top of a live writer.
 # A SESSION_NOT_OWNED refusal that never clears is the other 6.
 set -euo pipefail
 
@@ -95,6 +97,24 @@ done
 PROFILE_ARGS=()
 [[ -n "$PROFILE" ]] && PROFILE_ARGS=(-p "$PROFILE")
 [[ -n "$ISSUE" && -n "$WORKTREE" ]] || { usage >&2; exit 2; }
+
+# The lane's skills, checked against the ones this repository ships. A
+# merged skill change stops at the repository until it reaches the
+# profile's tree.
+SKILLS=${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}
+IFS=',' read -ra SKILL_NAMES <<<"$SKILLS"
+SKILL_NAMES=("${SKILL_NAMES[@]}")
+# The profile whose tree the lane loads its skills from. The agent's own
+# tree is the root one, and a named profile has its own.
+SKILL_PROFILE="$PROFILE"
+# The repository whose skills the lane must be running. This checkout's own
+# copy by default. SKILLS_REPO names the live checkout a host's lanes run
+# from.
+SKILLS_SOURCE=${SKILLS_REPO:-$BIN_DIR/..}
+if ! check_skill_versions "$SKILLS_SOURCE" "$SKILL_PROFILE" "${SKILL_NAMES[@]}"; then
+	echo "hermes-implement: refusing to start; a dispatched skill is not the repository's copy (run hermes-skills-sync)" >&2
+	exit 4
+fi
 
 cd "$WORKTREE"
 # Canonical from here on. lane-settled finds this run's record by hashing
@@ -303,7 +323,7 @@ run() {
 	# `bash -c` whose agent ignored SIGTERM. The kill-after path exits 137
 	# rather than 124, reported as its own message below.
 	PRE=("${PROFILE_ARGS[@]}")
-	POST=(--skills "${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}"
+	POST=(--skills "$SKILLS"
 	      --yolo --no-restore-cwd "$@")
 	timeout --kill-after="$KILL_AFTER" "$TIMEOUT" "$BASH" -c '
 		. "$1/lib/common.sh"

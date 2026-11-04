@@ -1,73 +1,138 @@
 #!/usr/bin/env bash
-# Copy every skill in the agent's root tree into any profile missing it.
+# Install the repository's skills into the agent's root tree and every
+# profile.
 #
-# Each profile keeps its own skills tree rather than a view onto the root one,
-# and the agent re-bundles that tree in place when it updates. The manifest it
-# rebuilds from lists only bundled skills, so a hand-authored one is invisible
-# to the re-bundle and is deleted by it. The phases dispatch skills by name, so
-# what that produces is a lane failing at startup -- which is indistinguishable
-# from a model that had nothing to say.
+# The repository's copy wins for the skills the repository ships. A skill
+# the repository leaves out is never overwritten: the tree's own copy is
+# the only one there is, and the tree's owner may have edited it.
 #
-# Run it after any agent update. It only adds: an existing skill is never
-# overwritten, so a profile's own edit survives.
+# "Is the tree's copy the repository's copy" is answered by the content of
+# the directory, not by its `version:` field. Four of the repository's
+# skills carry no version at all, and swe-updater 3.3.0 changed its text
+# twice with the version unmoved.
 #
-# --check reports instead of copying and exits 3 when anything is missing.
+# Where a skill lands is the tree's existing location for it. A skill an
+# operator filed under .archive/ is updated in place rather than
+# re-activated under the dispatch category. A skill a tree has never
+# carried is created under the dispatch category.
+#
+# Run it after any merge to skills/, and by the check that refuses a
+# dispatch whose skill differs from the repository's copy.
+#
+# --check reports instead of copying and exits 3 when anything is out of
+# date.
 set -euo pipefail
 
-ROOT=${HERMES_HOME:-$HOME/.hermes}
-SRC="$ROOT/skills"
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+# The repository whose skills are installed. The tool sits beside it: a
+# checkout's own copy is the source. LIVE_REPO overrides it for a host whose
+# live checkout sits elsewhere.
+REPO=${SKILLS_REPO:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}
+if [ -n "${LIVE_REPO:-}" ] && [ -d "$LIVE_REPO/skills" ]; then
+	REPO="$LIVE_REPO"
+fi
+
 CHECK=0
-# Only the category the phases dispatch from. The rest of a root tree is
-# whatever its owner has installed, and every skill a profile carries is weight
-# in a system prompt the agent already sends on every call.
-CATEGORIES=(software-development)
+# The category a skill the tree has never carried is created under. The
+# phases dispatch from software-development, and that is the location the
+# trees keep the dispatched skills in.
+DISPATCH_CATEGORY=software-development
 
 for arg in "$@"; do
 	case "$arg" in
 	--check) CHECK=1 ;;
-	--all) CATEGORIES=() ;;
-	*) echo "usage: ${0##*/} [--check] [--all]" >&2; exit 2 ;;
+	*) echo "usage: ${0##*/} [--check]" >&2; exit 2 ;;
 	esac
 done
 
-[ -d "$SRC" ] || { echo "no skills tree at $SRC" >&2; exit 2; }
+[ -d "$REPO/skills" ] || { echo "no skills tree at $REPO/skills" >&2; exit 2; }
 
-in_scope() {
-	[ ${#CATEGORIES[@]} -eq 0 ] && return 0
-	local c
-	for c in "${CATEGORIES[@]}"; do [ "$1" = "$c" ] && return 0; done
-	return 1
+# The skills the repository ships. The repository keeps them flat
+# (skills/<name>/), unlike the trees, which keep them under a category.
+repo_skill_dirs() {
+	local d
+	for d in "$REPO"/skills/*/; do
+		[ -d "$d" ] || continue
+		[ -r "$d/SKILL.md" ] || continue
+		printf '%s\n' "${d%/}"
+	done
 }
 
-missing=0
-for pdir in "$ROOT"/profiles/*/; do
-	profile=$(basename "$pdir")
-	dest="$pdir/skills"
-	[ -d "$dest" ] || continue
+# The repository's copy of a skill, and its digest. The repository keeps
+# them flat (skills/<name>/), so the name is the path.
+repo_skill_digest() {
+	local name="$1"
+	skill_digest "$REPO/skills/$name"
+}
 
-	while IFS= read -r skill; do
-		rel=${skill#"$SRC"/}
-		# Dot-prefixed categories are the agent's own bookkeeping -- the hub
-		# cache, curator backups, the archive. Copying those between trees
-		# grafts one profile's history onto another.
-		case "$rel" in .*) continue ;; esac
-		in_scope "${rel%%/*}" || continue
-		[ -e "$dest/$rel" ] && continue
+# The root tree and every profile tree. The root tree first: it is the one a
+# fresh profile inherits from. A current root saves the profiles work. The
+# root home holds the profiles directory, not $HOME directly.
+trees=()
+root_tree=$(skills_tree "")
+[ -d "$root_tree" ] && trees+=("|$root_tree")
+for pdir in "$(hermes_root_home)"/profiles/*/; do
+	[ -d "$pdir/skills" ] || continue
+	trees+=("$(basename "$pdir")|$pdir/skills")
+done
 
-		missing=$((missing + 1))
-		if [ "$CHECK" -eq 1 ]; then
-			echo "missing: $profile/$rel"
-		else
-			mkdir -p "$(dirname "$dest/$rel")"
-			cp -r "$skill" "$dest/$rel"
-			echo "restored: $profile/$rel"
+installed=0
+stale=0
+
+for entry in "${trees[@]}"; do
+	profile=${entry%%|*}
+	tree=${entry#*|}
+	while IFS= read -r src; do
+		[ -n "$src" ] || continue
+		name=$(basename "$src")
+		# The directory a tree already keeps this skill in, or empty when
+		# the tree carries no copy. This keeps an operator's filing
+		# intact: a skill under .archive/, or under another category. The
+		# update lands where the copy is, not beside it.
+		dest=$(find_skill_dir "$tree" "$name")
+		if [ -z "$dest" ]; then
+			dest="$tree/$DISPATCH_CATEGORY/$name"
 		fi
-	done < <(find "$SRC" -mindepth 2 -maxdepth 2 -type d)
+		repo_digest=$(repo_skill_digest "$name")
+		tree_digest=""
+		if [ -d "$dest" ]; then
+			tree_digest=$(skill_digest "$dest")
+		fi
+		# Current: the tree has the skill and its content is the
+		# repository's. Skip it.
+		if [ -n "$tree_digest" ] && [ "$repo_digest" = "$tree_digest" ]; then
+			continue
+		fi
+		if [ "$CHECK" -eq 1 ]; then
+			if [ -n "$tree_digest" ]; then
+				echo "out of date: ${profile:+$profile/}$name is not the repository's copy"
+			else
+				echo "missing: ${profile:+$profile/}$name"
+			fi
+			stale=$((stale + 1))
+			continue
+		fi
+		# The repository's copy wins. The tree's copy is replaced
+		# wholesale: a skill is a directory of files, and a partial copy
+		# leaves the agent reading two versions at once.
+		mkdir -p "$(dirname "$dest")"
+		rm -rf "$dest"
+		cp -r "$src" "$dest"
+		if [ -n "$tree_digest" ]; then
+			echo "updated: ${profile:+$profile/}$name"
+		else
+			echo "installed: ${profile:+$profile/}$name"
+		fi
+		installed=$((installed + 1))
+	done < <(repo_skill_dirs)
 done
 
 if [ "$CHECK" -eq 1 ]; then
-	echo "$missing skill(s) missing from profile trees"
-	[ "$missing" -gt 0 ] && exit 3
+	echo "$stale skill(s) out of date in the agent's trees"
+	[ "$stale" -gt 0 ] && exit 3
 	exit 0
 fi
-echo "$missing skill(s) restored"
+echo "$installed skill(s) installed from $REPO/skills"

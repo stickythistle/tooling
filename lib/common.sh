@@ -20,8 +20,174 @@ case "${AGENT_STATE_DIR:-/}" in
 esac
 
 # -P: bin/ is reached through a symlink, and a logical cd resolves ../lib
-# against the link's parent rather than the checkout's.
+# against the link and lands outside the checkout.
 TOOLS_LIB=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+
+# ----- skills -----------------------------------------------------------
+#
+# A lane dispatches skills by name, and the agent resolves each name from
+# the profile's own tree. Two copies of a skill are compared by the content
+# of the skill directory.
+
+# The `version:` field of a skill file, or empty when there is none. It
+# labels a skill for a human. It never decides whether two copies match.
+skill_version() {
+	local file="$1"
+	[ -r "$file" ] || return 0
+	sed -n 's/^version:[[:space:]]*//p' "$file" | head -1 | tr -d '"'"'"' \r'
+}
+
+# The digest of a skill directory: the hash of every file under it, by
+# path. File names are part of the digest because a skill's references and
+# scripts are part of what the lane loads.
+skill_digest() {
+	local dir="$1"
+	[ -d "$dir" ] || return 0
+	(
+		cd "$dir" || exit 1
+		find . -type f ! -name '*.pyc' ! -path '*/__pycache__/*' -print0 \
+			| LC_ALL=C sort -z \
+			| xargs -0 -r sha256sum
+	) | sha256sum | cut -d' ' -f1
+}
+
+# The root home of the agent: the directory that holds `skills/` and
+# `profiles/`. The layout is:
+#   <root>/skills                    the root tree
+#   <root>/profiles/<p>/skills       a profile's tree
+#
+# HERMES_HOME names whichever home is active.
+hermes_root_home() {
+	local hh="${HERMES_HOME:-}"
+	if [ -z "$hh" ]; then
+		printf '%s\n' "$HOME/.hermes"
+		return 0
+	fi
+	if [ -d "$hh/skills" ]; then
+		# HERMES_HOME is the root home itself: it holds the skills tree
+		# every profile inherits from. Checked before the profiles
+		# directory, because a home can hold both.
+		printf '%s\n' "$hh"
+		return 0
+	fi
+	if [ -d "$hh/profiles" ]; then
+		printf '%s\n' "$hh"
+		return 0
+	fi
+	# HERMES_HOME is a profile home: <root>/profiles/<p>.
+	printf '%s\n' "$(dirname "$(dirname "$hh")")"
+}
+
+# The skills tree of a profile, or of the root tree when the profile is
+# empty.
+skills_tree() {
+	local profile="$1"
+	if [ -z "$profile" ]; then
+		printf '%s/skills\n' "$(hermes_root_home)"
+		return 0
+	fi
+	# The profile's own home, when HERMES_HOME is it.
+	local hh="${HERMES_HOME:-}"
+	if [ -n "$hh" ] && [ "$(basename "$hh")" = "$profile" ] && [ ! -d "$hh/profiles" ] && [ -d "$hh/skills" ]; then
+		printf '%s/skills\n' "$hh"
+		return 0
+	fi
+	printf '%s/profiles/%s/skills\n' "$(hermes_root_home)" "$profile"
+}
+
+# The directory a tree keeps a skill in, or empty when the tree carries
+# no copy.
+#
+# The repository keeps `skills/<name>/`. Agent trees keep
+# `skills/<category>/<name>/`. The search walks the whole tree.
+#
+# A live copy wins over an archived one. The archived copy sorts first,
+# so taking the first match would aim the check and the sync at it and
+# leave the live one stale. The archive is used only when it is the tree's
+# sole copy.
+find_skill_dir() {
+	local tree="$1" name="$2" hit archived=""
+	[ -d "$tree" ] || return 0
+	# `find`, not a glob. A glob skips dot-prefixed entries. `.archive/`
+	# is where an operator files a skill.
+	while IFS= read -r hit; do
+		[ -r "$hit/SKILL.md" ] || continue
+		case "$hit" in
+		*/.archive/*) [ -n "$archived" ] || archived="$hit" ;;
+		*) printf '%s\n' "$hit"; return 0 ;;
+		esac
+	done < <(find "$tree" -mindepth 1 -maxdepth 3 -type d -name "$name" 2>/dev/null | LC_ALL=C sort)
+	[ -n "$archived" ] && printf '%s\n' "$archived"
+	return 0
+}
+
+# The path of a skill's SKILL.md inside a tree, or empty when the tree
+# carries no such skill.
+find_skill_file() {
+	local tree="$1" name="$2" dir
+	dir=$(find_skill_dir "$tree" "$name")
+	[ -n "$dir" ] || return 0
+	printf '%s/SKILL.md\n' "$dir"
+}
+
+# The version of a skill in a tree, or empty when the tree carries no
+# such skill or the skill carries no version.
+tree_skill_version() {
+	local tree="$1" name="$2" file
+	file=$(find_skill_file "$tree" "$name")
+	[ -n "$file" ] || return 0
+	skill_version "$file"
+}
+
+# The version of a skill in the repository, or empty when the repository
+# ships it without a version.
+repo_skill_version() {
+	local repo="$1" name="$2"
+	tree_skill_version "$repo/skills" "$name"
+}
+
+# `check_skill_versions <repo> <profile> <name...>`: refuse when a
+# dispatched skill's installed copy differs from the repository's copy.
+#
+# A mismatch stops the run before it starts, naming the skill and what
+# differs. A copy the tree never carried is a mismatch too: the lane
+# dispatches a skill the agent cannot load. A skill the repository leaves
+# out is left alone.
+#
+# The names arrive as one comma-separated list. The agent splits it and
+# trims each name. The check trims and drops empties the same way.
+#
+# Prints one line per mismatch and returns 1 when there was one.
+check_skill_versions() {
+	local repo="$1" profile="$2"
+	shift 2
+	local name repo_dir tree_dir repo_digest tree_digest tree
+	local failed=0
+	tree=$(skills_tree "$profile")
+	for name in "$@"; do
+		name=$(printf '%s' "$name" | tr -d '[:space:]')
+		[ -n "$name" ] || continue
+		repo_dir=$(find_skill_dir "$repo/skills" "$name")
+		# The repository ships no such skill. There is nothing to be out
+		# of date with.
+		[ -n "$repo_dir" ] || continue
+		tree_dir=$(find_skill_dir "$tree" "$name")
+		if [ -z "$tree_dir" ]; then
+			echo "skill '$name' is not installed in ${profile:-the root tree}" >&2
+			echo "  the lane would load no rules for it; run hermes-skills-sync to install the repository's version" >&2
+			failed=1
+			continue
+		fi
+		repo_digest=$(skill_digest "$repo_dir")
+		tree_digest=$(skill_digest "$tree_dir")
+		[ -n "$repo_digest" ] && [ "$repo_digest" = "$tree_digest" ] && continue
+		echo "skill '$name' in ${profile:-the root tree} is not the repository's copy" >&2
+		echo "  the lane would run the old rules; run hermes-skills-sync to install the repository's version" >&2
+		failed=1
+	done
+	[ "$failed" -eq 0 ] || return 1
+	return 0
+}
 
 # `manifest <repo> <query> [default]`. Without a default a missing field is
 # fatal, which is the right outcome for a gate that would otherwise guess.

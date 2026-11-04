@@ -27,6 +27,8 @@ import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 LANE_WATCH = REPO_ROOT / "bin" / "lane-watch"
 # The hook must invoke lane-watch by this absolute path, not by name.
@@ -177,6 +179,10 @@ def make_env(stem: Path, wt: Path, **extra) -> dict:
     the real ones cannot interfere."""
     env_dir = stem / "env"
     bin_dir = stem / "bin"
+    # The lane refuses to start when a dispatched skill differs from the
+    # repository's copy. The `fast` profile is the one the --profile case
+    # below runs on.
+    install_skills(env_dir, ["fast"])
     # /usr/bin:/bin must stay on PATH for git and the system tools.
     return {
         **os.environ,
