@@ -22,6 +22,11 @@ LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 # shellcheck source=../lib/common.sh
 . "$LIB/common.sh"
 
+# The directory this script's own siblings live in, for the tools it
+# calls: `lane-settled` is the check that answers whether a lane holds a
+# worktree.
+BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+
 usage() { echo "usage: remote-prune [--prune] [--task NAME] [worktree]" >&2; exit 2; }
 
 PRUNE=0
@@ -105,13 +110,78 @@ cherry_landed() {
 	return 0
 }
 
+# Whether the worktree is carrying work that has not landed.
+#
+# `git cherry` answers "does this branch have commits that are not on
+# main", and a branch that has not committed anything answers "no" --
+# the same answer a merged branch gives. A bench dir belonging to a
+# lane that had not made its first commit yet was removed whole, and
+# the cold compile that followed could exceed the lane's attempt
+# timeout.
+#
+# So when cherry says "landed", the other signals decide. Any of them
+# means the tree is carrying work.
+#
+# The three signals:
+#
+#   - the tree is dirty: uncommitted edits are work by definition;
+#   - a lane process holds the tree: the same check `lane-settled`
+#     makes, which is the in-band signal that a lane is running here;
+#   - the branch was created after the bench dir's mtime: the bench
+#     dir predates the branch, so it cannot be this branch's build and
+#     nothing about it says the work is done.
+#
+# Returns 0 when the tree carries work, 1 when it does not. The last
+# signal needs the bench dir's mtime from the remote, so it is read by
+# the caller and passed in; an empty mtime means the remote could not
+# answer, which counts as carrying work.
+carrying_work() {
+	local wt=$1 bench_mtime=$2
+	# Uncommitted edits. A dirty tree is work whatever the branch says.
+	if [ -n "$(git -C "$wt" status --porcelain 2>/dev/null)" ]; then
+		return 0
+	fi
+	# A lane holds the tree. lane-settled prints why on stderr, and its
+	# exit code is the answer: 0 settled, 1 a live lane or one that died
+	# holding the tree, 2 not a worktree at all.
+	local settled_rc=0
+	"$BIN_DIR/lane-settled" "$wt" >/dev/null 2>&1 || settled_rc=$?
+	[ "$settled_rc" -eq 0 ] || return 0
+	# The branch was created after the bench dir's mtime: the bench
+	# dir predates the branch.
+	[ -n "$bench_mtime" ] || return 0
+	local branch_time
+	branch_time=$(branch_created_at "$wt")
+	[ -n "$branch_time" ] || return 0
+	[ "$branch_time" -gt "$bench_mtime" ] && return 0
+	return 1
+}
+
+# When the branch was created, as a unix timestamp. Empty when the
+# answer is not available: a branch with no reflog entry (created by a
+# clone, or the reflog expired) has no creation time, and the caller
+# treats that as work in progress rather than as landed.
+branch_created_at() {
+	local wt=$1 branch
+	branch=$(git -C "$wt" branch --show-current 2>/dev/null)
+	[ -n "$branch" ] || return 0
+	# The default reflog format is `<sha> <branch>@{<unix>}: <msg>`.
+	# The "Created from" entry is the branch's birth, and its `@{...}`
+	# carries the unix timestamp.
+	git -C "$wt" reflog show --date=unix "$branch" 2>/dev/null \
+		| grep -m1 'Created from' \
+		| grep -o '@{[0-9]*}' \
+		| tr -d '@{}' \
+		| grep -E '^[0-9]+$' || true
+}
+
 # `REMOTE_PRUNE_IDLE_DAYS` overrides the idle threshold: the right value is
 # a property of how often this builder sees traffic, which the tool cannot
 # see. Default matches pipeline/cleanup.sh's stale-days, so a tree the local
 # cleaner would call stale is one this one will look at.
 IDLE_DAYS=${REMOTE_PRUNE_IDLE_DAYS:-${PIPELINE_STALE_DAYS:-3}}
 
-landed=() uncertain=() idle=() trunk=() refused=()
+landed=() uncertain=() idle=() trunk=() refused=() carrying=()
 landed_bytes=0 idle_bytes=0
 for name in "${BENCH_DIRS[@]}"; do
 	[ -n "$name" ] || continue
@@ -145,13 +215,52 @@ for name in "${BENCH_DIRS[@]}"; do
 	cherry_rc=$?
 	set -e
 	case "$cherry_rc" in
-	0)	# `du -sb` rather than `du -sh`: the bytes go into a sum, not a label,
-		# and the report quotes them in a single human-readable line. One
-		# invocation per dir; the bench is shallow.
-		size=$(ssh "$REMOTE" "du -sb \$HOME/bench/$name 2>/dev/null | awk '{print \$1}'")
-		landed+=("$name")
-		landed_bytes=$((landed_bytes + ${size:-0}))
-		continue
+	0)
+		# Cherry says every commit on this branch is on main, which is
+		# also what a branch with no commits at all says, so the other
+		# signals decide whether the work is really done.
+		#
+		# The bench dir's mtime and its size come from one call. The
+		# mtime is NOT the sync time: the sync is `rsync -a`, which
+		# preserves the source's mtimes, directories included, so it is
+		# the local worktree root's mtime as of the last sync. Against
+		# the branch's creation time it answers "does the bench dir
+		# predate the branch?". A dir that cannot be measured has no
+		# mtime, which counts as carrying work.
+		set +e
+		bench_info=$(ssh "$REMOTE" bash -s -- "$name" <<'REMOTE_BENCH'
+d="$HOME/bench/$1"
+mtime=$(stat -c %Y "$d" 2>/dev/null || echo "")
+size=$(du -sb "$d" 2>/dev/null | awk '{print $1}')
+printf '%s %s\n' "$mtime" "${size:-0}"
+REMOTE_BENCH
+		)
+		set -e
+		bench_mtime=${bench_info%% *}
+		size=${bench_info##* }
+		[ -n "$bench_mtime" ] || bench_mtime=""
+		case "$bench_mtime" in
+		'' | *[!0-9]*) bench_mtime="" ;;
+		esac
+		set +e
+		carrying_work "$wt" "$bench_mtime"
+		work_rc=$?
+		set -e
+		if [ "$work_rc" -eq 0 ]; then
+			# Carrying work: the tree is not done, so its bench dir
+			# stays whole -- the warm cache with it. A lane that is
+			# not building right now is not protected by the lock.
+			carrying+=("$name")
+			continue
+		else
+			# `du -sb` rather than `du -sh`: the bytes go into a sum,
+			# not a label, and the report quotes them in a single
+			# human-readable line. One invocation per dir; the bench
+			# is shallow.
+			landed+=("$name")
+			landed_bytes=$((landed_bytes + ${size:-0}))
+			continue
+		fi
 		;;
 	2)	uncertain+=("$name")
 		continue
@@ -201,9 +310,15 @@ report_bytes() {
 
 # advisory exit code 0 -- a tool that runs through every case and has nothing
 # to report is not a failure.
-if [ ${#landed[@]} -eq 0 ] && [ ${#idle[@]} -eq 0 ] && [ ${#uncertain[@]} -eq 0 ] && [ ${#trunk[@]} -eq 0 ] && [ ${#refused[@]} -eq 0 ]; then
+if [ ${#landed[@]} -eq 0 ] && [ ${#idle[@]} -eq 0 ] && [ ${#uncertain[@]} -eq 0 ] && [ ${#trunk[@]} -eq 0 ] && [ ${#refused[@]} -eq 0 ] && [ ${#carrying[@]} -eq 0 ]; then
 	echo "==> nothing to prune"
 	exit 0
+fi
+
+if [ ${#carrying[@]} -gt 0 ]; then
+	echo
+	echo "==> left alone, carrying unlanded work (${#carrying[@]} tree(s)):"
+	printf '  %s\n' "${carrying[@]}"
 fi
 
 if [ ${#landed[@]} -gt 0 ]; then
