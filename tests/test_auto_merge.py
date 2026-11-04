@@ -949,7 +949,20 @@ api() {
       fi
       printf '%s\n' '{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"id":"PR_stub"}}}}'
       exit 0 ;;
-    */rulesets) cat "$STUB_DATA/rulesets.json"; exit 0 ;;
+    */rulesets)
+      # The list endpoint answers with summaries, as GitHub does: the
+      # name, the id and the enforcement, but no `rules`. The rules
+      # are on the ruleset's own endpoint, fetched by id.
+      cat "$STUB_DATA/rulesets.json"; exit 0 ;;
+    */rulesets/*)
+      # The detail endpoint answers with the whole ruleset, rules and
+      # all. A test that names a ruleset writes the file the id maps
+      # to; an id with no file is a ruleset that cannot be fetched.
+      id="${endpoint##*/}"
+      if [ -f "$STUB_DATA/ruleset_$id.json" ]; then
+        cat "$STUB_DATA/ruleset_$id.json"; exit 0
+      fi
+      echo "gh: Not Found" >&2; exit 1 ;;
     */pulls/*/files) cat "$STUB_DATA/files.json"; exit 0 ;;
     */pulls/*/reviews) cat "$STUB_DATA/reviews.json"; exit 0 ;;
     */contents/*)
@@ -1035,7 +1048,23 @@ def install(data_dir: Path, pr_obj, reviews, checks, rulesets, files,
         json.dumps({"statusCheckRollup": checks}))
     # The rulesets endpoint is read with `--paginate --slurp`, so the
     # stub answers with the pages wrapped in an outer array.
-    (data_dir / "rulesets.json").write_text(json.dumps([rulesets]))
+    #
+    # The list endpoint answers with summaries, as GitHub does: the
+    # name, the id and the enforcement, but no `rules`. The rules live
+    # on the ruleset's own endpoint, which the driver fetches by id.
+    # Serving the whole ruleset from the list would hide the difference
+    # between the two endpoints.
+    summaries = []
+    for payload in rulesets:
+        summary = {k: v for k, v in payload.items() if k != "rules"}
+        summaries.append(summary)
+    (data_dir / "rulesets.json").write_text(json.dumps([summaries]))
+    for payload in rulesets:
+        rule_id = payload.get("id")
+        if rule_id is None:
+            continue
+        (data_dir / f"ruleset_{rule_id}.json").write_text(
+            json.dumps(payload))
     (data_dir / "files.json").write_text(json.dumps(files))
     # The contents endpoint answers with base64, as GitHub does.
     if contents is None:
@@ -1630,6 +1659,62 @@ def check_tools(failures):
 
 # ----- the source is free of a merge call ---------------------------------
 
+def check_ruleset_details_are_fetched(failures):
+    """The ruleset's rules come from its own endpoint, not from the list.
+
+    GitHub's list endpoint answers with summaries: the name, the id and
+    the enforcement, and no `rules`. The rules are on the ruleset's own
+    endpoint. A driver that reads the summary as if it carried the
+    rules refuses every repository that has a ruleset with
+    `malformed ruleset: rules` -- which is every repository this tool
+    is for.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        bin_dir = tmp / "bin"
+        bin_dir.mkdir()
+        write_stub_gh(bin_dir)
+        data = tmp / "data"
+        data.mkdir()
+        good_reviews = [review(1, "APPROVED", HEAD, "2026-10-20T00:00:00Z")]
+        install(data, pr(), good_reviews, [check_run()], [ruleset()], [])
+        config_path = tmp / "on.toml"
+        write_config(config_path, auto_merge="on", merge_method="squash",
+                     ruleset="loop-merge", required_checks=["Gates"],
+                     allow_same_family=True)
+
+        # The stub answers the list with summaries, as GitHub does.
+        listed = json.loads((data / "rulesets.json").read_text())
+        for page in listed:
+            for summary in page:
+                if "rules" in summary:
+                    failures.append(
+                        "the list endpoint answered with a ruleset that "
+                        "carries its rules; the fixture is not GitHub's shape")
+
+        r = run_driver(data, bin_dir, config_path=config_path)
+        if r.returncode != 0:
+            failures.append(
+                f"the driver exited {r.returncode} with a ruleset in "
+                f"GitHub's shape: {r.stderr.strip()!r}")
+
+        # The rules came from the ruleset's own endpoint.
+        log = (data / "gh.log").read_text()
+        if "/rulesets/7" not in log:
+            failures.append(
+                "the driver did not fetch the ruleset by its id; "
+                f"the requests were: {log!r}")
+
+        # A ruleset whose detail cannot be read is an unknown
+        # prerequisite, so it is refused rather than guessed at.
+        (data / "ruleset_7.json").unlink()
+        r = run_driver(data, bin_dir, config_path=config_path)
+        if r.returncode != 2:
+            failures.append(
+                f"the driver exited {r.returncode} when the ruleset's "
+                f"detail could not be read; expected 2")
+
+
 def check_no_merge(failures):
     """Nothing in this repository merges a pull request.
 
@@ -1661,7 +1746,8 @@ def main() -> int:
               check_lenient_ruleset_reader,
               check_on_mode_refuses_a_malformed_ruleset,
               check_config_reader, check_codeowners, check_ledger,
-              check_driver, check_tools, check_no_merge)
+              check_driver, check_ruleset_details_are_fetched,
+              check_tools, check_no_merge)
     for check in checks:
         try:
             check(failures)

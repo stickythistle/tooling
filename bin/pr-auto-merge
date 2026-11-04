@@ -142,7 +142,7 @@ def fetch_checks(repo: str, number: str) -> list:
 
 
 def fetch_rulesets(repo: str) -> list:
-    """Fetch every ruleset the repository has.
+    """Fetch every ruleset the repository has, with its rules.
 
     `includes_parents=false`: a ruleset inherited from an organization
     is not one the repository's configuration names, and a repository
@@ -151,6 +151,13 @@ def fetch_rulesets(repo: str) -> list:
     The query parameters are sent as query parameters (`-F` on a GET is
     a query parameter; `-f` would send a request body, which a GET
     ignores).
+
+    The list endpoint answers with summaries: the name, the id and the
+    enforcement, but no `rules`. The rules are on the ruleset's own
+    endpoint, so each summary is fetched by its id and the two are
+    joined. A summary that is read as if it carried the rules would
+    raise `malformed ruleset: rules` on every repository that has one,
+    which is every repository this tool is for.
     """
     endpoint = f"repos/{repo}/rulesets"
     payload = gh_json(endpoint, "--paginate", "--slurp",
@@ -166,10 +173,48 @@ def fetch_rulesets(repo: str) -> list:
         out = []
         for page in payload:
             out.extend(page)
-        return out
-    if not isinstance(payload, list):
+    elif isinstance(payload, list):
+        out = payload
+    else:
         raise FetchError(f"{endpoint}: response was not an array")
-    return payload
+
+    detailed = []
+    for summary in out:
+        if not isinstance(summary, dict):
+            raise FetchError(f"{endpoint}: a ruleset entry")
+        detailed.append(_ruleset_detail(repo, summary))
+    return detailed
+
+
+def _ruleset_detail(repo: str, summary: dict) -> dict:
+    """One ruleset with its rules, fetched by id.
+
+    The list endpoint does not carry the rules, so the summary is
+    joined with the ruleset's own response. A summary that already
+    carries them is used as it is: a caller may hand over a response
+    that has them, and fetching again would only cost a request.
+
+    A summary with no id cannot be fetched by id, and a ruleset whose
+    detail cannot be read is an unknown prerequisite, so it is refused
+    by name rather than guessed at.
+    """
+    if isinstance(summary.get("rules"), list):
+        return summary
+    rule_id = summary.get("id")
+    if not isinstance(rule_id, int) or isinstance(rule_id, bool):
+        name = summary.get("name")
+        raise FetchError(
+            f"repos/{repo}/rulesets: the ruleset {name!r} has no id, "
+            "so its rules cannot be fetched")
+    endpoint = f"repos/{repo}/rulesets/{rule_id}"
+    detail = gh_json(endpoint, "-X", "GET")
+    if not isinstance(detail, dict):
+        raise FetchError(f"{endpoint}: response was not an object")
+    # The detail response carries the summary's own fields too, so the
+    # two agree on the name and the enforcement. The summary wins for
+    # the fields it names, so a fetch that answers with a different
+    # ruleset cannot quietly replace the one the list named.
+    return {**detail, **{k: v for k, v in summary.items() if k != "rules"}}
 
 
 def fetch_changed_paths(repo: str, number: str) -> list:
