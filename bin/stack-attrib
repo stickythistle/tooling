@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
-"""Attribute a stack's findings to the pull requests that introduced them.
+"""Attribute a stack's findings to the pull request that wrote each quote.
 
-Reads the reviewer's findings and the plan `stack-plan` printed before the
-review ran. The plan is an input: a PR opened, closed or retargeted during
-the review cannot make this attribute over a different stack than the one
-reviewed. A finding on a line no PR of the stack changed belongs to the
-stack as a whole.
+Reads the findings after finding-check located their quotes, and the plan
+`stack-plan` printed before the review ran. The plan is an input: a PR
+opened, closed or retargeted during the review cannot make this attribute
+over a different stack than the one reviewed.
 
-The findings are text and their `path:line` references are parsed out of
-them. The output:
+Each finding's located line is blamed at the reviewed head, and the blamed
+commit is charged to the PR whose `base..head` range holds it. The output:
 
     {
       "stack": [ {"number": 1, "head": "feat/a", "title": "..."}, ... ],
       "findings": [
-        {"path": "src/x.rs", "line": 42, "pr": 1, "reason": "introduced"},
-        {"path": "src/y.rs", "line": 7,  "pr": null, "reason": "stack"}
+        {"path": "src/x.rs", "line": 11, "pr": 1, "reason": "attributed",
+         "blamed_commit": "<sha>"},
+        {"path": "src/y.rs", "line": 7, "pr": null, "reason": "stack"},
+        {"path": "src/z.rs", "line": 2, "pr": null, "reason": "unlocated",
+         "detail": "the quoted code was not located (...)"}
       ],
-      "tally": {"introduced": 1, "stack": 1, "unattributable": 0}
+      "tally": {"attributed": 1, "stack": 1, "unlocated": 1}
     }
 
-`reason` is `introduced` (the named PR introduced the cited line), `stack`
-(no PR of the stack changed it), or `unattributable` (the path is not in
-the reviewed tree).
+`reason` is `attributed` (the named PR wrote the quoted line), `stack` (the
+line was written before the stack began, so no single PR of it can be
+fixed for the finding), or `unlocated` (the quote was not located; it is
+charged to nobody).
 """
 from __future__ import annotations
 
@@ -79,36 +82,22 @@ def resolve_ref(repo_path: str, branch: str) -> str:
     )
 
 
-def attribute_findings(repo_path: str, findings_text: str,
+def attribute_findings(repo_path: str, located: list,
                        stack: list[stack_attrib.PullRequest],
                        final_tree: str) -> dict:
-    """Attribute every `path:line` the findings cite."""
-    members = []
-    for pr in stack:
-        members.append(stack_attrib.StackMember(
-            number=pr.number,
-            head_ref=resolve_ref(repo_path, pr.head_ref),
-            base_ref=resolve_ref(repo_path, pr.base_ref),
-            title=pr.title,
-        ))
-    owner = stack_attrib.introduced_by(repo_path, members, final_tree)
-    tree = stack_attrib.tree_paths(repo_path, final_tree)
-
-    findings = []
-    for path, line in stack_attrib.parse_references(findings_text):
-        if path not in tree:
-            pr, reason = None, "unattributable"
-        else:
-            pr = owner.get(path, {}).get(line)
-            reason = "introduced" if pr is not None else "stack"
-        findings.append({
-            "path": path,
-            "line": line,
-            "pr": pr,
-            "reason": reason,
-        })
-
-    tally = {"introduced": 0, "stack": 0, "unattributable": 0}
+    """Charge every located finding to the PR whose range holds its blame."""
+    members = [
+        (pr.number,
+         resolve_ref(repo_path, pr.base_ref),
+         resolve_ref(repo_path, pr.head_ref))
+        for pr in stack
+    ]
+    blamer = stack_attrib.Blamer(repo_path, final_tree)
+    findings = [
+        stack_attrib.attribute_finding(f, repo_path, members, blamer)
+        for f in located
+    ]
+    tally = {s: 0 for s in stack_attrib.STATUSES}
     for finding in findings:
         tally[finding["reason"]] += 1
 
@@ -131,8 +120,8 @@ def main() -> int:
                         help="the plan file stack-plan printed for this review")
     parser.add_argument("--repo-path", required=True,
                         help="the local checkout the review ran against")
-    parser.add_argument("--findings", required=True,
-                        help="the findings file the reviewer wrote")
+    parser.add_argument("--located", required=True,
+                        help="finding-check's annotated findings file")
     args = parser.parse_args()
 
     try:
@@ -148,12 +137,16 @@ def main() -> int:
                 "the plan is not a stack-plan document: no default_branch"
             )
         stack_attrib.stack_floor(stack, floor)
-        findings_text = Path(args.findings).read_text(errors="replace")
+        located = json.loads(Path(args.located).read_text())
+        if not isinstance(located, list):
+            raise stack_attrib.StackError(
+                "the located findings are not a JSON array"
+            )
         # The reviewed tree is the top of the stack, as the local ref it was
         # fetched to.
         final_tree = resolve_ref(args.repo_path, stack[-1].head_ref)
         result = attribute_findings(
-            args.repo_path, findings_text, stack, final_tree,
+            args.repo_path, located, stack, final_tree,
         )
     except stack_attrib.StackError as exc:
         sys.stderr.write(f"stack-attrib: {exc}\n")

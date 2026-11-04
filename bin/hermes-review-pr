@@ -42,10 +42,12 @@ execute   Do the review in the lane that runs the code. The reviewer gets the
           EXECUTION_NOTES.json and stops.
 
 --stack   Review the top of the PR's stack against the default branch, once,
-          and attribute each finding to the PR whose diff introduced the line
-          it cites; a line no PR changed belongs to the stack as a whole.
-          The stack is found from the PR's own base, and naming any PR of it
-          reviews the top. Writes REVIEW_NOTES.md and STACK_ATTRIBUTION.json.
+          and charge each finding to the PR whose commit last wrote the
+          quoted line; a line written before the stack began belongs to the
+          stack as a whole, and a quote that cannot be located is charged to
+          nobody. The stack is found from the PR's own base, and naming any
+          PR of it reviews the top. Writes REVIEW_NOTES.md and
+          STACK_ATTRIBUTION.json.
 
 Both phases write to $REVIEW_WT_ROOT/review-pr-N-PROFILE, on the branch
 review/pr-N-PROFILE, branched from the PR head. Nothing is pushed.
@@ -336,6 +338,15 @@ if [ -n "$TIMEOUT_PASSED" ]; then
 	SCRUTINIZE_ARGS=(--timeout "$TIMEOUT_OPT" "${SCRUTINIZE_ARGS[@]}")
 fi
 
+# Stack attribution works from the quoted code, so the reviewer also writes
+# its findings as JSON. The file lives outside the worktree: the review
+# prompt forbids creating files in the repository.
+FINDINGS_JSON=""
+if [[ "$STACK" == 1 ]]; then
+	FINDINGS_JSON=$(mktemp -t hermes-findings-XXXXXX.json)
+	SCRUTINIZE_ARGS+=(--json "$FINDINGS_JSON")
+fi
+
 FINDINGS=$(cd "$WT" && "$SCRUTINIZE" "${SCRUTINIZE_ARGS[@]}")
 
 cp "$FINDINGS" "$WT/REVIEW_NOTES.md"
@@ -344,15 +355,32 @@ if [[ "$STACK" == 1 ]]; then
 	# The attribution is computed against the worktree, the tree the reviewer
 	# saw, over the plan the review was set up from: rediscovering the stack
 	# here would attribute over whatever it changed into mid-review.
+	if [[ ! -s "$FINDINGS_JSON" ]]; then
+		rm -f "$FINDINGS_JSON"
+		echo "the reviewer wrote no findings JSON; its markdown findings are at $WT/REVIEW_NOTES.md, and the stack attribution did not run" >&2
+		exit 1
+	fi
+	# finding-check locates each quote in the file and corrects the drifted
+	# line; stack-attrib blames the located line and charges the PR whose
+	# range holds the blamed commit. A quote that is not located is
+	# unlocated and charged to nobody.
+	LOCATED=$(mktemp -t hermes-located-XXXXXX.json)
+	if ! python3 "$BIN_DIR/finding-check" "$WT" "$FINDINGS_JSON" \
+		--base "origin/$BASE_REF" >"$LOCATED"; then
+		rm -f "$FINDINGS_JSON" "$LOCATED"
+		echo "finding-check failed on the reviewer's findings" >&2
+		exit 1
+	fi
 	ATTRIB=$(mktemp -t hermes-stack-attrib-XXXXXX.json)
 	if ! python3 "$BIN_DIR/stack-attrib" \
 		--plan "$STACK_PLAN" \
 		--repo-path "$WT" \
-		--findings "$FINDINGS" >"$ATTRIB"; then
-		rm -f "$ATTRIB"
+		--located "$LOCATED" >"$ATTRIB"; then
+		rm -f "$FINDINGS_JSON" "$LOCATED" "$ATTRIB"
 		echo "stack attribution failed" >&2
 		exit 1
 	fi
+	rm -f "$FINDINGS_JSON" "$LOCATED"
 	cp "$ATTRIB" "$WT/STACK_ATTRIBUTION.json"
 	rm -f "$ATTRIB"
 	# The per-pull-request breakdown, so the operator sees which PR of the
@@ -360,7 +388,7 @@ if [[ "$STACK" == 1 ]]; then
 	echo "stack:"
 	jq -r '.stack[] | "  #\(.number) \(.head) -- \(.title)"' "$WT/STACK_ATTRIBUTION.json"
 	echo "attribution:"
-	jq -r '.findings[] | "  \(.path):\(.line) -> PR \(.pr // "stack") (\(.reason))"' \
+	jq -r '.findings[] | "  \(.path):\(.line) -> \(if .pr then "PR \(.pr)" else .reason end)"' \
 		"$WT/STACK_ATTRIBUTION.json"
 	echo "tally: $(jq -c '.tally' "$WT/STACK_ATTRIBUTION.json")"
 	commit_artifact REVIEW_NOTES.md STACK_ATTRIBUTION.json \

@@ -1,39 +1,31 @@
 #!/usr/bin/env python3
-"""Attribute a finding on a stacked pull request to the PR whose diff introduced it.
+"""Attribute a finding on a stacked pull request to the PR that wrote its quote.
 
-A stacked PR is reviewed against its own base, so a defect that appears only
-when two PRs combine is invisible to both. Reviewing the top of the stack
-against the default branch sees the combined tree; this module then says
-which PR of the stack owns each `path:line` in the reviewed tree.
+Reviewing the top of a stack against the default branch sees the combined
+tree of every PR below it; this module says which PR owns each finding. A
+finding belongs to the PR whose commit last wrote the code the reviewer
+quoted: finding-check locates the quote in the file, the located line is
+blamed at the reviewed head, and the blamed commit is charged to the PR
+whose range (`base..head`) holds it.
 
-The rule: a line belongs to the PR that introduced it, not the PR that last
-edited it, because the fix goes in the introducer. A finding on a line no PR
-of the stack changed is reported against the stack as a whole.
+The cited line numbers are not used. Reviewers' line numbers drift, often
+by tens of lines, and a drifted line lands on code another PR wrote or on
+code no PR wrote at all.
 
-A line's position moves as the stack grows, so each PR's changed lines are
-carried forward into the reviewed tree's coordinates, one stack level at a
-time.
+Three answers, and every finding lands in exactly one:
+
+- `attributed` -- the PR named owns the blamed commit.
+- `unlocated` -- the quote was not located in the file, so the finding is
+  charged to nobody: a citation that cannot be located is evidence of
+  nothing.
+- `stack` -- the located line was written before the stack began, so the
+  finding is charged to the stack as a whole.
 """
 from __future__ import annotations
 
 import json
-import re
 import subprocess
-from dataclasses import dataclass, field
-
-# A hunk header: `@@ -old[,count] +new[,count] @@`.
-HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
-
-# A path reference in a reviewer's findings: `path:line` or `path:line-line`
-# (a range resolves to its first line). The path runs to the last colon
-# followed by a number, so `crates/a:b.rs` still resolves.
-REF_RE = re.compile(
-    r"(?P<path>[^\s`():,;]+?):(?P<start>\d+)(?:-(?P<end>\d+))?"
-)
-
-# The number of context lines that makes `git diff` show every line of a
-# file. `git diff -U<n>` uses a huge n to mean "no limit".
-FULL_CONTEXT = "1000000"
+from dataclasses import dataclass
 
 
 class StackError(Exception):
@@ -51,6 +43,17 @@ def gh_json(args: list[str]) -> object:
         )
     out = result.stdout
     return json.loads(out) if out.strip() else None
+
+
+@dataclass
+class PullRequest:
+    """The shape of a pull request the stack is read from."""
+
+    number: int
+    head_ref: str
+    base_ref: str
+    title: str = ""
+    state: str = "OPEN"
 
 
 def open_pull_requests(repo: str) -> list["PullRequest"]:
@@ -81,31 +84,20 @@ def default_branch(repo: str) -> str:
     return raw["defaultBranchRef"]["name"]
 
 
-@dataclass
-class PullRequest:
-    """The shape of a pull request the stack is read from."""
-
-    number: int
-    head_ref: str
-    base_ref: str
-    title: str = ""
-    state: str = "OPEN"
-
-
 def discover_stack(prs: list[PullRequest], number: int,
                    default_branch: str) -> list[PullRequest]:
     """The stack a pull request belongs to, bottom first.
 
     A PR is stacked on another when its base branch is another open PR's head
-    branch. The chain is followed down to the PR based on the default branch,
-    then up to the top, which carries every change below it and is the one
-    reviewed. `prs` is every open pull request; a PR stacked on nothing is a
-    stack of one.
+    branch. The chain runs down to the PR based on the default branch and up
+    to the top, which carries every change below it and is the one reviewed.
+    `prs` is every open pull request; a PR stacked on nothing is a stack of
+    one.
 
     A PR based on any branch that is neither the default branch nor an open
-    PR's head is refused: the stack does not have that base. A stack that
-    forks -- more than one open PR based on the same member's head -- has no
-    single top to review and is refused naming the siblings.
+    PR's head is refused. A stack that forks -- more than one open PR based
+    on the same member's head -- has no single top and is refused naming the
+    siblings.
     """
     by_number = {pr.number: pr for pr in prs}
     by_head: dict[str, PullRequest] = {}
@@ -188,45 +180,6 @@ def stack_floor(stack: list[PullRequest], default_branch: str) -> str:
     return floor
 
 
-@dataclass
-class StackMember:
-    """One pull request of the stack.
-
-    `base_ref` and `head_ref` are refs in the local repository, resolved by
-    the caller: `base_ref` is the branch the PR is based on, `head_ref` the
-    branch it pushes. The stack is ordered bottom first.
-    """
-
-    number: int
-    head_ref: str
-    base_ref: str
-    title: str = ""
-    # The commit the PR's head is at, as the caller resolved it.
-    head_sha: str = ""
-    # New-side line ranges per path, in this PR's own head-tree coordinates.
-    # Filled in by `load_own_ranges`; empty means "not computed yet".
-    own_ranges: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
-
-
-@dataclass
-class Attribution:
-    """Where one finding lands in the stack."""
-
-    path: str
-    line: int
-    # The PR number that introduced the line, or None when no PR of the
-    # stack changed it.
-    pr: int | None
-    # Why: `introduced`, `stack` (no PR changed the line), or
-    # `unattributable` (the path is not in the reviewed tree at all).
-    reason: str
-
-    @property
-    def attributed(self) -> bool:
-        """True when a single PR of the stack owns the finding."""
-        return self.pr is not None
-
-
 def _git(repo: str, *args: str) -> str:
     """Run git in `repo` and return stdout. Raises on failure."""
     result = subprocess.run(
@@ -241,222 +194,174 @@ def _git(repo: str, *args: str) -> str:
     return result.stdout
 
 
-def parse_hunks(diff_text: str) -> dict[str, list[tuple[int, int]]]:
-    """New-side line ranges per path, from a `git diff --unified=0`.
+def is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    """True when `ancestor` is in the history of `descendant`.
 
-    A pure deletion in a surviving file still gets a one-line range at the
-    deletion point, so a finding about the removed code counts as in the
-    change.
+    A range that cannot be decided raises instead of reading as empty or as
+    containing everything.
     """
-    ranges: dict[str, list[tuple[int, int]]] = {}
-    path = None
-    for line in diff_text.splitlines():
-        # The `+++` line names the new side, which is what a finding cites.
-        # A deleted file's is `/dev/null`, and its hunks belong to no path.
-        if line.startswith("+++ "):
-            m = re.match(r"^\+\+\+ b/(.+)$", line)
-            path = m.group(1) if m else None
+    result = subprocess.run(
+        ["git", "-C", repo, "merge-base", "--is-ancestor",
+         ancestor, descendant],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode == 0:
+        return True
+    if result.returncode == 1:
+        return False
+    raise StackError(
+        f"merge-base --is-ancestor {ancestor} {descendant} failed: "
+        f"{result.stderr.strip() or 'no output'}"
+    )
+
+
+def owner_of(repo: str, ranges: list[tuple[int, str, str]],
+             commit: str) -> int | None:
+    """The PR whose `base..head` range holds `commit`, or None.
+
+    `ranges` is the stack bottom first as (number, base_ref, head_ref).
+    Each member's base is the one below it's head, so the ranges are
+    disjoint and a commit belongs to at most one.
+    """
+    for number, base_ref, head_ref in ranges:
+        if is_ancestor(repo, commit, head_ref) and \
+                not is_ancestor(repo, commit, base_ref):
+            return number
+    return None
+
+
+def parse_blame(porcelain: str) -> dict[int, str]:
+    """The commit each final line came from, from `git blame --porcelain`.
+
+    The header line is `<sha> <orig-line> <final-line> [<num-lines>]`. When
+    a commit contributed several consecutive lines, the first header carries
+    the count and the rest are bare `<sha> <orig-line> <final-line>`
+    headers, so the count is what says how many lines to expect.
+    """
+    shas: dict[int, str] = {}
+    lines = porcelain.splitlines()
+    i = 0
+    while i < len(lines):
+        header = lines[i]
+        if not header or header.startswith("\t"):
+            i += 1
             continue
-        m = HUNK_RE.match(line)
-        if m and path is not None:
-            start = int(m.group(3))
-            count = int(m.group(4)) if m.group(4) is not None else 1
-            ranges.setdefault(path, []).append((start, start + max(count, 1) - 1))
-    return ranges
-
-
-def build_line_map(repo: str, from_tree: str,
-                   to_tree: str) -> dict[str, dict[int, int]]:
-    """Map line numbers of `from_tree` onto `to_tree`, per path.
-
-    The diff uses full context so every unchanged line is present and
-    mappable. A deleted line and the addition that replaced it are the same
-    slot, so the deleted line maps onto the added line's position.
-
-    A deletion pairs only with an addition in the same run of changed
-    lines: pending deletions clear at every hunk header and context line,
-    because carrying one across a context line pairs it with any later
-    addition in the file.
-    """
-    if from_tree == to_tree:
-        # The same tree: every line maps to itself. This is the top PR of a
-        # stack, whose head *is* the reviewed tree.
-        return {}
-    diff = _git(repo, "diff", f"--unified={FULL_CONTEXT}", from_tree, to_tree)
-    mapping: dict[str, dict[int, int]] = {}
-    path = None
-    old = new = 0
-    deleted: list[int] = []
-    for line in diff.splitlines():
-        if line.startswith("--- ") or line.startswith("diff --git "):
+        parts = header.split(" ")
+        if len(parts) < 3:
+            i += 1
             continue
-        if line.startswith("+++ "):
-            m = re.match(r"^\+\+\+ b/(.+)$", line)
-            path = m.group(1) if m else None
-            if path is not None:
-                mapping.setdefault(path, {})
-            old = new = 0
-            deleted = []
-            continue
-        m = HUNK_RE.match(line)
-        if m and path is not None:
-            old = int(m.group(1))
-            new = int(m.group(3))
-            # A hunk header means the next lines are a fresh run of changes;
-            # anything deleted in the previous run stayed deleted.
-            deleted = []
-            continue
-        if path is None:
-            continue
-        if line.startswith("-"):
-            deleted.append(old)
-            old += 1
-        elif line.startswith("+"):
-            new += 1
-            # The oldest pending deletion is the one this addition replaced.
-            if deleted:
-                mapping[path][deleted.pop(0)] = new - 1
-        elif line.startswith(" "):
-            mapping[path][old] = new
-            old += 1
-            new += 1
-            # A context line ends the run: a deletion before it and an
-            # addition after it are different edits at different positions,
-            # not a replacement of one another.
-            deleted = []
-    return mapping
-
-
-def compose_line_maps(first: dict[str, dict[int, int]],
-                      second: dict[str, dict[int, int]]
-                      ) -> dict[str, dict[int, int]]:
-    """Carry a mapping through another mapping.
-
-    `first` maps a PR's own tree onto an intermediate tree, and `second` maps
-    that intermediate tree onto the reviewed tree. The composition maps the
-    PR's own tree onto the reviewed tree.
-    """
-    composed: dict[str, dict[int, int]] = {}
-    for path, lines in first.items():
-        onward = second.get(path, {})
-        for old, mid in lines.items():
-            composed.setdefault(path, {})[old] = onward.get(mid, mid)
-    return composed
-
-
-def load_own_ranges(repo: str, member: StackMember) -> StackMember:
-    """Fill in the lines this PR's own diff changed, in its head's coordinates.
-
-    The diff is `base...head`, so a commit the base gained since the fork
-    does not count as the PR's change.
-    """
-    diff = _git(repo, "diff", "--unified=0",
-                f"{member.base_ref}...{member.head_ref}")
-    member.own_ranges = parse_hunks(diff)
-    return member
-
-
-def tree_paths(repo: str, tree: str) -> set[str]:
-    """The files the reviewed tree holds.
-
-    A finding citing a path outside it names something the review never saw.
-    """
-    listing = _git(repo, "ls-tree", "-r", "--name-only", tree)
-    return {line for line in listing.splitlines() if line}
-
-
-def introduced_by(repo: str, members: list[StackMember],
-                  final_tree: str) -> dict[str, dict[int, int]]:
-    """Which PR introduced which line of the reviewed tree, per path.
-
-    The result maps `path` to `line -> pr number`; a line no PR changed is
-    absent. `members` is the stack, bottom first.
-    """
-    owner: dict[str, dict[int, int]] = {}
-    for index, member in enumerate(members):
-        if not member.own_ranges:
-            load_own_ranges(repo, member)
-        own = member.own_ranges
-        # The member's own head tree, carried forward to the reviewed tree.
-        pr_map = carry_to_final(repo, members, index, final_tree)
-        for path, ranges in own.items():
-            path_map = pr_map.get(path, {})
-            for start, end in ranges:
-                for line in range(start, end + 1):
-                    # A line with no counterpart in the reviewed tree was
-                    # deleted above; it has no position there, so it cannot
-                    # be attributed.
-                    if path_map and line not in path_map:
-                        continue
-                    final_line = path_map.get(line, line)
-                    # The lowest PR that introduced a line owns it: a PR
-                    # above it may have edited the line, but did not
-                    # introduce it.
-                    owner.setdefault(path, {}).setdefault(final_line,
-                                                         member.number)
-    return owner
-
-
-def carry_to_final(repo: str, members: list[StackMember], index: int,
-                   final_tree: str) -> dict[str, dict[int, int]]:
-    """Map member `index`'s own head tree onto the reviewed tree.
-
-    The carry goes one stack level at a time: a diff taken across two
-    levels at once cannot tell which of two adjacent changed lines
-    replaced which.
-    """
-    member = members[index]
-    if member.head_ref == final_tree or member.head_sha == final_tree:
-        return {}
-    result: dict[str, dict[int, int]] = {}
-    # The tree this member's head is at, and the tree above it.
-    current = member.head_ref
-    for level in range(index + 1, len(members)):
-        above = members[level]
-        step = build_line_map(repo, current, above.head_ref)
-        result = compose_line_maps(result, step) if result else step
-        current = above.head_ref
-    return result
-
-
-def attribute_finding(repo: str, members: list[StackMember],
-                      final_tree: str, path: str,
-                      line: int) -> Attribution:
-    """Attribute one `path:line` to the PR that introduced it."""
-    owner = introduced_by(repo, members, final_tree)
-    if path not in tree_paths(repo, final_tree):
-        # The review never saw this path -- a different answer from "a line
-        # no PR changed".
-        return Attribution(path=path, line=line, pr=None,
-                           reason="unattributable")
-    pr = owner.get(path, {}).get(line)
-    if pr is None:
-        return Attribution(path=path, line=line, pr=None, reason="stack")
-    return Attribution(path=path, line=line, pr=pr, reason="introduced")
-
-
-def parse_references(text: str) -> list[tuple[str, int]]:
-    """The `path:line` references in a reviewer's findings.
-
-    Every reference the text carries, in the order it carries them. A
-    reference with a range (`path:12-20`) resolves to its first line, which
-    is the line the finding is about.
-    """
-    found: list[tuple[str, int]] = []
-    seen: set[tuple[str, int]] = set()
-    for m in REF_RE.finditer(text):
-        path = m.group("path")
-        if not path:
-            continue
+        sha, _, final = parts[0], parts[1], parts[2]
         try:
-            line = int(m.group("start"))
+            final_line = int(final)
         except ValueError:
+            i += 1
             continue
-        if line < 1:
-            continue
-        key = (path, line)
-        if key in seen:
-            continue
-        seen.add(key)
-        found.append(key)
-    return found
+        count = 1
+        if len(parts) >= 4:
+            try:
+                count = int(parts[3])
+            except ValueError:
+                count = 1
+        for offset in range(count):
+            shas[final_line + offset] = sha
+        # Skip the metadata block up to the content line.
+        while i < len(lines) and not lines[i].startswith("\t"):
+            i += 1
+        i += 1
+    return shas
+
+
+class Blamer:
+    """The blamed commit per line, cached by path.
+
+    Blame walks a file's history once, and a review puts most of its
+    findings in a handful of files. A path git cannot blame is a path the
+    reviewed tree does not hold: the finding it belongs to is charged to
+    nobody rather than aborting the batch.
+    """
+
+    def __init__(self, repo: str, rev: str) -> None:
+        self.repo = repo
+        self.rev = rev
+        self._cache: dict[str, dict[int, str] | None] = {}
+
+    def blame(self, path: str) -> dict[int, str]:
+        if path not in self._cache:
+            result = subprocess.run(
+                ["git", "-C", self.repo, "blame", "--porcelain", self.rev,
+                 "--", path],
+                capture_output=True, text=True, check=False,
+            )
+            self._cache[path] = (
+                parse_blame(result.stdout) if result.returncode == 0
+                else None
+            )
+        cached = self._cache[path]
+        return cached if cached is not None else {}
+
+
+def git_path(repo: str, path: str) -> str:
+    """The path as git spells it, relative to the repository root.
+
+    A reviewer may write `./src/a.rs`; git names the file `src/a.rs`. The
+    reviewer's spelling is kept in the finding, so the two are both there.
+    """
+    from pathlib import Path as _Path
+    root = _Path(repo).resolve(strict=False)
+    candidate = (root / path).resolve(strict=False)
+    try:
+        return candidate.relative_to(root).as_posix()
+    except ValueError:
+        return path
+
+
+# The finding-check status that means the quote was found in the file.
+# `redaction-artifact` means the quote was found but holds a `***` the
+# agent's own redaction wrote: that text is the agent's rendering, not the
+# source's, so it is not a located quote.
+LOCATED_STATUS = "located"
+
+ATTRIBUTED = "attributed"
+UNLOCATED = "unlocated"
+STACK = "stack"
+
+STATUSES = (ATTRIBUTED, UNLOCATED, STACK)
+
+
+def attribute_finding(finding: object, repo: str,
+                      ranges: list[tuple[int, str, str]],
+                      blamer: Blamer) -> dict:
+    """Charge one located finding. Never raises for a bad finding."""
+    def annotated(**fields: object) -> dict:
+        base = finding if isinstance(finding, dict) else {"value": finding}
+        return {**base, **fields}
+
+    def unlocated(reason: str) -> dict:
+        return annotated(pr=None, reason=UNLOCATED, detail=reason)
+
+    status = finding.get("status") if isinstance(finding, dict) else None
+    if status != LOCATED_STATUS:
+        # A quote that was not located has no located line, and the cited
+        # line is not a substitute.
+        return unlocated(f"the quoted code was not located "
+                         f"(finding-check status {status!r})")
+
+    line = finding.get("line")  # type: ignore[union-attr]
+    if isinstance(line, bool) or not isinstance(line, int) or line < 1:
+        return unlocated(f"the located line {line!r} is not a line number")
+
+    path = finding.get("path")  # type: ignore[union-attr]
+    if not isinstance(path, str) or not path:
+        return unlocated("the finding names no path")
+
+    commit = blamer.blame(git_path(repo, path)).get(line)
+    if commit is None:
+        return unlocated(f"line {line} of {path} is not in the file as "
+                         f"blamed at the reviewed head")
+
+    pr = owner_of(repo, ranges, commit)
+    if pr is None:
+        # Written before the stack began: the stack as a whole owns it,
+        # which is a different answer from owning it by one PR.
+        return annotated(pr=None, reason=STACK, blamed_commit=commit)
+    return annotated(pr=pr, reason=ATTRIBUTED, blamed_commit=commit)

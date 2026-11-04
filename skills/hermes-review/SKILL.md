@@ -88,7 +88,7 @@ diff never shows the upper PR's value, and the upper PR's diff never shows
 the lower PR's drop.
 
 `hermes-review-pr --stack` reviews the top of the stack against the default
-branch, once, and attributes each finding to a pull request of the stack:
+branch, once, and charges each finding to a pull request of the stack:
 
     hermes-review-pr --pr 391 --stack
 
@@ -97,15 +97,16 @@ the top. A stack that forks -- two open PRs based on the same member's head
 -- has no single top and is refused, naming the siblings.
 
 **The attribution is the point:** without it the review names a line and
-nobody can say which PR to fix. A finding belongs to the PR whose diff
-*introduced* the cited line, not the last PR to touch it, because the fix
-goes in the introducer. A finding on a line no PR changed belongs to the
-stack as a whole.
+nobody can say which PR to fix. A finding goes to the PR whose commit last
+wrote the quoted line: the quote is located in the file with
+`finding-check` -- reviewers' line numbers drift, so the cited line is not
+used -- and the located line is blamed at the reviewed head. A quote that
+cannot be located is charged to nobody, and a line written before the stack
+began belongs to the stack as a whole.
 
 The review writes `REVIEW_NOTES.md` and `STACK_ATTRIBUTION.json` into the
-worktree and prints the breakdown: each cited `path:line` with the PR that
-owns it and the reason -- `introduced`, `stack`, or `unattributable` (the
-path is not in the reviewed tree).
+worktree and prints the breakdown: each finding's located `path:line`, the
+PR that owns it, and the reason -- `attributed`, `stack`, or `unlocated`.
 
 ## Review until clean
 

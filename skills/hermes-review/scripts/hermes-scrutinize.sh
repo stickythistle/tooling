@@ -19,11 +19,13 @@ BASE=""
 PROFILE=""
 TIMEOUT_OPT=""
 EXTRA=""
+JSON_OUT=""
 
 usage() {
 	cat <<'EOF'
 usage: hermes-scrutinize.sh [--base REF] [--model MODEL] [--profile NAME]
                             [--extra TEXT] [--timeout SECONDS]
+                            [--json FILE]
 
   --base REF   Review this branch against REF. Default: uncommitted changes if
                the tree is dirty, otherwise HEAD against the merge-base with
@@ -38,6 +40,10 @@ usage: hermes-scrutinize.sh [--base REF] [--model MODEL] [--profile NAME]
   --timeout    Seconds before the review is abandoned. Resolved per profile:
                the explicit value, then REVIEW_TIMEOUT_<PROFILE>, then
                HERMES_REVIEW_TIMEOUT, then 900.
+  --json FILE  Also ask for the findings as a JSON array in FILE, one object
+               per finding with severity, path, line, snippet, claim,
+               settled_by and recommendation. The markdown findings are
+               unchanged.
 
 Prints the path to the findings file on stdout.
 EOF
@@ -50,6 +56,7 @@ while [[ $# -gt 0 ]]; do
 	--profile) PROFILE="$2"; shift 2 ;;
 	--extra) EXTRA="$2"; shift 2 ;;
 	--timeout) TIMEOUT_OPT="$2"; shift 2 ;;
+	--json) JSON_OUT="$2"; shift 2 ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -88,6 +95,19 @@ if [[ "$DIFF_BYTES" -gt 400000 ]]; then
 	exit 1
 fi
 
+# --json asks for the same findings a second way: a JSON array for
+# finding-check to locate. The snippet is the code quoted exactly as the
+# file holds it, which is what the location and the blame work from.
+JSON_ASK=""
+if [[ -n "$JSON_OUT" ]]; then
+	JSON_ASK="
+Also write the same findings to $JSON_OUT as a JSON array, one object per
+finding with exactly these fields: severity (high, medium or low), path,
+line (the line of the snippet's first line in the file), snippet (the code
+quoted, exactly as it appears in the file), claim, settled_by, and
+recommendation."
+fi
+
 PROMPT=$(
 	cat <<EOF
 Review a proposed code change in the repository at $ROOT.
@@ -111,7 +131,7 @@ Hard constraints:
 Write your findings to $FINDINGS using the swe-reviewer entry format: severity,
 exact file path and line number, the offending snippet, and a concrete
 Recommendation. If a change is correct, say so rather than inventing a finding.
-
+$JSON_ASK
 When the file is written, reply with one line: the count of findings per
 severity class.
 $EXTRA
