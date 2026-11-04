@@ -1,0 +1,61 @@
+# pr-loop settings, one table per repository.
+#
+# Every value shown is the default except reviewer_profile,
+# implementer_profile and issue_label, which have no safe default and are
+# only needed by the role that uses them. An absent file is fine: the
+# defaults are the ones this file shows. A value of the wrong type, or an
+# unknown key, is a refusal -- the wrong shape is where a typo'd profile
+# hides.
+#
+# Copy to ~/.config/hermes-tools/pr-loop.toml (PR_LOOP_CONFIG overrides
+# the path).
+
+# [repos."owner/name"]
+#
+# # In-flight runs this loop may hold at once. Each is one PR; a second
+# # run never starts on a PR that has one.
+# slots = 1
+#
+# # The Hermes profiles the roles run. The reviewer must be a different
+# # model family from the implementer (hermes-review-post enforces it).
+# reviewer_profile = "minimax"
+# implementer_profile = ""        # empty is the root profile
+#
+# # The verify command a lane runs. Empty means the tool's own default
+# # (gate-verify on the worktree).
+# verify = ""
+#
+# # changes-requested rounds before the gate says ESCALATE.
+# max_rounds = 4
+#
+# # The label whose open issues a lane may take once no labelled PR
+# # needs work. Empty means the implement loop never opens a PR from an
+# # issue.
+# issue_label = ""
+#
+# # Live MiniMax processes allowed machine-wide before this loop stops
+# # starting runs. A fifth session falls back to the local model and
+# # evicts whatever is loaded there.
+# minimax_max = 4
+#
+# # "shadow" records the would-merge decision to the shadow ledger and
+# # leaves the merge to a person; "on" enables GitHub's auto-merge for
+# # the agreed head. shadow until the ledger says the loop is right.
+# auto_merge = "shadow"
+#
+# # The tools the loop runs, by name, resolved on PATH.
+# implement_cmd = "hermes-implement"
+# fix_cmd = "agent-fix-pr"
+# review_cmd = "hermes-review-post"
+#
+# # The clone worktrees are made from. Empty means the current
+# # directory's repository.
+# clone = ""
+#
+# # Append finished rounds to findings-ledger.
+# measure = true
+#
+# # A command that takes the escalation text on argv -- the Telegram
+# # sender repo-watch uses. Escalations still reach the PR as a comment
+# # when this is unset.
+# notify_cmd = ""

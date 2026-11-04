@@ -37,6 +37,13 @@ name = "pr-loop-gate tests"
 when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
 run = "python3 tests/test_pr_loop_gate.py"
 
+# The loop itself. Separate from the gate: the gate decides, the loop
+# acts, and a change to the driver must not lean on the gate's fixtures.
+[[gates]]
+name = "pr-loop tests"
+when = '^(bin/pr-loop|lib/pr_loop\.py|tests/test_pr_loop\.py)$'
+run = "python3 tests/test_pr_loop.py"
+
 [[gates]]
 name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'
