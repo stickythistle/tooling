@@ -19,9 +19,20 @@ here is hardcoded.
 > review is the gate that decides what lands.
 >
 > **Never take a pull request out of draft.** Draft is what tells the maintainer
-> that an agent is still working the branch, so promoting one claims the work is
-> finished when only your part of it is. Leave the state alone and say in the
-> handover that the branch is ready for the caller to check.
+> that an agent is still working the branch, so promoting one claims the work
+> is finished when only your part of it is. Leave the state alone and say in
+> the handover that the branch is ready for the caller to check.
+>
+> **An accidental `gh` call in this run fails, and that is deliberate.** A
+> lane dispatched by `hermes-implement` runs with `gh` pointed at an empty
+> config directory: a run that could reach GitHub could approve its own pull
+> request or answer a reviewer's comment, and afterwards nobody could tell
+> which of those it had done. Do not work around it, and do not put a
+> credential into a file, a commit message or a command line to get past it.
+> You run as the same operating-system user as the dispatcher, so credentials
+> that user can reach may still be on this host: do not use them. Everything
+> the run needs from the pull request is in its prompt; when something is
+> missing, name it in the handover and the script can fetch it.
 
 ## Done means a verified commit
 
@@ -159,6 +170,15 @@ reviewer has to agree with, so name them rather than leaving them to be found.
   it does so silently: the run goes green, the report says so, and the evidence
   that it should not have is gone. Say what broke, what you would change, and
   stop.
+- **No credential, ever, and no deriving one.** An accidental `gh` call
+  fails; that is the design, not a fault to work around. You run as the same
+  operating-system user as the dispatcher, so credentials that user can reach
+  may still be on this host — do not use them. Do not read a token out of a
+  file, a git remote, a CI config or another tool's environment, and do not
+  put one on a command line, where every other process on the host can read
+  it. A credential you derived from another is a second exposure of the
+  first. If the work needs something only GitHub can answer, name it in the
+  handover and the script will fetch it.
 - **A claim about something outside this repository is a guess until you run
   it.** An API on a cloud provider, a flag on a CLI, a resource a Terraform
   provider offers, a default inside a framework — none of these can be settled

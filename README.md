@@ -223,6 +223,36 @@ The reproductions run in a separate detached worktree at the reviewed head,
 because the artifact worktree carries the review's own commits and a
 reproduction run there would be evidence about a commit nobody reviewed.
 
+## Two identities, and a lane with neither
+
+The loop has two GitHub accounts and they are not the same person. The
+implementer authors the pull request; the reviewer is the repository's owner.
+One login cannot approve a pull request it authored, so a verdict can only
+exist as a real review state when the reviewer is somebody else — and a reply
+posted by the implementer has to be told apart from a person speaking.
+
+**Credentials per role.** `gh_as implementer ...` runs `gh` as the
+implementer, for one call, with that role's own credentials:
+`GH_IMPLEMENTER_TOKEN` or `GH_IMPLEMENTER_CONFIG_DIR`. Unset, the role uses
+the host's own `gh` login. A role with no credentials at all is **refused,
+naming the variable to set**.
+
+**The login is checked, not the variable's presence.** `gh_as` resolves the
+login the call would act as — `gh api user` under the same credentials — and
+refuses unless it is one of `IMPLEMENTER_LOGINS`, naming both. On the
+coordinator host the ambient login is the reviewer, so an implementer call
+there would otherwise act as the reviewer with no error at all.
+
+**A lane's `gh` is pointed at an empty config.** A lane dispatched by
+`hermes-implement` runs with a `gh` config directory that holds no hosts and
+with no token in its environment, so an accidental `gh` call inside the lane
+fails.
+
+The lane runs as the same operating-system user as the dispatcher, so
+credentials that user can reach are still on the host: the empty config
+makes an accidental call fail, it does not make them unreadable. A lane
+is told that, and must not use them.
+
 ## Setup
 
     cp hosts.env.example ~/.config/agent-tools/env    # then edit

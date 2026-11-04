@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -117,7 +118,16 @@ def write_stub_gh(tmpdir: Path) -> Path:
     runs `gh issue view N` before invoking the agent; without this the
     network call would block or fail."""
     shim = tmpdir / "gh"
-    shim.write_text("#!/usr/bin/env bash\necho 'stub issue'\n")
+    shim.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        # `gh api user` answers who the call would act as, which `gh_as`
+        # checks against IMPLEMENTER_LOGINS.
+        if [[ "$1" == "api" && "$2" == "user" ]]; then
+            echo "test-implementer"
+            exit 0
+        fi
+        echo 'stub issue'
+        """))
     shim.chmod(0o755)
     return shim
 
@@ -141,6 +151,7 @@ def run_lane(tmpdir: Path, worktree: Path, state_dir: Path | str,
         # Prepend the gh shim dir so the script's `gh issue view` resolves
         # to our stub before the system's gh.
         "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
+        "IMPLEMENTER_LOGINS": "test-implementer",
         # Cap attempts at 2 so the failure case finishes promptly: each
         # attempt is otherwise bounded by the agent's timeout (90 minutes
         # by default). The stub exits 0 immediately either way.

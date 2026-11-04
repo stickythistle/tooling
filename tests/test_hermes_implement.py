@@ -30,6 +30,12 @@ LIB = REPO_ROOT / "lib" / "common.sh"
 # would on a real machine.
 FAKE_GH = textwrap.dedent("""\
     #!/usr/bin/env bash
+    # `gh api user` answers who the call would act as, which `gh_as`
+    # checks against IMPLEMENTER_LOGINS.
+    if [[ "$1" == "api" && "$2" == "user" ]]; then
+        echo "test-implementer"
+        exit 0
+    fi
     # Whatever the operator asks gh to do, return a no-op success unless
     # it is the one command hermes-implement issues: `gh issue view`.
     # `gh issue view` is what populates $WORK/issue.txt; the body never
@@ -327,6 +333,10 @@ def setup_env(tmp: Path, **extra) -> dict:
             # stand in for the operator's so HOST_BUILDER etc. do not
             # leak into the test.
             "TOOLS_ENV": str(tmp / "fake.env"),
+            # The login the implementer role may act as. `gh_as` resolves
+            # the login the call would act as and refuses unless it is
+            # one of these.
+            "IMPLEMENTER_LOGINS": "test-implementer",
             # hermes-implement reads the verification evidence DB if it
             # exists at $HERMES_HOME/verification_evidence.db. Point it
             # at a path that does not have one.

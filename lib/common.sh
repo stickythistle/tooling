@@ -768,3 +768,144 @@ hermes_query() {
 	esac
 	return "$rc"
 }
+
+# `gh_as <role> <gh args...>` -- run gh as one of the loop's roles, for one call.
+#
+# The loop has two GitHub identities, and they are not the same person: the
+# implementer authors the pull request, and the reviewer is the repository's
+# owner. A verdict can only exist as a real review state when the reviewer is
+# not the author. Credentials per role are what make both possible.
+#
+# A role's credentials come from the host the role runs on, never from a
+# token carried to another host:
+#
+#   GH_<ROLE>_TOKEN   a token for that role, used for this one call.
+#   GH_<ROLE>_CONFIG_DIR  the gh config directory for that role.
+#
+# With neither set, the role uses the host's ambient gh auth. The token goes
+# in the environment, never on the command line: an argument is visible in
+# the process table to every other process on the host.
+#
+# The login the call would act as is resolved and checked against the role.
+# Checking that the variable is set, or that `gh auth status` passes, is not
+# enough: on the coordinator host the ambient login is the reviewer, so an
+# implementer call there would act as the reviewer with no error at all.
+#
+#   IMPLEMENTER_LOGINS   the logins the implementer role may act as, space
+#                         separated. A call whose login is not among them is
+#                         refused, naming both.
+gh_as() {
+	local role="${1:-}" token_var config_var token config_dir
+	shift || true
+	case "$role" in
+	implementer) ;;
+	*)
+		echo "gh_as: role must be implementer, got '${role}'" >&2
+		return 2
+		;;
+	esac
+	# ROLE is upper case for the variable name: implementer -> IMPLEMENTER.
+	local upper
+	upper=$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]')
+	token_var="GH_${upper}_TOKEN"
+	config_var="GH_${upper}_CONFIG_DIR"
+	token=${!token_var:-}
+	config_dir=${!config_var:-}
+	# The cache of resolved logins lives in a directory this process
+	# created, and is named by a hash of the credential in force, so a
+	# token never inherits another token's answer.
+	local cache_dir="${_GH_AS_CACHE_DIR:-}"
+	if [[ -z "$cache_dir" ]]; then
+		cache_dir=$(mktemp -d "${TMPDIR:-/tmp}/gh-as-cache.XXXXXX") || cache_dir=""
+		_GH_AS_CACHE_DIR="$cache_dir"
+	fi
+	local login
+	if [[ -z "$token" && -z "$config_dir" ]]; then
+		# No credentials named for this role. The host's own gh auth may
+		# still serve it: a host that serves one role needs no token.
+		login=$(GH_AS_CACHE_DIR="$cache_dir" gh_as_login)
+		if [[ -z "$login" ]]; then
+			echo "gh_as: no credentials for role '$role'; set $token_var, or $config_var, or log in with gh on this host" >&2
+			return 1
+		fi
+	else
+		# The login these credentials give: a token names its own
+		# account.
+		login=$(GH_TOKEN="$token" GH_CONFIG_DIR="$config_dir" \
+			GH_AS_CACHE_DIR="$cache_dir" gh_as_login "token")
+	fi
+	# The login the call acts as must be one the role may act as.
+	local allowed=" ${IMPLEMENTER_LOGINS:-} "
+	case "$allowed" in
+	*" $login "*) ;;
+	*)
+		echo "gh_as: this call would act as '${login}', which is not an implementer login (IMPLEMENTER_LOGINS='${IMPLEMENTER_LOGINS:-}')" >&2
+		return 1
+		;;
+	esac
+	if [[ -n "$token" ]]; then
+		# In the environment, not on the command line: argv is readable by
+		# every other process on the host.
+		GH_TOKEN="$token" gh "$@"
+	else
+		GH_CONFIG_DIR="$config_dir" gh "$@"
+	fi
+}
+
+# The login the current gh auth acts as, or empty when there is none.
+#
+# `gh api user` is the question that matters: it asks who the API sees, not
+# what the config directory holds.
+#
+# The answer is cached per credential, because the question costs an API
+# call and the login does not change under a single run. The key is a hash
+# of the credential in force: a named token must not inherit another
+# token's answer, or it would act as a login it was never given.
+gh_as_login() {
+	local scope="${1:-ambient}"
+	# The cache is a file, not a variable: the login is resolved in a
+	# command substitution, and a subshell's variables do not outlive
+	# it. The directory comes from the caller, which made it with
+	# mktemp -d.
+	local dir="${GH_AS_CACHE_DIR:-}"
+	if [[ -z "$dir" ]]; then
+		# No directory was named, so there is no cache: resolve the
+		# login again.
+		local who
+		who=$(gh api user --jq .login 2>/dev/null) || who=""
+		printf '%s' "$who"
+		return 0
+	fi
+	# The key is the credential itself, hashed: the token is a secret and
+	# must not be written to disk in the clear.
+	local key
+	key=$(printf '%s' "${GH_TOKEN:-}|${GH_CONFIG_DIR:-}" | sha256sum | cut -d" " -f1)
+	local cache="$dir/$scope.$key"
+	if [[ -r "$cache" ]]; then
+		cat "$cache"
+		return 0
+	fi
+	local who
+	who=$(gh api user --jq .login 2>/dev/null) || who=""
+	printf '%s' "$who" >"$cache" 2>/dev/null || true
+	printf '%s' "$who"
+}
+
+# `credential_free_env <dir>` -- the environment a model run gets.
+#
+# No model run gets GitHub credentials. A lane runs with a gh config
+# directory that holds no hosts, so `gh auth status` reports it is not
+# logged in, and no token is in the environment for it to pick up. Everything
+# a run needs from the pull request is placed in its prompt instead.
+#
+# The directory is created empty, once, and reused: an empty directory that
+# gh writes into would gain a hosts.yml, and a hosts.yml is a credential.
+credential_free_env() {
+	local dir="${1:-}"
+	[[ -n "$dir" ]] || { echo "credential_free_env: a directory is required" >&2; return 2; }
+	mkdir -p "$dir"
+	# Any hosts.yml that a previous run left behind is a credential file.
+	# It is removed rather than trusted: the directory exists to hold none.
+	rm -f "$dir/hosts.yml"
+	printf '%s\n' "$dir"
+}
