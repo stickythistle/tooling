@@ -83,6 +83,13 @@ def embedded_programs(text: str):
     would miss it.
 
     The name may be any identifier, not just an upper-case one.
+
+    Every program carries a name, because a name is what tells two
+    fakes apart without reading a line number: the line moves when
+    anything is inserted above the fake, and the name does not. A
+    literal bound to a name carries that name. A literal handed to
+    `write_text` carries the name of the file it is written to, or the
+    name of the variable it is written through.
     """
     out = []
     # A literal bound to a name: `NAME = """..."""`.
@@ -96,16 +103,46 @@ def embedded_programs(text: str):
         out.append((m.group("name"), text[start:end],
                     text[:m.start()].count("\n") + 1, False))
     # A literal written to a file: `something.write_text("""...""")`.
+    # The receiver is matched in full, so a fake written to a computed
+    # path -- `(fake / "ssh").write_text(...)` -- is found as well as
+    # one written through a variable. A scan that only matched the
+    # variable form would miss every fake of the other shape, and a
+    # fake nobody scans is a fake nobody guards.
     for m in re.finditer(
-            r'\.write_text\(\s*(?:textwrap\.dedent\()?\s*(?P<prefix>f?r?)"""',
+            r'(?P<receiver>[^\n]*?)\.write_text\(\s*'
+            r'(?:textwrap\.dedent\()?\s*(?P<prefix>f?r?)"""',
             text):
         start = m.end()
         end = text.find('"""', start)
         if end == -1:
             continue
-        out.append((None, text[start:end],
+        out.append((_written_name(m.group("receiver")), text[start:end],
                     text[:m.start()].count("\n") + 1, True))
     return out
+
+
+def _written_name(receiver: str) -> str:
+    """The name of the file a literal is written to.
+
+    A fake written through a variable carries the variable's name: the
+    literal is handed to `impl.write_text(...)`, and `impl` is what the
+    test file calls it. A fake written to a path carries the name of
+    the file at the end of that path: the literal is handed to
+    `(fake / "ssh").write_text(...)`, and `ssh` is what the file is
+    called.
+    """
+    receiver = receiver.strip()
+    # The last component of a path: `"ssh"` in `(fake / "ssh")`.
+    tail = re.search(r'"([^"]+)"\s*\)?\s*$', receiver)
+    if tail:
+        return tail.group(1)
+    # A plain identifier: `impl` in `impl`.
+    plain = re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', receiver)
+    if plain:
+        return plain.group(0)
+    # Anything else is still identified by what it wrote to, so the
+    # name never falls back to a line number.
+    return receiver or "<unnamed>"
 
 
 def find_risky_fakes():
@@ -137,7 +174,7 @@ def find_risky_fakes():
                 continue
             risky.append({
                 "file": path,
-                "name": name or f"<written at line {line}>",
+                "name": name,
                 "line": line,
                 "body": body,
                 "var": var_match.group(1),
@@ -173,16 +210,20 @@ def extract_body(source: str, body: str) -> str:
 def case_the_scan_finds_the_fakes(failures):
     """The scan has to find the fakes, or it proves nothing. Each one it
     finds is named, so a fake that stops being risky shows up as a
-    change in the list."""
+    change in the list.
+
+    A fake is named by the file it lives in and the name it is bound
+    to.
+    """
     risky = find_risky_fakes()
     if not risky:
         fail(failures, "scan: no risky fakes were found at all")
         return
-    found = {(f["file"].name, f["line"]) for f in risky}
+    found = {(f["file"].name, f["name"]) for f in risky}
     expected = {
-        ("test_agent_fix_pr.py", 85),
-        ("test_lane_rustc.py", 265),
-        ("test_lane_settled.py", 162),
+        ("test_agent_fix_pr.py", "FAKE_IMPLEMENTER"),
+        ("test_lane_rustc.py", "impl"),
+        ("test_lane_settled.py", "body"),
     }
     missing = expected - found
     if missing:
