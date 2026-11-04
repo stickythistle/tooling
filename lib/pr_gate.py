@@ -37,6 +37,18 @@ PENDING_REVIEW_STATE = "PENDING"
 # its `status`, where `COMPLETED` is the only finished value.
 PENDING_STATUS_CONTEXTS = ("PENDING", "EXPECTED")
 
+# The conclusions that leave a finished `CheckRun` acceptable. A check
+# run that has finished and failed reports `status: "COMPLETED"` with
+# `conclusion: "FAILURE"`, so `COMPLETED` alone says only that the run
+# ended, not that it passed. `NEUTRAL` and `SKIPPED` are GitHub's
+# "nothing to complain about" conclusions, and a ruleset that names a
+# skipped check is satisfied by it.
+GREEN_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED")
+
+# The `state` that leaves a finished `StatusContext` acceptable. A
+# status context has no conclusion of its own.
+GREEN_STATUS_STATE = "SUCCESS"
+
 
 class Malformed(Exception):
     """A fetched entry carries a shape outside the API's.
@@ -177,6 +189,59 @@ def pending_checks(checks: list) -> bool:
             if isinstance(state, str) and state in PENDING_STATUS_CONTEXTS:
                 return True
     return False
+
+
+def check_green(entry: dict) -> bool:
+    """True when one rollup entry is finished and acceptable.
+
+    A `CheckRun` is acceptable when it has finished *and* its
+    conclusion is one GitHub counts as a pass. A finished run whose
+    conclusion is missing is unknown, and unknown is not acceptable: a
+    check the tool cannot read has not been shown to pass.
+
+    A `StatusContext` is acceptable when its state is `SUCCESS`. A
+    context in any other state has either failed or not finished.
+    """
+    if not isinstance(entry, dict):
+        return False
+    typename = entry.get("__typename")
+    if typename == "CheckRun":
+        if entry.get("status") != "COMPLETED":
+            return False
+        conclusion = entry.get("conclusion")
+        return isinstance(conclusion, str) and conclusion in GREEN_CONCLUSIONS
+    if typename == "StatusContext":
+        return entry.get("state") == GREEN_STATUS_STATE
+    # An entry of an unknown shape is not one this tool can vouch for.
+    return False
+
+
+def failing_checks(checks: list) -> list:
+    """Return the names of the checks in the rollup that are not green.
+
+    A check that is still running is not "failing": it has not had its
+    chance yet. This reader answers only the question of a check that
+    has finished and is not acceptable, which is the question a merge
+    decision has to answer. `pending_checks` answers the other one.
+    """
+    out = []
+    for entry in checks:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("__typename") == "CheckRun":
+            if entry.get("status") != "COMPLETED":
+                continue
+        elif entry.get("__typename") == "StatusContext":
+            state = entry.get("state")
+            if isinstance(state, str) and state in PENDING_STATUS_CONTEXTS:
+                continue
+        else:
+            continue
+        if check_green(entry):
+            continue
+        name = entry.get("name") or entry.get("context")
+        out.append(name if isinstance(name, str) and name else "(unnamed)")
+    return out
 
 
 def validate_comments(comments: list) -> list:

@@ -1,0 +1,77 @@
+# Per-repository settings for the pull-request loop.
+#
+# Copy to ~/.config/hermes-tools/pr-loop.toml and edit. The path is the
+# operator's own, because this file names what a repository is allowed to
+# do -- not what the repository contains.
+#
+# One table per repository, named `owner/name`. A repository with no
+# table here is a repository nobody configured: it runs in shadow mode
+# with no protections, and nothing merges there.
+#
+# `pr-loop-config owner/name` prints what this file says, and refuses a
+# file whose second repository is broken.
+
+# A repository whose pull requests are not stacked. GitHub's squash merge
+# replaces the loop's own squash and force-push, so the branch is never
+# rewritten for the sake of the merge.
+#
+# The name is quoted because a bare key may not contain a slash: the
+# table is named owner/name, and TOML's bare keys stop at the slash.
+["harbord-infra/docs"]
+auto_merge = "shadow"
+merge_method = "squash"
+
+# The ruleset that holds the merge authority. It must exist on the
+# repository, be enforced, and carry all of:
+#
+#   - one approving review (required_approving_review_count >= 1);
+#   - the most recent push approved (require_last_push_approval);
+#   - stale approvals dismissed on push
+#     (dismiss_stale_reviews_on_push);
+#   - the required status checks (required_status_checks);
+#   - linear history (required_linear_history);
+#   - this repository's merge method in allowed_merge_methods.
+#
+# The tool reads the ruleset and refuses when any of these is missing or
+# weaker. An unknown prerequisite is not a satisfied one, so a
+# repository whose ruleset cannot be read never auto-merges.
+ruleset = "loop-merge"
+
+# The checks the decision depends on. Every one of these must be in the
+# ruleset's own list, or the tool refuses: a configuration that asks
+# for more than the ruleset enforces is a configuration that believes
+# it is protected where it is not.
+#
+# The check goes both ways. A check the ruleset requires and this file
+# does not name is still required to be green, because the ruleset is
+# what will do the merging. Every check the decision depends on --
+# these and the ruleset's own -- must be reported on the pull request
+# and must have passed.
+required_checks = ["Gates"]
+
+# Paths a loop must not merge on its own, beyond whatever CODEOWNERS
+# already covers. A pull request touching one of these is approved, not
+# merged, and is labelled `pr-loop:needs-merge`.
+protected_paths = [
+  ".github/workflows/",
+  "gates.toml",
+  "bin/pr-loop-gate",
+  "bin/pr-auto-merge",
+  "bin/pr-merge-ledger",
+  "lib/auto_merge.py",
+  "lib/merge_ledger.py",
+]
+
+# Where the CODEOWNERS file lives. A repository with no such file has no
+# code owners, which is not an error; a file that exists and cannot be
+# read is, because then the protected paths are unknown.
+codeowners = "CODEOWNERS"
+
+# Whether a pull request may auto-merge when its implementer and its
+# reviewer run the same model family.
+#
+# UNDECIDED. The issue asks the question and no answer has been given.
+# The value is left out, which is not a permission: `auto_merge = "on"`
+# is refused until it is set to `true` or `false` explicitly.
+#
+# allow_same_family = true

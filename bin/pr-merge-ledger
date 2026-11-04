@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""Record what a person did with a pull request the loop had decided about,
+and report how often the two disagreed.
+
+    pr-merge-ledger record-outcome <owner/repo> <pr> <head> <outcome>
+                                  [--by LOGIN] [--ledger FILE]
+    pr-merge-ledger reconcile [--ledger FILE]
+    pr-merge-ledger rate [--ledger FILE]
+
+The outcome is one of `merged`, `changes_requested` or `closed`. `merged`
+is agreement; the other two are disagreement, and they are told apart
+because they say different things.
+
+The rate counts only decisions a person answered. An unanswered decision
+is not agreement: nothing has been said against it, and nothing has
+been said for it either. Counting it as agreement would make the rate
+fall as the loop got slower, which is the wrong direction for the
+number that decides a rollout.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import merge_ledger  # noqa: E402
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pr-merge-ledger",
+        description="Record a person's outcome against the loop's decision, "
+                    "and report the disagreement rate.",
+    )
+    parser.add_argument("--ledger", default=None,
+                        help=f"the ledger to read and write "
+                             f"(default {merge_ledger.LEDGER})")
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    r = sub.add_parser("record-outcome",
+                       help="record what a person did with a pull request")
+    r.add_argument("repo", help="owner/repo")
+    r.add_argument("pr", help="pull request number")
+    r.add_argument("head", help="the head the outcome happened on")
+    r.add_argument("outcome", help="merged, changes_requested or closed")
+    r.add_argument("--by", default="", help="who did it")
+
+    sub.add_parser("reconcile", help="pair each decision with its outcome")
+    sub.add_parser("rate", help="report the disagreement rate")
+
+    args = parser.parse_args(argv)
+    path = Path(args.ledger) if args.ledger else merge_ledger.LEDGER
+
+    if args.cmd == "record-outcome":
+        if "/" not in args.repo:
+            print(f"ERR repo: {args.repo} is not owner/repo", file=sys.stderr)
+            return 2
+        if not args.pr.isdigit():
+            print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
+            return 2
+        if args.outcome not in merge_ledger.OUTCOMES:
+            print(f"ERR outcome: {args.outcome} is not one of "
+                  f"{', '.join(merge_ledger.OUTCOMES)}", file=sys.stderr)
+            return 2
+        written = merge_ledger.record_outcome(
+            path, args.repo, args.pr, args.head, args.outcome, args.by)
+        print("recorded" if written else "already recorded")
+        return 0
+
+    if args.cmd == "reconcile":
+        pairs = merge_ledger.reconcile(path)
+        if not pairs:
+            print("no decisions recorded")
+            return 0
+        for pair in pairs:
+            outcome = pair["outcome"] or "unanswered"
+            agrees = ("agrees" if pair["agrees"] else
+                      "disagrees" if pair["answered"] else "")
+            print(f"{pair['repo']}#{pair['pr']} {pair['head'][:7]} "
+                  f"{pair['mode']} {outcome} {agrees}".rstrip())
+        return 0
+
+    if args.cmd == "rate":
+        if not path.exists():
+            print(f"no ledger at {path}")
+            return 0
+        print(merge_ledger.summary(path))
+        return 0
+
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
