@@ -1,0 +1,261 @@
+#!/usr/bin/env bash
+# Run the agentic review lane: a reviewer that executes the change against
+# the reviewed head, not one that reads the diff and guesses.
+#
+# The diff-reading reviewer cannot find a race, an input shape the tests
+# never try, or a helper that swallows an exit status -- those show only
+# when the code runs.
+#
+# This driver is that lane: it hands the reviewer the diff, the repo's own
+# hazard notes, and the bench, and then it holds the reviewer to one rule.
+# A finding carries the command that reproduces it and the output that
+# command produced, run against the reviewed head.
+#
+# The phase records the head it ran against, and refuses to run when the
+# worktree's head differs from that head. Prints the path to the findings
+# file on stdout.
+
+set -euo pipefail
+
+# readlink -f: installed as a symlink on PATH, and lib/ sits beside the real file.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
+BASE=""
+HEAD_SHA=""
+PROFILE=""
+TIMEOUT_OPT=""
+EXTRA=""
+
+usage() {
+	cat <<'EOF'
+usage: review-execute <worktree> --head SHA [--base REF] [--profile NAME]
+                      [--extra TEXT] [--timeout SECONDS]
+
+  <worktree>  The checkout under review. It is where the reproductions run.
+  --head SHA  The commit the review is about. The driver refuses to run
+              unless the worktree's HEAD is exactly this commit: a
+              reproduction run against another commit proves nothing.
+  --base REF  The far side of the diff. Default: origin/main.
+  --profile   Hermes profile, which selects the model and the host it runs on.
+  --extra     Text appended to the prompt: the change's intent, and the
+              product decisions behind it.
+  --timeout   Seconds before the review is abandoned. Resolved per profile:
+              the explicit value, then REVIEW_TIMEOUT_<PROFILE>, then
+              HERMES_REVIEW_TIMEOUT, then 900.
+
+Prints the path to the findings file on stdout.
+EOF
+}
+
+# Positional collection, not "first argument wins": the flags may come
+# before or after the worktree, and a flag's value must never be mistaken
+# for the worktree.
+POSITIONAL=()
+while [[ $# -gt 0 ]]; do
+	case "$1" in
+	--head) HEAD_SHA="$2"; shift 2 ;;
+	--base) BASE="$2"; shift 2 ;;
+	--profile) PROFILE="$2"; shift 2 ;;
+	--extra) EXTRA="$2"; shift 2 ;;
+	--timeout) TIMEOUT_OPT="$2"; shift 2 ;;
+	-h | --help) usage; exit 0 ;;
+	*) POSITIONAL+=("$1"); shift ;;
+	esac
+done
+[[ ${#POSITIONAL[@]} -eq 1 ]] || { echo "exactly one worktree is required" >&2; usage >&2; exit 2; }
+[[ -n "$HEAD_SHA" ]] || { echo "--head is required" >&2; usage >&2; exit 2; }
+WORKTREE="${POSITIONAL[0]}"
+
+# The worktree is resolved through git, so a relative path or a trailing
+# slash names the same tree the reviewer will run in.
+[[ -d "$WORKTREE" ]] || { echo "worktree is not a directory: $WORKTREE" >&2; exit 2; }
+WORKTREE=$(cd "$WORKTREE" && git rev-parse --show-toplevel)
+
+# The head binding, before anything else runs. The whole phase is evidence
+# about one commit, so a worktree at another commit is refused, not
+# reported on.
+ACTUAL_HEAD=$(git -C "$WORKTREE" rev-parse HEAD)
+if [[ "$ACTUAL_HEAD" != "$HEAD_SHA" ]]; then
+	echo "refusing to review: $WORKTREE is at ${ACTUAL_HEAD:0:12} but the review was asked to run against ${HEAD_SHA:0:12}" >&2
+	exit 1
+fi
+
+BASE=${BASE:-origin/main}
+BASE_SHA=$(git -C "$WORKTREE" rev-parse --verify "$BASE" 2>/dev/null || true)
+if [[ -z "$BASE_SHA" ]]; then
+	echo "refusing to review: base '$BASE' does not resolve in $WORKTREE" >&2
+	exit 1
+fi
+
+WORK=$(mktemp -d -t hermes-review-execute-XXXXXX)
+DIFF="$WORK/changes.diff"
+FINDINGS="$WORK/findings.json"
+HAZARDS="$WORK/hazards.md"
+
+# Written outside the repository: a stray file in the workspace is a defect
+# of its own, and a dirty tree would corrupt the next round.
+git -C "$WORKTREE" diff "$BASE_SHA...$ACTUAL_HEAD" >"$DIFF"
+if [[ ! -s "$DIFF" ]]; then
+	echo "no changes to review (against $BASE_SHA)" >&2
+	exit 1
+fi
+
+# The hazard notes: the repo's own statement of what has gone wrong here
+# before. AGENTS.md is where this repo keeps it; a project that keeps its
+# notes elsewhere can point REVIEW_HAZARDS at them.
+HAZARDS_FILE=${REVIEW_HAZARDS:-}
+if [[ -z "$HAZARDS_FILE" ]]; then
+	for candidate in AGENTS.md CLAUDE.md CONTRIBUTING.md; do
+		if [[ -f "$WORKTREE/$candidate" ]]; then
+			HAZARDS_FILE="$WORKTREE/$candidate"
+			break
+		fi
+	done
+fi
+if [[ -n "$HAZARDS_FILE" && -r "$HAZARDS_FILE" ]]; then
+	cp "$HAZARDS_FILE" "$HAZARDS"
+else
+	printf 'No hazard notes were found for this repository.\n' >"$HAZARDS"
+fi
+
+# What the reviewer may run, and what it may not.
+
+# The bench is named, not described, so the reviewer runs the project's own
+# command rather than a copy that drifts: remote-task syncs the tree to a
+# host with the toolchain and runs the recipe there, and gate-verify runs
+# the gates the diff earned.
+PROMPT=$(
+	cat <<EOF
+Review a proposed code change in the repository at $WORKTREE.
+
+The commit under review is $ACTUAL_HEAD. Every reproduction you write must
+fail against that commit, and must be a command that can be re-run there.
+
+Scope: branch against $BASE_SHA
+The complete diff is at $DIFF. Read it first, then read the surrounding source
+files in the repository for the context needed to judge each change.
+
+The repository's own hazard notes are at $HAZARDS. Read them before you
+start: they record the failures this codebase has already shipped, and a
+review that ignores them will re-report behaviour that is deliberate.
+
+## Run the code, not only read it
+
+A diff shows what changed. It does not show a race, an input shape the tests
+never use, or a helper that swallows its child's exit status. Those show only
+when the code runs, so run it.
+
+What is available to you:
+
+- The bench. If this project declares one, \`remote-task --task bench\`
+  syncs the tree to a host with the toolchain and runs the project's own
+  recipe there. It is the project's command, not a copy of it.
+- The gates. \`gate-verify $WORKTREE\` runs every gate the diff has earned.
+- The project's own tests and fixtures, in the tree, as they are.
+
+Run whatever settles the question you are asking. A finding you could have
+settled by running something, but did not, is worth less than no finding at
+all.
+
+## The rule
+
+Every finding carries:
+
+- \`reproduce\`: one command, run in $WORKTREE, that fails and shows the
+  defect. One command. Not a pipeline, not a script, not a shell function.
+- \`observed\`: the output that command actually produced, trimmed to what
+  matters.
+
+You must have run the command and pasted what it printed. A finding whose
+reproduction you have not run is dropped before anyone sees it.
+
+If a command cannot be reduced to one line, write the one line that runs it
+and make sure that one line is what you paste.
+
+Write your findings to $FINDINGS as a JSON array. Each entry:
+
+    {
+      "severity": "high" | "medium" | "low",
+      "path": "path/relative/to/the/repository/root",
+      "line": 42,
+      "claim": "what is wrong, in one sentence",
+      "reproduce": "one command that fails against $ACTUAL_HEAD",
+      "observed": "the output that command produced",
+      "recommendation": "the concrete change that fixes it"
+    }
+
+Judge the change, not the repository: a defect that predates it and that it
+does not make worse is out of scope. What the change leaves out is not — a
+member of a set it half-covers, a consumer it never updated, and a rule its
+own doc comment states and its code contradicts are all defects of the change.
+
+If the change is correct, write an empty array. A finding you cannot
+reproduce is a finding you do not have.
+
+Do not modify, create, or delete any file inside $WORKTREE. The tree under
+review is the evidence, and a reviewer that edits the evidence has destroyed
+it. Run things; do not change them.
+
+When the file is written, reply with one line: the count of findings, and
+how many of them you ran a reproduction for.
+$EXTRA
+EOF
+)
+
+PROMPT_FILE="$WORK/prompt.txt"
+printf '%s' "$PROMPT" >"$PROMPT_FILE"
+
+PROFILE_NAME="${PROFILE:-default}"
+acquire_review_slot "$PROFILE_NAME"
+acquire_gpu_lock "$PROFILE_NAME"
+TIMEOUT=$(review_timeout_for "$PROFILE_NAME" "$TIMEOUT_OPT")
+
+# The helper writes the prompt to a file under $WORK rather than as one
+# argv string, so a long brief with quotes and backticks survives intact.
+
+# 8>&- 9>&-: a hermes child holding these fds keeps the lock until it
+# exits, long after this script moves on.
+set +e
+HERMES_QUERY_ARGS=(-p "$PROFILE" -- --skills swe-reviewer --yolo)
+timeout "$TIMEOUT" "$BASH" -c '
+	. "$1/lib/common.sh"
+	shift
+	hermes_query "$@" 8>&- 9>&-
+' bash "$LIB/.." \
+	"$HERMES -m hermes_cli.main" "$PROMPT_FILE" \
+	"$WORK/stdout.txt" "$WORK/stderr.txt" \
+	"${HERMES_QUERY_ARGS[@]}"
+RC=$?
+# The 8>&- 9>&- above closed both for the child only; release them here too.
+exec 9>&-
+exec 8>&-
+set -e
+
+if [[ "$RC" -ne 0 ]]; then
+	echo "hermes exited $RC (timeout was ${TIMEOUT}s)" >&2
+	tail -20 "$WORK/stderr.txt" >&2
+	exit "$RC"
+fi
+
+if [[ ! -s "$FINDINGS" ]]; then
+	echo "hermes wrote no findings file; its reply follows" >&2
+	cat "$WORK/stdout.txt" >&2
+	exit 1
+fi
+
+# The re-run. Every reproduction is executed again here, against the worktree
+# at the reviewed head, and a finding whose reproduction passes is dropped.
+python3 "$LIB/review_execute.py" "$WORKTREE" "$FINDINGS" \
+	--head "$ACTUAL_HEAD" --out "$FINDINGS.checked"
+
+if [[ ! -s "$FINDINGS.checked" ]]; then
+	echo "review-execute: the verification pass produced nothing" >&2
+	exit 1
+fi
+
+echo "head: $ACTUAL_HEAD (against $BASE_SHA)" >&2
+cat "$WORK/stdout.txt" >&2
+echo "$FINDINGS.checked"

@@ -179,7 +179,10 @@ def main() -> int:
             failures.append(
                 f"gate {g.get('name', '?')!r} passes a glob to `bash -n`, which "
                 f"parses only the first file")
-        if "-exec" in run:
+        # `find ... -exec`, not a bare `-exec` substring: a tool whose
+        # own name ends in `-exec` is no `find -exec`, and a gate that
+        # parses it must not be rejected for that.
+        if re.search(r"\bfind\b[^|]*\s-exec\b", run):
             failures.append(
                 f"gate {g.get('name', '?')!r} uses `find -exec`, which does not "
                 f"propagate the exit status of what it runs")
@@ -412,6 +415,28 @@ def self_tests() -> int:
                 for cached in (work / "__pycache__").iterdir():
                     cached.unlink()
                 (work / "__pycache__").rmdir()
+
+    # The `find -exec` arm of the syntax-floor audit: a gate that uses
+    # `find ... -exec` cannot fail, because find fails to propagate the
+    # exit status of what it runs.
+
+    # The arm is a string check, so it is pinned with a case that must be
+    # rejected -- and with the near miss that must not be: a tool whose
+    # own name ends in `-exec` is no `find -exec`.
+    find_exec_cases = [
+        ("find -exec is rejected",
+         "find install -name '*.sh' -exec bash -n {} \\;",
+         True),
+        ("a tool named -exec is not find -exec",
+         "bash -n bin/review-execute",
+         False),
+    ]
+    for label, run, must_fail in find_exec_cases:
+        reported = bool(re.search(r"\bfind\b[^|]*\s-exec\b", run))
+        if reported != must_fail:
+            failures.append(
+                f"{label}: the find -exec check reported {reported}, "
+                f"expected {must_fail} for run={run!r}")
 
     # The real manifest's audit fires on bin/ and tests/test_*.py paths. The
     # probes name no file the `when` lists literally, so each exercises its arm.
