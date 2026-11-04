@@ -62,7 +62,8 @@ the flag, a run that commits nothing has failed, and says so.
 diff rather than from whoever wrote the dispatch.
 
 Prints the run's private directory on stdout. It holds the issue text, every
-attempt's transcript and the lane's HANDOVER.md, and is the lane's TMPDIR.
+attempt's transcript, the session name the run resumed, and the lane's
+HANDOVER.md, and is the lane's TMPDIR.
 EOF
 }
 
@@ -313,10 +314,11 @@ run() {
 	local prompt_file="$WORK/$label.prompt"
 	printf '%s' "$prompt" >"$prompt_file"
 	# Heredoc-arr args: --skills lives after `chat`, --no-restore-cwd also,
-	# and `--continue` (passed via "$@" by the retry loop) is what resumes an
-	# earlier session. Pre-chat is `-p`. timeout wraps the whole call and the
-	# subshell re-sources the helper so `hermes_query` is in scope; timeout
-	# itself cannot call a parent's shell function directly.
+	# and `--continue <name> --create-if-missing` (passed via "$@" by the
+	# retry loop) is what names this run's session. Pre-chat is `-p`.
+	# timeout wraps the whole call and the subshell re-sources the helper
+	# so `hermes_query` is in scope; timeout itself cannot call a parent's
+	# shell function directly.
 	#
 	# --kill-after is the backstop for the case KILL_AFTER's own comment
 	# describes: without it `timeout` itself can hang, waiting on a
@@ -354,6 +356,19 @@ run() {
 	fi
 	tail -3 "$WORK/$label.stdout" >&2
 }
+
+# This run's session, named before the first attempt.
+#
+# The CLI resolves `--continue <name> --create-if-missing`: the first
+# attempt creates the session, later attempts name the same one. Reading
+# the id off the agent's stderr after the attempt does not survive a kill,
+# and the CLI prints that id only once the conversation ends.
+#
+# The name is recorded in the run directory, so a post-mortem can name the
+# session a run used.
+SESSION_NAME="hermes-implement-$(basename "$WORK")"
+SESSION_NAME_FILE="$WORK/session-id"
+printf '%s\n' "$SESSION_NAME" >"$SESSION_NAME_FILE"
 
 # The process group `timeout` put itself in, or nothing. Read from
 # /proc/PID/stat field 3-after-comm (pgrp) rather than assumed to equal the
@@ -503,7 +518,7 @@ while (( i <= ATTEMPTS )); do
 		break
 	fi
 	if (( i == 1 )); then
-		run "$label" "$PROMPT"
+		run "$label" "$PROMPT" --continue "$SESSION_NAME" --create-if-missing
 	else
 		# The resume prompt names the current state (commits since
 		# the base, uncommitted files, HANDOVER.md presence) so the
@@ -554,7 +569,13 @@ $EXTRA
 Follow the same brief the first attempt got.
 EOF
 )
-		run "$label" "$REMAINING" --continue
+		# Resume *this* run's session, by name. A bare `--continue`
+		# would let the CLI pick the session: its breadcrumb, or the
+		# most recent one in this workspace, or the most recent one
+		# anywhere -- so two runs in the same worktree could resume
+		# each other's session, and the attempt would answer with the
+		# wrong context.
+		run "$label" "$REMAINING" --continue "$SESSION_NAME" --create-if-missing
 	fi
 	# A refusal does not spend an attempt. Retrying the same attempt
 	# number is safe here because wait_attempt_gone at the top of the

@@ -678,11 +678,23 @@ review_timeout_for() {
 # with the helper returning 0 unconditionally, the nightly review
 # and triage did nothing while reporting no error.
 #
-# `chat -Q` writes one `session_id: <id>` line to stdout before the answer.
-# Callers whose downstream code reads stdout must drop it -- a
-# parsed-as-json answer that suddenly starts with `session_id:` is a real
-# defect. This helper filters that line out on its way back to the file
-# the caller named.
+# `chat -Q` writes one `session_id: <id>` line before the answer. Older
+# versions wrote it to stdout; this one writes it to stderr, after a
+# blank line (`cli.py`: `print(f"\nsession_id: {id}", file=sys.stderr)`).
+#
+# The stdout copy is filtered out on its way back to the file the caller
+# named, because a caller whose downstream code reads stdout must not get
+# a parsed-as-json answer that suddenly starts with `session_id:`. That
+# filter is by position -- the first line -- so it costs nothing when
+# the agent wrote the id to stderr. It is kept because an older hermes
+# still writes it there, and because the answer itself could carry the
+# shape.
+#
+# A caller that needs the session id must read it from stderr and scan
+# for the line rather than take the first one. The id is gone on a killed
+# attempt, because the CLI prints it once the conversation ends; a run
+# that needs the session survives a kill by naming it up front, as
+# `bin/hermes-implement` does.
 #
 # The helper does NOT close fd 8 (GPU group lock) or fd 9 (review slot):
 # callers that need those closed in the child add `8>&- 9>&-` to their

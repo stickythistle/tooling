@@ -104,6 +104,13 @@ FAKE_HERMES = textwrap.dedent("""\
         query_sha = hashlib.sha256(data).hexdigest()
 
     is_continue = "--continue" in args
+    # The session the attempt was told to continue. Every attempt names
+    # one: the run fixes the name before the first attempt.
+    continue_name = ""
+    if is_continue:
+        i = args.index("--continue")
+        if i + 1 < len(args) and not args[i + 1].startswith("-"):
+            continue_name = args[i + 1]
     pid = os.getpid()
     ts = time.monotonic()
 
@@ -154,6 +161,7 @@ FAKE_HERMES = textwrap.dedent("""\
                 f"has_query_file={has_query_file} "
                 f"query_bytes={query_bytes} "
                 f"query_sha={query_sha} prev_alive={prev_alive} "
+                f"continue_name={continue_name!r} "
                 f"action={action} t={ts:.6f}\\n")
         f.flush()
 
@@ -386,12 +394,17 @@ def test_hermes_implement_holds_gpu_lock_across_retry():
         for line in calls:
             m = re.match(r"call pid=(\d+) continue=(\S+) fd8=(\S+) "
                          r"has_query_file=(\S+) query_bytes=(\d+) "
-                         r"query_sha=(\S*) prev_alive=(\S+) action=(\S+) "
+                         r"query_sha=(\S*) prev_alive=(\S+) "
+                         r"continue_name=(\S+) action=(\S+) "
                          r"t=(\S+)", line)
             assert m, f"unparseable log line: {line!r}"
             assert m.group(3) == "True", (
                 f"hermes child did not inherit fd 8 from hermes-implement: "
                 f"{line!r}")
+            # Every attempt names the run's session, so a retry resumes
+            # the session the run fixed before the first attempt.
+            assert m.group(8), (
+                f"the attempt named no session: {line!r}")
             # The agent must have been called with --query-file, and the
             # prompt file must have been readable. A hermes-implement that
             # passed the prompt as `-z "$prompt"` would fail this: the
@@ -403,11 +416,14 @@ def test_hermes_implement_holds_gpu_lock_across_retry():
             assert int(m.group(5)) > 0, (
                 f"hermes-implement's --query-file pointed at an empty or "
                 f"missing file: {line!r}")
-        # First call is attempt 1 (no --continue, legacy action=timeout),
-        # second is attempt 2 (with --continue, legacy action=do_nothing).
-        assert "continue=False" in calls[0], calls[0]
+        # First call is attempt 1 (legacy action=timeout), second is
+        # attempt 2 (legacy action=do_nothing). Every attempt names the
+        # run's session, so the retry resumes it.
+        assert "continue=True" in calls[0], calls[0]
         assert "action=timeout" in calls[0], calls[0]
         assert "continue=True" in calls[1], calls[1]
+        assert calls[0].split("continue_name=")[1].split()[0] == \
+            calls[1].split("continue_name=")[1].split()[0], calls
 
 
 def _read_attempt_prompts(run_dir: Path) -> list[str]:
@@ -454,9 +470,9 @@ def test_hermes_implement_resumes_after_one_commit_with_dirty_tree():
         calls = log.read_text().splitlines()
         assert len(calls) == 2, (
             f"expected 2 invocations, got {len(calls)}: {calls!r}")
-        # Attempt 1 (no --continue) ran commit_dirty; attempt 2
-        # (--continue) ran finish_clean.
-        assert "continue=False" in calls[0]
+        # Attempt 1 ran commit_dirty; attempt 2 ran finish_clean. Both
+        # name the run's session.
+        assert "continue=True" in calls[0]
         assert "action=commit_dirty" in calls[0], calls[0]
         assert "continue=True" in calls[1]
         assert "action=finish_clean" in calls[1], calls[1]
@@ -536,7 +552,7 @@ def test_hermes_implement_resumes_after_timeout_with_dirty_tree():
         assert len(calls) == 2, (
             f"expected exactly 2 invocations under a 124 then finish plan, "
             f"got {len(calls)}: {calls!r}")
-        assert "continue=False" in calls[0]
+        assert "continue=True" in calls[0]
         assert "action=timeout" in calls[0], calls[0]
         assert "continue=True" in calls[1]
         assert "action=finish" in calls[1], calls[1]
@@ -569,7 +585,7 @@ def test_hermes_implement_does_not_retry_when_finished():
         assert len(calls) == 1, (
             f"a finished attempt must not trigger a retry, got "
             f"{len(calls)} invocations: {calls!r}")
-        assert "continue=False" in calls[0]
+        assert "continue=True" in calls[0]
         assert "action=finish" in calls[0], calls[0]
 
 
@@ -1070,9 +1086,16 @@ def test_refused_resume_does_not_spend_an_attempt():
         assert len(calls) == 3, (
             f"expected 3 invocations (two refusals then a finish), got "
             f"{len(calls)}: {calls!r}")
-        # All three are attempt 1: a refusal spent no attempt, so no call
-        # carried --continue and the attempt number never advanced.
-        assert all("continue=False" in c for c in calls), (
+        # All three are attempt 1: a refusal spent no attempt, so the
+        # attempt number never advanced. Every call names the same
+        # session, because the run fixes the name before the first
+        # attempt.
+        names = set()
+        for c in calls:
+            m = re.search(r"continue_name='([^']*)'", c)
+            assert m, f"the call named no session: {c!r}"
+            names.add(m.group(1))
+        assert len(names) == 1, (
             f"a refusal spent an attempt: {calls!r}")
         assert "refused (session still owned)" in proc.stderr, (
             f"the script did not report the retry: {proc.stderr!r}")
