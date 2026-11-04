@@ -146,6 +146,10 @@ the parent changes what the child is reviewed against.
    what it left, and say what failed in the next review. So is `answered`: the
    lane pushed back on every comment and committed nothing, and its replies are
    on the threads. Rule on each one. A round that did not push still counts.
+
+   `round message refused` is also a finished round, and the lane's fault
+   rather than the code's: the commit named the round. Say so in the next
+   review's brief. A lane that names the round again gets refused again.
 7. Back to step 1.
 
 ## The cap

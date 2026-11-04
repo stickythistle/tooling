@@ -16,6 +16,7 @@ Run directly: `python3 tests/test_agent_fix_pr.py`.
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -111,6 +112,15 @@ FAKE_IMPLEMENTER = textwrap.dedent("""\
     amend)
         echo fix >>file.txt; git commit -q --amend -am "Rewritten" ;;
     answer)
+        cp "$FAKE_REPLIES" "$work/replies.json" ;;
+    commit_named)
+        # A lane commit whose message the test chooses: FAKE_COMMIT_MSG.
+        echo fix >>file.txt; git commit -qam "${FAKE_COMMIT_MSG:-Fix the thing}"
+        cp "$FAKE_REPLIES" "$work/replies.json" ;;
+    commit_with_text)
+        # A lane commit whose added line the test chooses: FAKE_COMMIT_TEXT.
+        echo "${FAKE_COMMIT_TEXT:-fix}" >>file.txt
+        git commit -qam "Fix the thing"
         cp "$FAKE_REPLIES" "$work/replies.json" ;;
     none) ;;
     esac
@@ -977,6 +987,219 @@ def test_refuses_a_rewritten_history_in_agent_fix_pr():
         # generic identity refusal.
         assert ledger(ld)[-1]["verdict"] == "history rewritten"
         assert "history rewritten" in r.stderr, r.stderr
+
+
+def test_a_round_numbered_commit_message_is_refused_before_push():
+    """A lane commit whose message names the round is refused before the
+    push. The profile's own review skills prescribe exactly this shape
+    ("Round 2: ...", "B1 (round 3) -- ..."), and nothing else in the
+    lane's path would refuse it."""
+    for message in ("Round 2: fix the thing",
+                    "round 2: fix the thing",
+                    "Fix B1 (review 3) -- the thing",
+                    "B1 (round 3) -- the thing"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, origin, head, env, ld = setup(tmp, lane="commit_named")
+            env["FAKE_COMMIT_MSG"] = message
+            r = run(env, wt)
+            assert r.returncode == 1, (message, r.stdout, r.stderr)
+            # Nothing was pushed.
+            assert git(origin, "rev-parse", BRANCH) == head, (
+                f"the round-numbered commit was pushed: {message}")
+            entry = ledger(ld)[-1]
+            assert entry["verdict"] == "round message refused", (message, entry)
+            assert entry["pushed"] is False, (message, entry)
+            # The refusal names the offending commit.
+            assert "names the round" in r.stderr, (message, r.stderr)
+
+
+def test_a_commit_message_naming_no_round_is_pushed():
+    """A message that says what the code now does is pushed as before."""
+    for message in ("Fix the thing",
+                    "Add a round-trip test",
+                    "Review the cached index"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, origin, head, env, ld = setup(tmp, lane="commit_named")
+            env["FAKE_COMMIT_MSG"] = message
+            r = run(env, wt)
+            assert r.returncode == 0, (message, r.stdout, r.stderr)
+            assert git(origin, "rev-parse", BRANCH) != head, message
+            assert ledger(ld)[-1]["verdict"] == "pushed", (message, ledger(ld)[-1])
+
+
+def test_a_word_that_is_not_a_round_is_not_refused():
+    """A subject that merely contains the word stays out of the rule.
+
+    A refusal the lane cannot fix costs a round for nothing.
+    """
+
+    for message in ("Round up the totals",
+                    "Add a round-robin tournament",
+                    "Call math.Round(x) for the cents"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, origin, head, env, ld = setup(tmp, lane="commit_named")
+            env["FAKE_COMMIT_MSG"] = message
+            r = run(env, wt)
+            assert r.returncode == 0, (message, r.stdout, r.stderr)
+            assert git(origin, "rev-parse", BRANCH) != head, message
+            assert ledger(ld)[-1]["verdict"] == "pushed", (message, ledger(ld)[-1])
+
+
+def test_a_round_glued_to_another_word_is_not_refused():
+    """The pattern is word-bounded, so the word must stand alone.
+
+    "xRound 2" and "prreview 3" carry the shape inside a longer word.
+    """
+    for message in ("Fix xRound 2 of the thing",
+                    "Fix prreview 3 of the thing"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, origin, head, env, ld = setup(tmp, lane="commit_named")
+            env["FAKE_COMMIT_MSG"] = message
+            r = run(env, wt)
+            assert r.returncode == 0, (message, r.stdout, r.stderr)
+            assert git(origin, "rev-parse", BRANCH) != head, message
+            assert ledger(ld)[-1]["verdict"] == "pushed", (message, ledger(ld)[-1])
+
+
+def test_a_round_word_in_the_commit_body_is_refused():
+    """The body of a commit message is read too, not only its subject.
+
+    "Addressed in Round 2 of the review." names the round, so it is
+    refused wherever in the message it sits.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="commit_named")
+        env["FAKE_COMMIT_MSG"] = "Fix the thing"
+        # The phrase goes in the body, away from the subject.
+        impl = tmp / "fakebin" / "implementer"
+        src = impl.read_text().replace(
+            'git commit -qam "${FAKE_COMMIT_MSG:-Fix the thing}"',
+            'git commit -qam "${FAKE_COMMIT_MSG:-Fix the thing}" '
+            '-m "Addressed in Round 2 of the review."')
+        impl.write_text(src)
+        impl.chmod(0o755)
+        r = run(env, wt)
+        assert r.returncode == 1, (r.stdout, r.stderr)
+        assert git(origin, "rev-parse", BRANCH) == head
+        assert ledger(ld)[-1]["verdict"] == "round message refused", ledger(ld)[-1]
+
+
+def test_source_naming_the_round_is_not_refused():
+    """Only the commit message is checked.
+
+    The source a lane adds carries the same words for its own reasons:
+    a test fixture, a summary this loop prints, a standard library's
+    rounding. A guard that refuses those cannot be worked around.
+    """
+
+    for text in ("Round 2 of the review",
+                 "This is round 3 of the work",
+                 "See review 12 for the reason"):
+        with tempfile.TemporaryDirectory() as t:
+            tmp = Path(t)
+            wt, origin, head, env, ld = setup(tmp, lane="commit_with_text")
+            env["FAKE_COMMIT_TEXT"] = text
+            r = run(env, wt)
+            assert r.returncode == 0, (text, r.stdout, r.stderr)
+            assert git(origin, "rev-parse", BRANCH) != head, (
+                f"the round-naming source was not pushed: {text}")
+            assert ledger(ld)[-1]["verdict"] == "pushed", (text, ledger(ld)[-1])
+
+
+def test_the_loops_own_summary_line_is_not_refused():
+    """The loop's own output format is a string the loop itself prints.
+
+    `agent-fix-pr` prints "Review round 1 (review 99): **pushed**". A lane
+    adding a case for that format must not be refused by the guard.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="commit_with_text")
+        env["FAKE_COMMIT_TEXT"] = (
+            'assert "Review round 1 (review 99): **pushed**" in joined')
+        r = run(env, wt)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert git(origin, "rev-parse", BRANCH) != head
+        assert ledger(ld)[-1]["verdict"] == "pushed", ledger(ld)[-1]
+
+
+def test_source_that_already_named_the_round_is_not_the_lanes_fault():
+    """Text already on the trunk is somebody else's.
+
+    Only the lane's own commits are read, the same way redaction-check
+    reads added lines only."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, origin, head, env, ld = setup(tmp, lane="commit")
+        # The trunk already carries the phrase.
+        (wt / "file.txt").write_text("start\nRound 2 of the review\n")
+        git(wt, "add", "file.txt")
+        git(wt, "commit", "-qm", "start")
+        git(wt, "push", "-q", "origin", BRANCH)
+        head = git(wt, "rev-parse", "HEAD")
+        # The fake gh still reports the old head, so the driver refuses on
+        # the worktree check first; point it at the new head.
+        data = json.loads(Path(env["FAKE_GH_DATA"]).read_text())
+        data["pr"]["headRefOid"] = head
+        Path(env["FAKE_GH_DATA"]).write_text(json.dumps(data))
+        r = run(env, wt)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        assert ledger(ld)[-1]["verdict"] == "pushed", ledger(ld)[-1]
+
+
+def test_the_implementer_keeps_the_hosts_github_login():
+    """The implementer reads the work item with its own `gh`, so it keeps
+    the host's login.
+
+    The lane that edits the code is the one that must not have a login,
+    and that boundary is hermes-implement's to draw. Stripping the
+    credentials here instead would take them from the implementer's own
+    `gh issue view`, and the lane would be handed an empty work item.
+
+    The real gh is used, under a name the test's fake gh does not own, so
+    the answer depends on the real authentication and not on the canned
+    JSON the fake serves. `gh auth status` is the check: with no
+    credential it reports "not logged into any GitHub hosts", and with a
+    credential it names the token it found.
+    """
+    real_gh = shutil.which("gh")
+    if not real_gh:
+        raise AssertionError("gh is not on PATH; this test needs the real one")
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        wt, _, _, env, ld = setup(tmp, lane="commit")
+        # A name the fake gh leaves unanswered.
+        realgh = tmp / "fakebin" / "realgh"
+        realgh.write_text(f'#!/bin/sh\nexec "{real_gh}" "$@"\n')
+        realgh.chmod(0o755)
+        # The implementer checks its own login, the way the credential-free
+        # lane is expected to find none.
+        impl = tmp / "fakebin" / "implementer"
+        src = impl.read_text().replace(
+            "work=$(mktemp -d)",
+            'work=$(mktemp -d)\n'
+            'realgh auth status >"$work/auth.txt" 2>&1 || true\n')
+        impl.write_text(src)
+        impl.chmod(0o755)
+        # A token the real gh finds and tries. The token is invalid, so
+        # gh reports a failed login -- but it found one, which is the
+        # difference this test is about.
+        env["GH_TOKEN"] = "gho_a_token_that_is_not_real"
+        env["GH_CONFIG_DIR"] = str(tmp / "empty-gh-config")
+        Path(env["GH_CONFIG_DIR"]).mkdir(parents=True, exist_ok=True)
+        r = run(env, wt)
+        assert r.returncode == 0, (r.stdout, r.stderr)
+        work = Path(ledger(ld)[-1]["work"])
+        auth = (work / "auth.txt").read_text()
+        # gh found the token and tried it, and reported no credential
+        # missing.
+        assert "not logged into any GitHub hosts" not in auth, auth
+        assert "GH_TOKEN" in auth, auth
 
 
 if __name__ == "__main__":

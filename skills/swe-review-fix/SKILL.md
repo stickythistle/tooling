@@ -45,9 +45,11 @@ it would widen the PR.
 - New commits on top of the branch's head. Never amend, rebase, reset or
   squash: the caller refuses to push a branch whose history moved, and the
   reviewer reads this round as the commits added since their review.
-- Never push, never open or edit a pull request, never post on GitHub.
+- Never push, never open or edit a pull request, never post on GitHub. The
+  caller pushes the branch and posts your replies.
 - Commit subjects say what the code now does. No review numbers, round
-  numbers, or reviewer names in commits or source.
+  numbers, or reviewer names in commits or source. The caller checks the
+  commit message: "Round 2" is a refusal, "round-robin" passes.
 - Run the verification command the brief gives until it passes, as in
   `swe-updater`'s Phase 4.
 - **Experiments happen in a scratch copy, never in the worktree you are
