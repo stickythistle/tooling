@@ -34,6 +34,32 @@ A non-zero exit, or no findings file, means no review happened, never that the
 review found nothing. Reviewers have timed out silently and read a diff
 backwards.
 
+## The lane that runs the code
+
+Reading the diff finds what is visible in the diff. A race, an input shape the
+tests never use, and a helper that swallows its child's exit status show only
+when the code runs, so the second lane runs it.
+
+```bash
+hermes-review-pr --pr N --phase execute [--answers FILE] [--timeout SECONDS]
+```
+
+The reviewer gets the diff, the repository's own hazard notes (`AGENTS.md`, or
+whatever `REVIEW_HAZARDS` points at), and the bench: `remote-task --task
+bench` for the project's own recipe, and `gate-verify` for the gates the
+diff has earned.
+
+One rule holds it to account: **a finding carries the command that reproduces
+it and the output it produced.** The command is run again against
+the reviewed head before the finding reaches `EXECUTION_NOTES.json`, and a
+finding whose reproduction passes is dropped.
+
+The tally counts every finding, including the dropped ones, so the discard
+count is visible, not silent.
+
+The phase refuses to run when the worktree's head differs from the head it
+was asked to review, and it records the head it ran against.
+
 ## Verify before reporting
 
 Read the findings file, then check every finding against the real source:

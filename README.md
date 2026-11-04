@@ -163,6 +163,66 @@ it was built on, and the trees are known by name rather than guessed from
 `git cherry`. `remote-prune --prune --tree <name>` removes that tree and
 its `_prove` copy on every lane, in the same coordinator step as the merge.
 
+## The review that runs the code
+
+`hermes-review-pr --phase review` sends the diff to a second model, and that
+model reads. It finds what is visible in the diff, and it cannot find a race,
+an input shape the tests never try, or a helper that swallows an exit.
+
+`hermes-review-pr --phase execute` is the lane that runs it. The reviewer
+gets the diff, the repository's hazard notes (`AGENTS.md`, or whatever
+`REVIEW_HAZARDS` points at), and the bench: `remote-task --task bench` for
+the recipe, `gate-verify` for the gates the diff earned.
+
+One rule holds the lane to account: **a finding carries the command that
+reproduces it and the output that command produced.** The command is run
+again against the reviewed head before the finding reaches the findings
+file.
+
+Nothing is dropped silently — every finding lands in one of four statuses,
+and the tally counts them all:
+
+| | |
+|---|---|
+| `reproduced` | the command ran and failed on the reviewed head |
+| `not-reproduced` | the command ran and passed |
+| `no-reproduction` | the finding carried no command |
+| `reproduction-error` | the command did not run, or changed the tree |
+
+A command that never ran says nothing about the defect, so it is no
+reproduction. Not found, not executable, timed out, killed by a signal, or
+refused before it started are all `reproduction-error`.
+
+A kept finding's `observed` is the re-run's own output; the reviewer's text
+is kept beside it as `claimed_output`.
+
+What is enforced is the outcome, not the spelling of the command. The tree
+is compared before and after every reproduction, and one that changed it is
+a `reproduction-error`; the tree then goes back to the reviewed head.
+
+The worktree must be clean before the lane starts. A restore puts the tree
+back with `reset --hard` and `clean -ffdx`, so on a developer's working tree
+it would take their uncommitted edits. The lane refuses a dirty tree.
+
+A reproduction still runs with this process's environment and can reach the
+network. This lane prevents neither: a write is caught after the fact, and a
+network call by neither the tree check nor the program list.
+
+Preventing it means a sandbox, which is the owner's call because it changes
+what runs on the host. The list of refused programs is a first pass, not a
+guarantee.
+
+This lane needs a shell because a reproduction is a shell command the
+reviewed project defines. `bin/finding-verify` in #181 takes the opposite
+approach, a closed allow-list parsed into argv.
+
+The phase records the head it ran against, and refuses to run when the
+worktree's head differs from that head — exactly, never by ancestry.
+
+The reproductions run in a separate detached worktree at the reviewed head,
+because the artifact worktree carries the review's own commits and a
+reproduction run there would be evidence about a commit nobody reviewed.
+
 ## Setup
 
     cp hosts.env.example ~/.config/agent-tools/env    # then edit

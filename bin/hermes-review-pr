@@ -13,6 +13,7 @@ LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 
 BIN_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
 SCRUTINIZE="$BIN_DIR/../skills/hermes-review/scripts/hermes-scrutinize.sh"
+EXECUTE="$BIN_DIR/review-execute"
 
 HERMES=${HERMES_PYTHON:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent/venv/bin/python}
 PR=""
@@ -25,7 +26,7 @@ STACK=0
 
 usage() {
 	cat <<'EOF'
-usage: hermes-review-pr --pr N [--phase readback|review] [--answers FILE]
+usage: hermes-review-pr --pr N [--phase readback|review|execute] [--answers FILE]
                         [--profile NAME] [--timeout SECONDS] [--stack]
 
 readback  Ask what it thinks the scope is, what it will check, what it treats as
@@ -34,6 +35,11 @@ readback  Ask what it thinks the scope is, what it will check, what it treats as
 review    Do the review. --answers FILE is folded into the prompt above the
           standing priors, so a decision made once does not have to be
           rediscovered.
+execute   Do the review in the lane that runs the code. The reviewer gets the
+          diff, the repo's hazard notes, and the bench, and every finding it
+          reports carries the command that reproduces it and the output that
+          command produced. A finding without a reproduction is dropped. Writes
+          EXECUTION_NOTES.json and stops.
 
 --stack   Review the top of the PR's stack against the default branch, once,
           and attribute each finding to the PR whose diff introduced the line
@@ -68,8 +74,8 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$PHASE" in
-readback | review) ;;
-*) echo "--phase must be readback or review" >&2; exit 2 ;;
+readback | review | execute) ;;
+*) echo "--phase must be readback, review or execute" >&2; exit 2 ;;
 esac
 
 # The readback phase briefs the reviewer on one PR's diff. In stack mode the
@@ -116,6 +122,7 @@ PRIORS="$REVIEW_PRIORS"
 [[ -r "$PRIORS" ]] || { echo "priors file not readable: $PRIORS" >&2; exit 2; }
 
 [[ -x "$SCRUTINIZE" ]] || { echo "scrutinize script not executable: $SCRUTINIZE" >&2; exit 2; }
+[[ -x "$EXECUTE" ]] || { echo "review-execute not executable: $EXECUTE" >&2; exit 2; }
 
 REPO_DIR=$(git rev-parse --show-toplevel)
 cd "$REPO_DIR"
@@ -214,6 +221,51 @@ commit_artifact() { # path... subject
 
 $HEAD_REF at $REVIEWED_SHA, against $BASE_REF, with $PROFILE."
 }
+
+if [[ "$PHASE" == execute ]]; then
+	# The lane runs the code, so it needs a checkout whose HEAD is exactly
+	# the commit under review. The artifact worktree cannot be that: by
+	# this phase its HEAD is a readback or findings commit on the PR head.
+
+	# A separate detached worktree at the reviewed head gives the lane a
+	# tree it can run in without disturbing the artifact worktree or the
+	# branch the artifacts live on.
+	REVIEWED_SHA=$(git rev-parse "$(git config --get "$HEAD_KEY")")
+	EXEC_WT="$WT_ROOT/review-pr-$PR-exec"
+	if [[ -e "$EXEC_WT" ]]; then
+		git worktree remove --force "$EXEC_WT"
+	fi
+	git worktree add --detach "$EXEC_WT" "$REVIEWED_SHA" --quiet
+
+	# The head the lane is asked to review is the head the worktree is at.
+	# A mismatch is refused, not reported on: a reproduction run against
+	# another commit proves nothing about the reviewed one.
+	EXECUTE_ARGS=(--head "$REVIEWED_SHA" --base "origin/$BASE_REF" --profile "$PROFILE")
+	if [ -n "$TIMEOUT_PASSED" ]; then
+		EXECUTE_ARGS=(--timeout "$TIMEOUT_OPT" "${EXECUTE_ARGS[@]}")
+	fi
+
+	EXECUTE_EXTRA=$(cat "$PRIORS")
+	if [[ -n "$ANSWERS" ]]; then
+		[[ -r "$ANSWERS" ]] || { echo "answers file not readable: $ANSWERS" >&2; exit 2; }
+		EXECUTE_EXTRA=$'DECISIONS FROM THE BRIEFING. These answer questions you raised, and they\noverride your own scope judgement where the two disagree.\n\n'"$(cat "$ANSWERS")"$'\n\n'"$EXECUTE_EXTRA"
+	fi
+	EXECUTE_ARGS+=(--extra "$EXECUTE_EXTRA")
+
+	EXEC_FINDINGS=$("$EXECUTE" "$EXEC_WT" "${EXECUTE_ARGS[@]}")
+
+	# The artifact lands in the artifact worktree, and the branch it is on
+	# names the head it is about. The execution worktree is left in place:
+	# a reader who wants to re-run a reproduction needs the tree it ran in.
+	cp "$EXEC_FINDINGS" "$WT/EXECUTION_NOTES.json"
+	commit_artifact EXECUTION_NOTES.json "review(pr-$PR): execution findings against $HEAD_REF"
+
+	echo "worktree: $WT"
+	echo "branch:   $BRANCH (from origin/$HEAD_REF, not pushed)"
+	echo "exec wt:  $EXEC_WT (detached at $REVIEWED_SHA)"
+	echo "findings: $WT/EXECUTION_NOTES.json"
+	exit 0
+fi
 
 if [[ "$PHASE" == readback ]]; then
 	acquire_review_slot "$PROFILE"
