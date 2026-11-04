@@ -81,6 +81,44 @@ the first failure.
 | `pr-ready`        | take a PR out of draft, refusing while the work behind it is unfinished |
 | `issue-grade`     | grade open issues by size and context, and route each to a lane |
 
+## Review findings
+
+Two tools sit between a reviewer model and the person deciding.
+
+`finding-check <worktree> <findings.json>` locates each finding in the
+tree: it corrects a drifted line number, flags a `***` the reviewer wrote
+into its own quote, and says whether the location is inside the change. It
+never drops a finding — a malformed entry comes back annotated in its place.
+
+`finding-verify <worktree> <findings.json>` then verifies the located ones.
+It gathers the evidence first — the enclosing block, the diff hunk, and the
+output of `settled_by` when that is one of four read-only forms (`file:`,
+`grep:`, `git-log:`, `git-show:`) — and asks the model for one verdict per
+finding: `holds`, `does-not-hold` or `cannot-settle`. An answer whose quote
+is not in the evidence is recorded as `cannot-settle`. Every finding comes
+back, with `verdict` and `evidence` added; the decider still decides.
+
+The diff hunk is the branch's diff against its base, so `--base REF` names
+the base and defaults to `origin/main`; the default is resolved to the fork
+point, the same way `finding-check` resolves it. A `git-log:` or `git-show:`
+revision is resolved to a commit before it runs, so a git option cannot
+reach the argv of a form documented as read-only.
+
+The profile is `VERIFY_PROFILE`, and the model it names is only used after
+it clears the known-answer controls in `VERIFY_CONTROLS`: archived findings
+with known verdicts, one of them false. A profile that fails the false one
+is not used.
+
+    VERIFY_PROFILE=small \
+    VERIFY_CONTROLS=/path/to/controls.json \
+    VERIFY_MODEL='<tool-free model command>' \
+    finding-verify /path/to/worktree findings.json
+
+`VERIFY_MODEL` is the model command; it is split into argv and the prompt
+arrives on its stdin, so no command text is evaluated. It must be a call
+that gives the model no tools, and it is run as given, so the tool cannot
+enforce that; which command it is depends on the operator's agent.
+
 Exit 3 means *unprovable*: the gate gathered no evidence either way.
 `gate-verify` reports it on its own line, because a gate that measured nothing
 must not appear in a list headed "passed".

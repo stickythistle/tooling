@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""Verify located reviewer findings with bounded, read-only evidence.
+
+The tool annotates every finding in place. Only findings whose finding-check
+status is `located` reach the model; malformed and unlocated entries keep
+their state and are handed to the decider.
+
+A verification model gets one call per finding and a closed answer
+vocabulary. Its answer must quote the evidence verbatim. The profile is
+used only after it clears the archived known-answer control, including the
+false claim; without that evidence the tool refuses to run the model.
+
+`VERIFY_MODEL` must be a call that gives the model no tools. It is run as
+given, so the tool cannot enforce that.
+
+`settled_by` is data, never a command line. Only the read-only forms in
+ALLOWED_SETTLED_BY are accepted, and each is parsed into a fixed argv. A
+`git-log:` or `git-show:` revision is resolved to a commit before it is
+used, so a git option cannot ride into the argv of a read-only form.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+from pathlib import Path
+from typing import NoReturn
+
+USAGE = "usage: finding-verify <worktree> <findings.json> [--base REF]"
+VERDICTS = ("holds", "does-not-hold", "cannot-settle")
+MAX_EVIDENCE_BYTES = 200_000
+MAX_FILE_LINES = 200
+MAX_DIFF_LINES = 400
+MAX_COMMAND_LINES = 100
+
+# A section marker names a part of the evidence; it is not evidence. The
+# markers are printed with this prefix and carry no `E<number>|` address,
+# so they cannot be quoted as a decision.
+SECTION_MARKER = "=== "
+
+# The branch's diff is taken against this ref unless the caller names
+# another. `bin/finding-check` uses the same default, so the two tools
+# agree on which change a finding belongs to.
+DEFAULT_BASE = "origin/main"
+
+# The archived controls are the gate on a model profile. They are supplied
+# by the operator because they are project facts; this repository cannot
+# manufacture empirical results about a model it does not own.
+CONTROL_ENV = "VERIFY_CONTROLS"
+
+# A settled_by value names a read-only command and its arguments. Only these
+# command names are accepted: `file:` reads one in-worktree file, `grep:`
+# searches one in-worktree path, `git-log:` and `git-show:` name a revision
+# and a path. The argument is parsed here and executed as argv, never eval.
+ALLOWED_SETTLED_BY = {
+    "file",
+    "grep",
+    "git-log",
+    "git-show",
+}
+
+
+def die(message: str) -> "NoReturn":
+    sys.stderr.write(message + "\n")
+    sys.exit(2)
+
+
+def _type_name(value: object) -> str:
+    if isinstance(value, bool):
+        return "bool"
+    return type(value).__name__
+
+
+def safe_path(worktree: Path, raw: str) -> Path | None:
+    """Resolve a worktree-relative path, refusing escapes and symlinks."""
+    if not raw or "\x00" in raw:
+        return None
+    root = worktree.resolve(strict=True)
+    try:
+        candidate = (root / raw).resolve(strict=False)
+        candidate.relative_to(root)
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return candidate
+
+
+def git_path(worktree: Path, raw: str) -> str:
+    """The path as git spells it, relative to the worktree.
+
+    Git's spelling is what `git diff -- <path>` matches against, and it is
+    not the reviewer's spelling: `./a.py` and `a.py` are the same file to
+    git but not to a string comparison. A leading `.` in a directory name
+    is part of the path, so stripping a `./` prefix by characters would
+    turn `.github/workflows/gates.yaml` into `github/workflows/gates.yaml`
+    and match nothing.
+    """
+    candidate = safe_path(worktree, raw)
+    if candidate is None:
+        return ""
+    try:
+        return candidate.relative_to(worktree.resolve(strict=True)).as_posix()
+    except (OSError, RuntimeError, ValueError):
+        return ""
+
+
+def enclosing_block(lines: list[str], line: int) -> str:
+    """A bounded block around a cited line.
+
+    Python-like definitions and brace-like blocks get their nearest enclosing
+    span; otherwise the context is the surrounding lines. The result is
+    evidence, not source code to execute.
+    """
+    idx = max(0, min(len(lines) - 1, line - 1))
+    start = idx
+    end = idx
+    if lines and "def " in lines[idx]:
+        for i in range(idx, -1, -1):
+            if re.match(r"^\s*def\s+", lines[i]):
+                start = i
+                break
+        for i in range(idx + 1, len(lines)):
+            if lines[i].strip() and not lines[i][0].isspace():
+                end = i
+                break
+    elif lines and "{" in lines[idx]:
+        depth = lines[idx].count("{") - lines[idx].count("}")
+        for i in range(idx, -1, -1):
+            depth += lines[i].count("{") - lines[i].count("}")
+            if depth <= 0:
+                start = i
+                break
+        depth = 0
+        for i in range(idx, len(lines)):
+            depth += lines[i].count("{") - lines[i].count("}")
+            if depth <= 0 and i > idx:
+                end = i
+                break
+    start = max(0, start - 3)
+    end = min(len(lines) - 1, end + 3)
+    return "\n".join(lines[start:end + 1])
+
+
+def resolve_base(worktree: Path, base: str) -> str:
+    """The commit the branch's diff is taken against.
+
+    `origin/main` is resolved to the fork point, so commits main gained
+    since do not count as this branch's change. The same resolution
+    `bin/finding-check` uses, so both tools agree on which change a
+    finding belongs to.
+    """
+    if base == DEFAULT_BASE:
+        merge_base = subprocess.run(
+            ["git", "-C", str(worktree), "merge-base", DEFAULT_BASE, "HEAD"],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+        if merge_base:
+            return merge_base
+    return base
+
+
+def diff_hunk(worktree: Path, path: str, base: str) -> str:
+    """The diff hunks for a path, bounded in size.
+
+    The branch's own diff against its base is the evidence a reviewer
+    would read. Every hunk in the file is gathered, not merged into one
+    blob.
+
+    The diff is `base...HEAD`, not `HEAD`: the latter compares the
+    working tree with the last commit, which is empty on a checked-out
+    branch.
+    """
+    rel = git_path(worktree, path)
+    if not rel:
+        return ""
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "diff", "--unified=20",
+         f"{base}...HEAD", "--", rel],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return ""
+    hunks: list[str] = []
+    current: list[str] = []
+    for row in result.stdout.splitlines():
+        if row.startswith("@@"):
+            if current:
+                hunks.append("\n".join(current))
+            current = [row]
+            continue
+        if current:
+            current.append(row)
+    if current:
+        hunks.append("\n".join(current))
+    if not hunks:
+        return ""
+    text = "\n".join(hunks)
+    lines = text.splitlines()
+    if len(lines) > MAX_DIFF_LINES:
+        lines = lines[:MAX_DIFF_LINES]
+    return "\n".join(lines)
+
+
+def resolve_revision(worktree: Path, revision: str) -> str | None:
+    """Resolve a revision to a commit sha, or None when it is not one.
+
+    The revision is model-supplied data that reaches argv, so it must be
+    something git itself names as a revision before it is passed on. A
+    string like `--output=/tmp/x` is not a revision and `rev-parse
+    --verify` refuses it, which keeps git options out of the argv of a
+    form documented as read-only.
+    """
+    if not revision or revision.startswith("-"):
+        return None
+    result = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet",
+         f"{revision}^{{commit}}"],
+        capture_output=True, text=True, check=False,
+    )
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
+
+
+def run_settled_by(worktree: Path, settled_by: str) -> tuple[str | None, str]:
+    """Run an allow-listed read-only command.
+
+    Returns `(output, reason)`. The output is None when the command was not
+    allow-listed or could not be run; the reason then says why. No command
+    string from a finding is ever passed to a shell.
+
+    The argument list is split into the command's own shape. `file:a.py` is
+    one path; `grep:a.py:pattern` is a path and a pattern; `git-log:REF:path`
+    and `git-show:REF:path` are a revision and a path. A colon inside a path
+    would be ambiguous with these separators, so a path with one is refused.
+    """
+    kind, sep, argument = settled_by.partition(":")
+    if not sep or kind not in ALLOWED_SETTLED_BY:
+        return None, f"settled_by {settled_by!r} is not a read-only allow-list form"
+    # The allow-list names the command shape; the argument is parsed, never
+    # evaluated. `file:a.py` therefore has kind `file` and argument `a.py`,
+    # while `file:a.py; touch x` has argument `a.py; touch x` and fails the
+    try:
+        words = shlex.split(argument.strip(), posix=True)
+    except ValueError as exc:
+        return None, f"settled_by argument is malformed: {exc}"
+    if not words:
+        return None, "settled_by has no argument"
+
+    if kind == "file":
+        if len(words) != 1:
+            return None, "file: settled_by takes one path"
+        path = safe_path(worktree, words[0])
+        if path is None or not path.is_file():
+            return None, f"file {words[0]!r} is not a file inside the worktree"
+        try:
+            data = path.read_text(errors="replace")
+        except OSError as exc:
+            return None, f"file {words[0]!r} could not be read: {exc}"
+        return "\n".join(data.splitlines()[:MAX_FILE_LINES]), ""
+
+    if kind == "grep":
+        target, sep, needle = argument.partition(":")
+        if not sep or not needle:
+            return None, "grep: settled_by takes <path>:<pattern>"
+        path = safe_path(worktree, target.strip())
+        if path is None or not path.is_file():
+            return None, f"grep target {target!r} is not a file inside the worktree"
+        try:
+            data = path.read_text(errors="replace")
+        except OSError as exc:
+            return None, f"grep target {target!r} could not be read: {exc}"
+        output = [row for row in data.splitlines() if needle in row]
+        return "\n".join(output[:MAX_COMMAND_LINES]), ""
+
+    if kind == "git-log":
+        revision, sep, path = argument.partition(":")
+        if not sep or not path:
+            return None, "git-log: settled_by takes <revision>:<path>"
+        if safe_path(worktree, path.strip()) is None:
+            return None, f"git-log path {path!r} is not inside the worktree"
+        resolved = resolve_revision(worktree, revision.strip())
+        if resolved is None:
+            return None, f"git-log revision {revision.strip()!r} is not a revision"
+        cmd = ["git", "-C", str(worktree), "log", "--oneline",
+               resolved, "--", path.strip()]
+    else:
+        revision, sep, path = argument.partition(":")
+        if not sep or not path:
+            return None, "git-show: settled_by takes <revision>:<path>"
+        if safe_path(worktree, path.strip()) is None:
+            return None, f"git-show path {path!r} is not inside the worktree"
+        resolved = resolve_revision(worktree, revision.strip())
+        if resolved is None:
+            return None, f"git-show revision {revision.strip()!r} is not a revision"
+        cmd = ["git", "-C", str(worktree), "show",
+               f"{resolved}:{path.strip()}"]
+
+    result = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    if result.returncode != 0:
+        return None, result.stderr.strip() or "git command failed"
+    return "\n".join(result.stdout.splitlines()[:MAX_COMMAND_LINES]), ""
+
+
+def number_evidence(rows: list[str]) -> str:
+    """Number the evidence entries so a quote can be checked exactly.
+
+    Each entry is `E<number>|<text>`, one entry per line.
+    """
+    return "\n".join(f"E{index}|{row}" for index, row in enumerate(rows, start=1))
+
+
+def render_evidence(sections: list[tuple[str, str]]) -> str:
+    """The evidence text, with the section markers outside the entries.
+
+    A marker names a section; it is not evidence. A marker carried as an
+    `E<number>|` entry would be quotable, and a verdict "decided" by
+    `(no diff hunk)` would pass the quote check while saying nothing. So a
+    marker is printed on its own line with no prefix, and only the content
+    of a section is numbered.
+
+    A section with no content is printed as its marker alone: `(no diff
+    hunk)` and `(not run: ...)` are statements about the evidence, not
+    evidence, so they are not quotable either.
+    """
+    lines: list[str] = []
+    index = 0
+    for marker, body in sections:
+        lines.append(marker)
+        if not body:
+            continue
+        for row in body.splitlines() or [""]:
+            index += 1
+            lines.append(f"E{index}|{row}")
+    return "\n".join(lines)
+
+
+def gather_evidence(worktree: Path, finding: dict,
+                    base: str) -> tuple[str, list[str]]:
+    """Collect the bounded evidence for one located finding."""
+    path = finding.get("path")
+    line = finding.get("line")
+    if not isinstance(path, str) or isinstance(line, bool) or not isinstance(line, int):
+        return "", ["finding has no usable path and line"]
+    candidate = safe_path(worktree, path)
+    if candidate is None or not candidate.is_file():
+        return "", [f"path {path!r} is not a file inside the worktree"]
+    try:
+        lines = candidate.read_text(errors="replace").splitlines()
+    except OSError as exc:
+        return "", [f"path {path!r} could not be read: {exc}"]
+    sections: list[tuple[str, str]] = []
+    notes: list[str] = []
+    sections.append((f"{SECTION_MARKER}enclosing block ===", enclosing_block(lines, line)))
+    hunk = diff_hunk(worktree, path, base)
+    sections.append((f"{SECTION_MARKER}diff hunk ===" if hunk
+                     else f"{SECTION_MARKER}diff hunk === (no diff hunk)", hunk))
+    settled_by = finding.get("settled_by")
+    if isinstance(settled_by, str) and settled_by:
+        output, reason = run_settled_by(worktree, settled_by)
+        if output is None:
+            notes.append(f"settled_by was not run: {reason}")
+            sections.append((f"{SECTION_MARKER}settled_by === (not run: {reason})", ""))
+        else:
+            sections.append((f"{SECTION_MARKER}settled_by ===", output))
+    return render_evidence(sections), notes
+
+
+def _json_objects(text: str) -> list[dict]:
+    """Every JSON object in the text, in the order they appear.
+
+    Each `{` is tried as the start of an object and the text is decoded
+    from there, so an object is found whatever surrounds it. A greedy
+    match to the last `}` would instead span from the first `{` in the
+    prose to the last one in the answer, which loses the answer entirely.
+    """
+    decoder = json.JSONDecoder()
+    found: list[dict] = []
+    for index, char in enumerate(text):
+        if char != "{":
+            continue
+        try:
+            value, _ = decoder.raw_decode(text[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, dict):
+            found.append(value)
+    return found
+
+
+def _verdict_from(value: dict) -> tuple[str | None, str | None, str]:
+    """The verdict and quote in one object, or None when it has neither.
+
+    Returns `(verdict, quote, reason)`. The verdict is None when the
+    object does not carry a usable answer, and the reason says why.
+    """
+    verdict = value.get("verdict")
+    quote = value.get("quote")
+    if not isinstance(verdict, str) or verdict not in VERDICTS:
+        return None, None, (f"model verdict {verdict!r} is not one of "
+                            f"{list(VERDICTS)}")
+    if not isinstance(quote, str) or not quote.strip():
+        return None, None, "model did not quote evidence"
+    # The indentation of the deciding line is part of the quote; a
+    # stripped quote would match a differently indented line and the
+    # evidence would no longer be the thing the model saw.
+    return verdict, quote, ""
+
+
+def parse_response(text: str) -> tuple[str | None, str | None, str]:
+    """Parse one closed-vocabulary answer.
+
+    The answer is JSON so a model cannot smuggle prose around the verdict.
+    The parser also accepts a plain `verdict: quote` pair, and tolerates a
+    JSON object wrapped in prose or a fence, because a real model wraps its
+    answer however it likes. Returns `(verdict, quote, reason)`.
+
+    The object that answers is the one that carries a verdict, wherever it
+    is: a model may hand back one object whose value is the answer, and
+    the answer is the object inside.
+    """
+    stripped = text.strip()
+    if not stripped:
+        return None, None, "model returned an empty response"
+    # Every JSON object in the response, outermost first. The outermost
+    # is the whole response when it is one object, so a plain answer is
+    # found by the same scan as a wrapped one.
+    for value in _json_objects(stripped):
+        verdict, quote, reason = _verdict_from(value)
+        if verdict is not None:
+            return verdict, quote, reason
+    plain = re.fullmatch(
+        r"(?s)\s*(holds|does-not-hold|cannot-settle)\s*:\s*(.+?)\s*", stripped)
+    if not plain:
+        return None, None, "model response is not a recognised verdict and quote"
+    return plain.group(1), plain.group(2), ""
+
+
+def quote_in_evidence(quote: str, evidence: str) -> bool:
+    """A quote must name an evidence line exactly.
+
+    The model quotes the text of a line; the tool matches it against the
+    text after the `E<number>|` prefix. The prefix is the line's address in
+    the evidence, not part of what the model quotes.
+
+    An entry is a line that starts with `E<number>|`, and every other line
+    is not an entry. The matching is on that shape and not on what the
+    line says, so a real evidence line that happens to start with `=== `
+    is quotable like any other, and a section marker, which carries no
+    address, is not.
+    """
+    if not quote or len(quote) > 2000:
+        return False
+    for line in evidence.splitlines():
+        prefix, sep, text = line.partition("|")
+        if not sep or not re.fullmatch(r"E\d+", prefix):
+            continue
+        if text == quote:
+            return True
+    return False
+
+
+def model_command() -> list[str]:
+    """The configured model command, as argv, never through a shell."""
+    command = os.environ.get("VERIFY_MODEL")
+    if not command:
+        raise RuntimeError("VERIFY_MODEL is not set")
+    try:
+        words = shlex.split(command, posix=True)
+    except ValueError as exc:
+        raise RuntimeError(f"VERIFY_MODEL is malformed: {exc}") from exc
+    if not words:
+        raise RuntimeError("VERIFY_MODEL is empty")
+    return words
+
+
+def model_timeout() -> int:
+    """The model call timeout in seconds.
+
+    A typo in VERIFY_TIMEOUT is a configuration error like any other, so
+    it is reported as one instead of raising out of the call and leaving
+    a traceback behind.
+    """
+    raw = os.environ.get("VERIFY_TIMEOUT", "120")
+    try:
+        return int(raw)
+    except ValueError:
+        die(f"finding-verify: VERIFY_TIMEOUT is not an integer: {raw!r}")
+
+
+def call_model(profile: str, prompt: str, timeout: int) -> tuple[str | None, str]:
+    """One model call.
+
+    The profile is passed to the configured model command as `-p PROFILE`.
+    The command receives the prompt on stdin, so no shell is involved and
+    the prompt cannot be interpreted as command text.
+    """
+    cmd = model_command()
+    full = cmd + ["-p", profile]
+    try:
+        result = subprocess.run(
+            full, input=prompt, capture_output=True, text=True, check=False,
+            timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"model call failed: {exc}"
+    if result.returncode != 0:
+        return None, result.stderr.strip() or f"model exited {result.returncode}"
+    return result.stdout, ""
+
+
+def answer_instructions() -> str:
+    """The answer contract, shared by the control and the finding prompts."""
+    return (
+        "You have no tools. Use only the evidence. Answer with one JSON object "
+        "on one line: {\"verdict\": \"holds|does-not-hold|cannot-settle\", "
+        "\"quote\": \"the exact evidence line that decides it\"}.\n"
+        "The quote must be one complete line copied exactly from the evidence.\n"
+    )
+
+
+def build_prompt(finding: dict, evidence: str) -> str:
+    claim = finding.get("claim", "")
+    snippet = finding.get("snippet", "")
+    return (
+        "Decide whether the review claim holds against the evidence below.\n"
+        + answer_instructions()
+        + f"\nCLAIM:\n{claim}\n\n"
+        + f"QUOTED SOURCE:\n{snippet}\n\n"
+        + f"EVIDENCE:\n{evidence}\n"
+    )
+
+
+def load_controls(path: Path) -> list[dict]:
+    """Load known-answer controls, requiring at least one false claim.
+
+    A control's evidence is numbered the same way as a finding's evidence,
+    so the model's quote can be checked against it exactly.
+    """
+    try:
+        value = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"controls could not be read: {exc}") from exc
+    if isinstance(value, dict):
+        value = value.get("controls", [])
+    if not isinstance(value, list) or not value:
+        raise RuntimeError("controls must be a non-empty list")
+    controls: list[dict] = []
+    saw_false = False
+    for control in value:
+        if not isinstance(control, dict):
+            raise RuntimeError("each control must be an object")
+        verdict = control.get("verdict")
+        claim = control.get("claim")
+        evidence = control.get("evidence")
+        quote = control.get("quote")
+        if verdict not in VERDICTS:
+            raise RuntimeError(f"control verdict {verdict!r} is invalid")
+        if not all(isinstance(x, str) and x for x in (claim, evidence, quote)):
+            raise RuntimeError(
+                "control claim, evidence and quote must be non-empty strings")
+        if verdict == "does-not-hold":
+            saw_false = True
+        controls.append({**control,
+                        "evidence": number_evidence(evidence.splitlines())})
+    if not saw_false:
+        raise RuntimeError(
+            "controls must include at least one does-not-hold (false) claim")
+    return controls
+
+
+def check_controls(profile: str, controls: list[dict],
+                   timeout: int) -> tuple[bool, str]:
+    """Run the known-answer controls; all must pass, including the false one."""
+    for control in controls:
+        prompt = (
+            "Decide whether the review claim holds against the evidence below.\n"
+            + answer_instructions()
+            + f"\nCLAIM:\n{control['claim']}\n\n"
+            + f"EVIDENCE:\n{control['evidence']}\n"
+        )
+        answer, error = call_model(profile, prompt, timeout)
+        if answer is None:
+            return False, f"control model call failed: {error}"
+        verdict, quote, reason = parse_response(answer)
+        if verdict is None:
+            return False, f"control response was unusable: {reason}"
+        if verdict != control["verdict"]:
+            return False, (f"control expected {control['verdict']!r}, "
+                           f"got {verdict!r}")
+        if not quote_in_evidence(quote, control["evidence"]):
+            return False, "control quote was not in its evidence"
+    return True, ""
+
+
+def annotate_non_located(finding: object) -> dict:
+    """Keep an entry in place and make its reason explicit."""
+    if not isinstance(finding, dict):
+        return {"status": "malformed", "in_diff": False,
+                "reason": f"finding must be a JSON object, got {_type_name(finding)}",
+                "value": finding}
+    status = finding.get("status")
+    if status == "located":
+        return finding
+    return {**finding, "verdict": "cannot-settle",
+            "evidence": [],
+            "verification_reason": f"finding status is {status!r}; not verified"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("worktree")
+    parser.add_argument("findings")
+    parser.add_argument("--profile", default=os.environ.get("VERIFY_PROFILE", ""))
+    parser.add_argument("--controls", default=os.environ.get(CONTROL_ENV, ""))
+    parser.add_argument("--base", default=DEFAULT_BASE)
+    args = parser.parse_args()
+
+    worktree = Path(args.worktree)
+    findings_path = Path(args.findings)
+    if not worktree.is_dir():
+        die(f"finding-verify: {worktree} is not a directory")
+    if not findings_path.is_file():
+        die(f"finding-verify: {findings_path} is not a file")
+    if not args.profile:
+        die("finding-verify: VERIFY_PROFILE is not set")
+    if not args.controls:
+        die(f"finding-verify: {CONTROL_ENV} is not set")
+    controls_path = Path(args.controls)
+    if not controls_path.is_file():
+        die(f"finding-verify: {controls_path} is not a file")
+
+    # The timeout is parsed before anything else is attempted, so a typo
+    # in it is the message the operator sees rather than a traceback
+    # from inside the first model call.
+    timeout = model_timeout()
+
+    # The base must resolve, or the diff is against nothing and the
+    # evidence says nothing. A base that does not resolve is a
+    # configuration error, like a missing controls file.
+    base = resolve_base(worktree, args.base)
+    resolved_base = subprocess.run(
+        ["git", "-C", str(worktree), "rev-parse", "--verify", "--quiet",
+         f"{base}^{{commit}}"],
+        capture_output=True, text=True, check=False,
+    ).stdout.strip()
+    if not resolved_base:
+        die(f"finding-verify: base {args.base!r} does not resolve in "
+            f"{worktree}")
+
+    try:
+        findings = json.loads(findings_path.read_text())
+    except json.JSONDecodeError as exc:
+        die(f"finding-verify: {findings_path}: {exc.msg} "
+            f"(line {exc.lineno} col {exc.colno})")
+    except OSError as exc:
+        die(f"finding-verify: {findings_path}: {exc}")
+    if not isinstance(findings, list):
+        die("finding-verify: findings must be a JSON array")
+
+    try:
+        controls = load_controls(controls_path)
+    except RuntimeError as exc:
+        die(f"finding-verify: {exc}")
+
+    try:
+        ok, reason = check_controls(args.profile, controls, timeout)
+    except RuntimeError as exc:
+        die(f"finding-verify: {exc}")
+    if not ok:
+        die(f"finding-verify: profile {args.profile!r} failed the known-answer "
+            f"control: {reason}")
+
+    annotated: list[dict] = []
+    tally = {"verified": 0, "cannot-settle": 0, "not-located": 0}
+    for finding in findings:
+        if not isinstance(finding, dict) or finding.get("status") != "located":
+            entry = annotate_non_located(finding)
+            tally["not-located"] += 1
+            annotated.append(entry)
+            continue
+        evidence, notes = gather_evidence(worktree, finding, base)
+        if len(evidence.encode("utf-8")) > MAX_EVIDENCE_BYTES:
+            evidence = evidence[:MAX_EVIDENCE_BYTES]
+            notes.append("evidence was truncated to the size limit")
+        prompt = build_prompt(finding, evidence)
+        answer, error = call_model(args.profile, prompt, timeout)
+        verdict = quote = reason = None
+        if answer is not None:
+            verdict, quote, reason = parse_response(answer)
+        if verdict is None:
+            entry = {**finding, "verdict": "cannot-settle", "evidence": [],
+                     "verification_reason": (error if answer is None else reason)}
+            if notes:
+                entry["verification_notes"] = notes
+            tally["cannot-settle"] += 1
+            annotated.append(entry)
+            continue
+        if not quote_in_evidence(quote, evidence):
+            entry = {**finding, "verdict": "cannot-settle", "evidence": [],
+                     "verification_reason": "model quote was not in the evidence"}
+            if notes:
+                entry["verification_notes"] = notes
+            tally["cannot-settle"] += 1
+            annotated.append(entry)
+            continue
+        entry = {**finding, "verdict": verdict, "evidence": [quote]}
+        if notes:
+            entry["verification_notes"] = notes
+        tally["verified"] += 1
+        annotated.append(entry)
+
+    json.dump(annotated, sys.stdout, indent=2)
+    sys.stdout.write("\n")
+    sys.stderr.write("finding-verify: " + ", ".join(
+        f"{key}={value}" for key, value in tally.items()) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    main()
