@@ -135,9 +135,12 @@ export TMPDIR="$WORK" TMP="$WORK" TEMP="$WORK"
 export_lane_build_env "$WORKTREE"
 
 
+# The issue is read with the implementer's credentials: the one that reads
+# the work item must be the one that will answer for it. `gh_as` refuses
+# when no implementer credentials are available.
 GH_ARGS=(issue view "$ISSUE")
 [[ -n "$REPO" ]] && GH_ARGS+=(--repo "$REPO")
-gh "${GH_ARGS[@]}" >"$WORK/issue.txt"
+gh_as implementer "${GH_ARGS[@]}" >"$WORK/issue.txt"
 
 # The commit the run starts from. The base is what a no-commit run has to
 # leave the branch at, and what the FAILED line names.
@@ -166,6 +169,35 @@ Follow the swe-updater skill. The branch and worktree already exist: you are on
 $BRANCH, based on the remote default branch. Skip the skill's ingest phase --
 the work item is the issue below, not a REVIEW_NOTES.md file -- and do not
 create, switch, or push any branch. $COMMIT_INSTRUCTION
+
+**An accidental \`gh\` call in this run fails, and that is deliberate.** \`gh\`
+is pointed at an empty config directory here, so \`gh auth status\` inside this
+run reports that you are not logged in and any \`gh\` call that needs
+authentication fails.
+
+The loop has two identities: the implementer, which authors the pull request,
+and the reviewer, which is the repository's owner and posts the verdict. A run
+that could reach GitHub could approve its own pull request or answer a
+reviewer's comment, and afterwards nobody could tell which of those it had
+done. So every write to GitHub is made by the script that dispatched you, not
+by you.
+
+What this means for you:
+
+- Do not try to read or write anything on GitHub. An accidental \`gh\` call
+  fails, and that failure is the design, not a fault to work around.
+- You run as the same operating-system user as the dispatcher, so credentials
+  that user can reach may still be on this host. Do not use them: not a token
+  from a file, a git remote, a CI config or another tool's environment, and not
+  one read out of a directory you were pointed at.
+- Do not put a token, a password or a credential into a file, a commit
+  message, or a command line, to get past anything.
+- If the work item needs something from GitHub that is not in this prompt --
+  a review comment, another pull request, a check's log -- say so in the
+  handover and name what you needed. The script can fetch it and give it to
+  you; you cannot fetch it yourself.
+
+$WORKTREE is on branch $BRANCH at $(git rev-parse HEAD).
 
 **Every file you write belongs to $WORKTREE.** Not only source files, and not
 only git: nothing outside that directory is yours to change. Config files,
@@ -327,7 +359,11 @@ run() {
 	PRE=("${PROFILE_ARGS[@]}")
 	POST=(--skills "$SKILLS"
 	      --yolo --no-restore-cwd "$@")
-	timeout --kill-after="$KILL_AFTER" "$TIMEOUT" "$BASH" -c '
+	# lane_env, not the ambient environment: the agent's gh is pointed at
+	# an empty config. The wrapper's exports are inherited by the bash -c
+	# below and by everything it starts, so the whole tree -- the agent,
+	# and any tool the agent runs -- gets the empty config.
+	lane_env timeout --kill-after="$KILL_AFTER" "$TIMEOUT" "$BASH" -c '
 		. "$1/lib/common.sh"
 		shift
 		hermes_query "$@"
@@ -397,6 +433,43 @@ attempt_pgid() {
 		sleep 0.1
 	done
 	return 0
+}
+
+# The lane's `gh` is pointed at an empty config.
+#
+# A model run that can reach GitHub can approve its own pull request, post a
+# verdict, or answer a reviewer's comment -- and none of those can be told
+# apart from the loop's own state afterwards. So the lane runs with a gh
+# config directory that holds no hosts and with no token in its environment:
+# an accidental `gh` call inside the lane fails, and every write to GitHub is
+# made by this script or by agent-fix-pr, which check who they are acting as.
+#
+# The lane runs as the same operating-system user as the dispatcher, so
+# credentials that user can reach are still on the host. The empty config
+# makes an accidental call fail; it does not make the credentials unreadable.
+#
+# The directory lives under the run's own private directory, so it is removed
+# with the run and never shared with another lane.
+LANE_GH_DIR="$WORK/gh"
+credential_free_env "$LANE_GH_DIR" >/dev/null
+
+# The lane's environment, minus the credentials. Every attempt gets the same
+# one: the credentials are what is being removed, not what varies per
+# attempt.
+#
+# `exec`, not a plain call: the attempt is spawned in the background and its
+# process group is what the script later kills when an attempt's agent
+# outlives its timeout. `env` forks when it changes the environment, and the
+# forked child lands in the *script's* group -- so the kill would reach the
+# script instead of the agent, and an agent that ignored SIGTERM would
+# survive into the next attempt. That is issue #157's bug. exec replaces the
+# shell with env, which execs timeout in turn, so the group leader is still
+# the process the script spawned.
+lane_env() {
+	exec env -u GH_TOKEN -u GITHUB_TOKEN -u GH_ENTERPRISE_TOKEN \
+		-u GITHUB_ENTERPRISE_TOKEN -u GHE_TOKEN \
+		GH_CONFIG_DIR="$LANE_GH_DIR" \
+		"$@"
 }
 
 # Pids still alive in the attempt's group, one per line; empty when the

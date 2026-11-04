@@ -114,7 +114,15 @@ def make_fake_tmux(stem: Path) -> Path:
     # body -- the test does not care about the issue text, only that gh
     # exits 0 so the script reaches the tmux hook.
     gh = bin_dir / "gh"
-    gh.write_text("#!/usr/bin/env bash\n# Fake gh for the LANE_WATCH_TMUX_SESSION test.\nexit 0\n")
+    gh.write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        # Fake gh for the LANE_WATCH_TMUX_SESSION test.
+        if [[ "$1" == "api" && "$2" == "user" ]]; then
+            echo "test-implementer"
+            exit 0
+        fi
+        exit 0
+        """))
     gh.chmod(0o755)
     return bin_dir
 
@@ -187,6 +195,7 @@ def make_env(stem: Path, wt: Path, **extra) -> dict:
     return {
         **os.environ,
         "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "IMPLEMENTER_LOGINS": "test-implementer",
         "HOME": str(env_dir),
         "HERMES_PYTHON": str(stem / "bin" / "hermes"),
         "TMPDIR": str(stem),
@@ -335,7 +344,14 @@ def main() -> int:
     (no_tmux_bin / "hermes").chmod(0o755)
     # No gh either: the test is not about gh, it is about the tmux hook
     # short-circuiting before the hook even names tmux.
-    (no_tmux_bin / "gh").write_text("#!/usr/bin/env bash\nexit 0\n")
+    (no_tmux_bin / "gh").write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        if [[ "$1" == "api" && "$2" == "user" ]]; then
+            echo "test-implementer"
+            exit 0
+        fi
+        exit 0
+        """))
     (no_tmux_bin / "gh").chmod(0o755)
     env = make_env(stem, wt, LANE_WATCH_TMUX_SESSION="watch")
     env["PATH"] = f"{no_tmux_bin}:/usr/bin:/bin"

@@ -316,6 +316,20 @@ name = "hermes-implement session resume tests"
 when = '^(bin/hermes-implement|tests/test_hermes_implement_session\.py)$'
 run = "python3 tests/test_hermes_implement_session.py"
 
+# The implementer's identity, and the lane that must not use it.
+#
+# gh_as runs gh as the implementer, with that role's own credentials, and
+# refuses when the role has none or when the login it would act as is not
+# one of IMPLEMENTER_LOGINS. hermes-implement starts the lane with gh
+# pointed at an empty config, so an accidental gh call fails.
+#
+# The gate names the suite, the module that holds gh_as, and the driver that
+# starts the lane: a change to any of the three runs the suite that pins it.
+[[gates]]
+name = "credential-free lanes tests"
+when = '^(tests/test_credential_free_lanes\.py|lib/common\.sh|bin/hermes-implement)$'
+run = "python3 tests/test_credential_free_lanes.py"
+
 # Syntax floor for the two review drivers; their shared logic is in
 # lib/common.sh and the review script, which the suite above pins.
 [[gates]]

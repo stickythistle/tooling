@@ -64,6 +64,7 @@ def lane_wrapper(root: Path, role: str, stub: Path, gh_dir: Path) -> str:
              "AGENT_STATE_DIR": str(state),
              "HERMES_HOME": str(home),
              "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
+             "IMPLEMENTER_LOGINS": "test-implementer",
              "HERMES_IMPLEMENT_ATTEMPTS": "1",
              "HERMES_IMPLEMENT_TIMEOUT": "30"})
     out = proc.stdout.strip().splitlines()

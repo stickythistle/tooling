@@ -240,6 +240,12 @@ def make_fake_gh(bin_dir: Path) -> Path:
     of which are wrong for a test that runs offline."""
     body = r"""#!/usr/bin/env bash
 # Fake gh used by tests/test_lane_settled.py.
+# `gh api user` answers who the call would act as, which `gh_as` checks
+# against IMPLEMENTER_LOGINS.
+if [[ "$1" == "api" && "$2" == "user" ]]; then
+    echo "test-implementer"
+    exit 0
+fi
 cat <<'ISSUE'
 title: stub
 number: 0
@@ -270,6 +276,7 @@ def run_hermes_implement(worktree: Path, extra: str,
         # `gh`, `lane-settled` is not on its PATH, and the hermes
         # binary itself is named by HERMES_PYTHON.
         "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "IMPLEMENTER_LOGINS": "test-implementer",
         # Override the hermes binary.
         "HERMES_PYTHON": str(bin_dir / "fake-hermes"),
         # State + evidence: the script defaults these to $HOME/.local
