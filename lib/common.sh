@@ -124,6 +124,73 @@ tree_name() { basename "$1" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//';
 
 repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
 
+# `gh_as <role> <gh args...>` -- run one gh command as a role, with that
+# role's credentials and no others.
+#
+# The roles are the two GitHub identities a review loop uses. The implementer
+# authors the pull requests; the reviewer posts the verdicts on them. They
+# are separate accounts, because one account cannot approve or request
+# changes on a pull request it authored, and because a loop that posts as
+# one identity cannot tell its own reply from a person's comment.
+#
+# The token is set for that one call and no other: GH_TOKEN is exported
+# into the child's environment, so nothing else in the process sees it. A
+# role whose token is unset refuses and names the variable, because a gh
+# call that falls back to the stored credentials would post as whichever
+# account happens to be logged in -- and a review posted as the
+# implementer is not a review at all.
+#
+#   gh_as reviewer pr review 42 --request-changes --body "..."
+#
+# The role's login is in REVIEWER_LOGIN / IMPLEMENTER_LOGIN. The login is
+# not derived from the token here: reading it back would be a network call
+# in a helper whose job is to set an environment variable.
+gh_role_token_var() { # role -> the env var name holding that role's token
+	case "$1" in
+	reviewer) printf '%s\n' REVIEWER_GH_TOKEN ;;
+	implementer) printf '%s\n' IMPLEMENTER_GH_TOKEN ;;
+	*) printf '%s\n' "no such role: $1" >&2; return 2 ;;
+	esac
+}
+
+gh_role_login_var() { # role -> the env var name holding that role's login
+	case "$1" in
+	reviewer) printf '%s\n' REVIEWER_LOGIN ;;
+	implementer) printf '%s\n' IMPLEMENTER_LOGIN ;;
+	*) printf '%s\n' "no such role: $1" >&2; return 2 ;;
+	esac
+}
+
+gh_as() { # role args...
+	local role="$1" var token
+	shift
+	if [ $# -eq 0 ]; then
+		echo "gh_as: no gh command given" >&2
+		return 2
+	fi
+	var=$(gh_role_token_var "$role") || return 2
+	token=${!var:-}
+	if [ -z "$token" ]; then
+		echo "gh_as: set $var to the ${role}'s GitHub token (see hosts.env.example)" >&2
+		return 2
+	fi
+	GH_TOKEN="$token" gh "$@"
+}
+
+# The login of a role, from the operator's env. Empty is a refusal, not an
+# empty string to compare against: a caller that asks who the reviewer is
+# must not proceed with an answer that names nobody.
+gh_role_login() { # role
+	local role="$1" var login
+	var=$(gh_role_login_var "$role") || return 2
+	login=${!var:-}
+	if [ -z "$login" ]; then
+		echo "gh_role_login: set $var to the ${role}'s GitHub login (see hosts.env.example)" >&2
+		return 2
+	fi
+	printf '%s\n' "$login"
+}
+
 # The identity a lane's commits must carry. The caller override is
 # LANE_GIT_NAME / LANE_GIT_EMAIL. Setting either one selects it;
 # setting only one is incomplete and refuses rather than mixing in

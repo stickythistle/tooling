@@ -1,0 +1,768 @@
+#!/usr/bin/env python3
+"""Carry pull requests between the implementer and the reviewer, round by
+round, and on to the next item when the two agree.
+
+    pr-loop implement <owner/repo> [--from N] [--once]
+    pr-loop review    <owner/repo> [--from N] [--once]
+
+Each command is a long-running process, started by hand, for one repository
+under its own role's credentials (#129). The two loops never talk to each
+other: GitHub is the only channel. Every poll re-reads state through
+`pr-loop-gate` (#130), so a loop can be killed at any point and restarted
+where the PR stands — nothing but GitHub and the process's own memory
+decides what happens next.
+
+Polling is one conditional GET on the open-PR list; a 304 costs no rate
+limit. Measured against the live API (#133's acceptance step), a push and
+an issue comment move that list's ETag, but a review, an inline comment and
+a thread reply do not — so every PR in scope also gets a conditional GET on
+its own endpoint, where all three do move the ETag. The interval starts at
+30s and doubles to 5 minutes while nothing changes; any change, or the
+loop's own post, drops it back.
+
+The gate decides; the loop acts. `FIX` runs the fix command, `REVIEW` runs
+the review command, `REAPPROVE` approves with no model, `AGREED` marks the
+PR ready and asks GitHub to merge (or records the shadow decision), and
+`ESCALATE` labels the PR, comments the reason, and frees the slot. Three
+consecutive gate errors exit non-zero; an empty scope exits 0.
+
+Settings live in ~/.config/hermes-tools/pr-loop.toml (PR_LOOP_CONFIG
+overrides the path); see install/pr-loop/pr-loop.toml.example.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+import pr_loop  # noqa: E402
+from pr_loop import (AGREED_LABEL, ESCALATED_LABEL, PR_LABEL,  # noqa: E402
+                     ConfigError, load_config)
+
+DEFAULT_CONFIG = Path.home() / ".config" / "hermes-tools" / "pr-loop.toml"
+STATE_DIR = Path(os.environ.get("PR_LOOP_STATE",
+                                Path.home() / ".local" / "state" / "pr-loop"))
+WT_ROOT = Path(os.environ.get("PR_LOOP_WT_ROOT", Path.home() / "wt"))
+
+
+def log(msg: str) -> None:
+    print(msg, flush=True)
+
+
+class Loop:
+    def __init__(self, role: str, repo: str, from_n: int, config_path: Path,
+                 once: bool) -> None:
+        self.role = role
+        self.repo = repo
+        self.from_n = from_n
+        self.once = once
+        self.config = load_config(config_path, repo)
+        self.slug = repo.replace("/", "-")
+        self.log_dir = STATE_DIR / self.slug
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        # number -> {"proc": Popen, "log": str, "head": str, "verb": str}
+        self.running: dict[int, dict] = {}
+        # number -> consecutive failed runs (a run that exits non-zero).
+        self.failures: dict[int, int] = {}
+        # number -> last gate line, so a line is printed on change only.
+        self.last_gate: dict[int, str] = {}
+        # The scoped PRs from the last list read (handle_pr consults it
+        # for base-blocking).
+        self.scope_cache: list = []
+        # number -> ETag of the per-PR conditional GET.
+        self.pr_etags: dict[int, str] = {}
+        self.list_etag: str | None = None
+        self.interval = pr_loop.MIN_INTERVAL_SEC
+        self.gate_errors = 0
+        self.stopped = False
+
+    # ----- gh ---------------------------------------------------------------
+
+    def gh(self, *args: str, capture: bool = True) -> subprocess.CompletedProcess:
+        proc = subprocess.run(["gh", *args], capture_output=capture,
+                              text=True)
+        return proc
+
+    def conditional_get(self, endpoint: str, etag: str | None):
+        """One conditional GET. Returns (changed, new_etag, body) — see
+        pr_loop.parse_conditional_response for the meanings."""
+        args = ["api", endpoint, "-i"]
+        if etag:
+            args += ["-H", f"If-None-Match: {etag}"]
+        proc = self.gh(*args)
+        return pr_loop.parse_conditional_response(proc.stdout or "",
+                                                  proc.returncode)
+
+    def gh_json(self, endpoint: str, *args: str):
+        proc = self.gh("api", endpoint, *args)
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+            raise RuntimeError(detail[0] if detail else "gh failed")
+        return json.loads(proc.stdout)
+
+    def default_branch(self) -> str:
+        proc = self.gh("api", f"repos/{self.repo}", "--jq", ".default_branch")
+        branch = (proc.stdout or "").strip()
+        if proc.returncode != 0 or not branch:
+            raise RuntimeError(f"could not read {self.repo}'s default branch")
+        return branch
+
+    # ----- gate -------------------------------------------------------------
+
+    def gate(self, number: int) -> tuple[str, str] | None:
+        """Run pr-loop-gate for one PR. Returns (verb, argument), or None
+        when the line is unreadable — which counts as an error."""
+        args = ["pr-loop-gate", self.repo, str(number),
+                "--max-rounds", str(self.config.max_rounds)]
+        env = dict(os.environ)
+        proc = subprocess.run(args, capture_output=True, text=True, env=env)
+        line = (proc.stdout or "").strip()
+        parsed = pr_loop.parse_gate_line(line)
+        if parsed is None:
+            detail = ((proc.stderr or "").strip().splitlines() or
+                      [f"gate printed {line!r}"])[:1]
+            log(f"PR {number} gate unreadable: {detail[0]}")
+        return parsed
+
+    # ----- runs ---------------------------------------------------------------
+
+    def minimax_live(self) -> int:
+        """Every live MiniMax-backed hermes process, this loop's and every
+        other's. A fifth session falls back to the local model and evicts
+        whatever is loaded there, so the cap is on the count, not on
+        parentage."""
+        proc = subprocess.run(["ps", "-eo", "args="], capture_output=True,
+                              text=True)
+        count = 0
+        for line in (proc.stdout or "").splitlines():
+            if "hermes" in line and re.search(r"(^|\s)-p\s+minimax(\s|$)",
+                                              line):
+                count += 1
+        return count
+
+    def start_run(self, number: int, verb: str, argv: list[str]) -> None:
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        log_path = self.log_dir / f"pr-{number}-{verb}-{stamp}.log"
+        handle = open(log_path, "w")
+        # start_new_session: the run's children (the lane, the reviewer,
+        # their builders) share its process group, so stopping the loop
+        # ends the whole tree. A loop that SIGTERM-only's the wrapper
+        # leaves a foreground child holding its locks.
+        proc = subprocess.Popen(argv, stdout=handle, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL,
+                                start_new_session=True)
+        handle.close()
+        self.running[number] = {"proc": proc, "log": str(log_path),
+                                "verb": verb}
+        log(f"PR {number} {verb}: run started, log {log_path}")
+
+    def reap_runs(self) -> None:
+        """Collect finished runs. A non-zero exit is one failure toward
+        the two that escalate; a success clears the count."""
+        for number in sorted(self.running):
+            entry = self.running[number]
+            rc = entry["proc"].poll()
+            if rc is None:
+                continue
+            del self.running[number]
+            if rc == 0:
+                self.failures[number] = 0
+                log(f"PR {number} {entry['verb']}: run ok, log {entry['log']}")
+                if self.config.measure:
+                    # Every round goes to findings-ledger, so which model
+                    # reviews which repository is decided from
+                    # measurement. Its own failures are not this loop's.
+                    subprocess.run(["findings-ledger", "collect",
+                                    "--repo", self.repo],
+                                   capture_output=True)
+            else:
+                self.failures[number] = self.failures.get(number, 0) + 1
+                log(f"PR {number} {entry['verb']}: run failed exit {rc} "
+                    f"(failure {self.failures[number]}), log {entry['log']}")
+
+    # ----- actions -------------------------------------------------------------
+
+    def comment(self, number: int, body: str) -> str:
+        """One issue comment on the PR. Returns its URL."""
+        try:
+            out = self.gh_json(f"repos/{self.repo}/issues/{number}/comments",
+                               "-f", f"body={body}")
+            return out.get("html_url", "") if isinstance(out, dict) else ""
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            log(f"PR {number} could not comment: {exc}")
+            return ""
+
+    def escalate(self, number: int, reason: str) -> None:
+        """Label, comment the reason with the status marker, notify, free
+        the slot. A person decides what happens next."""
+        self.gh("api", "-X", "POST",
+                f"repos/{self.repo}/issues/{number}/labels",
+                "-f", f"labels[]={ESCALATED_LABEL}",
+                capture=False)
+        marker = pr_loop.STATUS_MARKER.format(review=0, head="0000000")
+        self.comment(number, f"pr-loop ({self.role}) escalated PR "
+                             f"!{number}: {reason}\n\n{marker}")
+        if self._notify:
+            subprocess.run([*self._notify.split(),
+                            f"pr-loop escalated {self.repo}#{number}: {reason}"],
+                           capture_output=True)
+        self.running.pop(number, None)
+        self.failures[number] = 10**6  # never act on it again
+
+    def load_notify(self, config_path: Path) -> None:
+        """`notify_cmd` (the Telegram bot repo-watch uses) lives in the
+        same table; RepoConfig rejects unknown keys, so it is read from
+        the raw file rather than the parsed record."""
+        self._notify = ""
+        import tomllib
+        if config_path and Path(config_path).exists():
+            with open(config_path, "rb") as handle:
+                doc = tomllib.load(handle)
+            table = doc.get("repos", {}).get(self.repo, {})
+            value = table.get("notify_cmd", "")
+            if isinstance(value, str):
+                self._notify = value
+
+    # ----- the AGREED path -------------------------------------------------------
+
+    def pr_view(self, number: int) -> dict:
+        return self.gh_json(f"repos/{self.repo}/pulls/{number}")
+
+    def worktree_for(self, head_ref: str) -> Path | None:
+        """The lane worktree for a head branch, if it exists and is clean.
+        The loop never checks out or resets anything; an absent or dirty
+        tree means the steps that need one are skipped with a line."""
+        candidate = WT_ROOT / head_ref
+        if not (candidate / ".git").exists():
+            return None
+        proc = subprocess.run(["git", "-C", str(candidate),
+                               "status", "--porcelain"],
+                              capture_output=True, text=True)
+        if proc.returncode != 0 or (proc.stdout or "").strip():
+            return None
+        return candidate
+
+    def agreed(self, number: int, head: str) -> None:
+        """Mark ready, squash first if the repository rebase-merges, then
+        the merge itself — GitHub's auto-merge in `on` mode, a ledger line
+        in `shadow` mode — and label the PR agreed."""
+        view = self.pr_view(number)
+        head_ref = view.get("head", {}).get("ref", "")
+        wt = self.worktree_for(head_ref)
+
+        if view.get("draft"):
+            if wt is not None:
+                rc = subprocess.run(["pr-ready", str(number), str(wt)]).returncode
+                if rc != 0:
+                    # pr-ready refuses; say so and leave the PR alone. A
+                    # forced `gh pr ready` over a refusal is exactly what
+                    # pr-ready exists to stop.
+                    log(f"PR {number} agreed but pr-ready refused (exit {rc}); "
+                        f"leaving it draft")
+                    return
+            else:
+                self.gh("pr", "ready", str(number), "--repo", self.repo,
+                        capture=False)
+
+        if self.rebase_repo() and wt is not None:
+            rc = self.squash_at_fork(number, view, wt)
+            if rc != 0:
+                log(f"PR {number} agreed but the squash failed (exit {rc})")
+                return
+
+        if self.config.auto_merge == "on":
+            if not self.enable_auto_merge(number, head):
+                return
+        else:
+            self.shadow_record(number, head)
+
+        self.gh("api", "-X", "POST",
+                f"repos/{self.repo}/issues/{number}/labels",
+                "-f", f"labels[]={AGREED_LABEL}", capture=False)
+        action = ("auto-merge enabled" if self.config.auto_merge == "on"
+                  else "shadow decision recorded")
+        self.comment(number, f"pr-loop ({self.role}): both sides agree; "
+                             f"{action} for head {head[:7]}.\n\n"
+                             + pr_loop.STATUS_MARKER.format(review=0,
+                                                            head=head[:7]))
+        log(f"PR {number} AGREED: {action}, head {head[:7]}")
+
+    def _repo_flags(self) -> dict:
+        if not hasattr(self, "_flags"):
+            try:
+                out = self.gh_json(f"repos/{self.repo}")
+                self._flags = out if isinstance(out, dict) else {}
+            except (RuntimeError, json.JSONDecodeError):
+                self._flags = {}
+        return self._flags
+
+    def rebase_repo(self) -> bool:
+        """A repository whose only merge button is rebase: then the PR
+        must arrive squashed, because rebase-merging a dozen WIP commits
+        lands them all on the base."""
+        flags = self._repo_flags()
+        return (flags.get("allow_rebase_merge") is True
+                and flags.get("allow_merge_commit") is False)
+
+    def squash_at_fork(self, number: int, view: dict, wt: Path) -> int:
+        """Squash the branch to one commit at the fork point and push with
+        lease. The dismissal of the approval is expected: the tree is
+        unchanged, so the reviewer loop answers the gate's REAPPROVE with
+        no model run."""
+        base_sha = view.get("base", {}).get("sha", "")
+        subprocess.run(["git", "-C", str(wt), "fetch", "origin", "--quiet"])
+        rc = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"],
+                            capture_output=True, text=True)
+        head_local = (rc.stdout or "").strip()
+        remote_head = view.get("head", {}).get("sha", "")
+        if head_local != remote_head:
+            log(f"PR {number} worktree HEAD {head_local[:7]} is not the "
+                f"remote head {remote_head[:7]}; skipping the squash")
+            return 1
+        mb = subprocess.run(["git", "-C", str(wt), "merge-base", "HEAD",
+                             base_sha], capture_output=True, text=True)
+        fork = (mb.stdout or "").strip()
+        if not fork:
+            return 1
+        commits = subprocess.run(
+            ["git", "-C", str(wt), "rev-list", "--count", f"{fork}..HEAD"],
+            capture_output=True, text=True)
+        try:
+            count = int((commits.stdout or "0").strip())
+        except ValueError:
+            return 1
+        if count <= 1:
+            return 0
+        subject = subprocess.run(
+            ["git", "-C", str(wt), "log", "-1", "--format=%s", fork],
+            capture_output=True, text=True)
+        msg = f"squash: pr-{number} into one commit"
+        rc = subprocess.run(["git", "-C", str(wt), "reset", "--soft", fork],
+                            capture_output=True)
+        if rc.returncode != 0:
+            return rc.returncode
+        rc = subprocess.run(["git", "-C", str(wt), "commit", "--quiet",
+                             "-m", msg], capture_output=True)
+        if rc.returncode != 0:
+            # Leave the tree exactly as it was found: the commits are
+            # still in the reflog, but restoring HEAD is kinder.
+            subprocess.run(["git", "-C", str(wt), "reset", "--soft",
+                            head_local], capture_output=True)
+            return rc.returncode
+        push = subprocess.run(["git", "-C", str(wt), "push",
+                               "--force-with-lease", "origin",
+                               f"HEAD:{view['head']['ref']}"],
+                              capture_output=True, text=True)
+        if push.returncode != 0:
+            subprocess.run(["git", "-C", str(wt), "reset", "--soft",
+                            head_local], capture_output=True)
+            log(f"PR {number} squash push refused: "
+                f"{(push.stderr or '').strip().splitlines()[:1]}")
+        else:
+            log(f"PR {number} squashed {count} commits at {fork[:7]}")
+        return push.returncode
+
+    def enable_auto_merge(self, number: int, head: str) -> bool:
+        """Ask GitHub to merge this head when its checks pass. GitHub
+        merges the head the PR has when the ruleset's checks are green;
+        the approval that AGREED named this head, and a push after it
+        moves the gate off AGREED before anything merges."""
+        node = self.gh("api", f"repos/{self.repo}/pulls/{number}",
+                       "--jq", ".node_id")
+        node_id = (node.stdout or "").strip()
+        if node.returncode != 0 or not node_id:
+            log(f"PR {number} could not read a node id for auto-merge")
+            return False
+        query = ("mutation($id: ID!) { enablePullRequestAutoMerge("
+                 "input: {pullRequestId: $id}) { pullRequest { id } } }")
+        proc = self.gh("api", "graphql", "-f", f"query={query}",
+                       "-F", f"id={node_id}")
+        if proc.returncode != 0:
+            log(f"PR {number} could not enable auto-merge: "
+                f"{(proc.stderr or '').strip().splitlines()[:1]}")
+            return False
+        return True
+
+    def _merge_method(self) -> str:
+        flags = self._repo_flags()
+        if flags.get("allow_squash_merge"):
+            return "SQUASH"
+        if flags.get("allow_rebase_merge"):
+            return "REBASE"
+        return "MERGE"
+
+    def shadow_record(self, number: int, head: str) -> None:
+        """The #82 shadow ledger: what the loop would have merged, so the
+        disagreement rate is measurable before any repository trusts it."""
+        ledger = Path(os.environ.get(
+            "PR_LOOP_SHADOW_LEDGER",
+            STATE_DIR / "shadow-merge.jsonl"))
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        line = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "repo": self.repo, "pr": number, "head": head,
+                "action": "would-enable-auto-merge",
+                "method": self._merge_method(), "role": self.role}
+        with open(ledger, "a") as handle:
+            handle.write(json.dumps(line, sort_keys=True) + "\n")
+
+    # ----- the issue-to-PR path ---------------------------------------------------
+
+    def open_pr_for_issue(self, issue: int, default_branch: str) -> bool:
+        """Run the implementer on the issue in a fresh worktree and open a
+        draft PR labelled pr-loop. The claim on the issue is that PR: a
+        restart finds it by the branch name, never opening a second one."""
+        branch = f"loop/issue-{issue}"
+        wt = WT_ROOT / branch
+        if wt.exists():
+            log(f"issue {issue}: worktree {wt} already exists; leaving it")
+            return False
+        wt.parent.mkdir(parents=True, exist_ok=True)
+        clone = self.config.clone or "."
+        subprocess.run(["git", "-C", clone, "fetch", "origin", "--quiet"])
+        rc = subprocess.run(["git", "-C", clone, "worktree", "add",
+                             str(wt), "-b", branch,
+                             f"origin/{default_branch}"],
+                            capture_output=True, text=True)
+        if rc.returncode != 0:
+            log(f"issue {issue}: could not create the worktree: "
+                f"{(rc.stderr or '').strip().splitlines()[:1]}")
+            return False
+        argv = [self.config.implement_cmd, "--issue", str(issue),
+                "--worktree", str(wt), "--repo", self.repo]
+        if self.config.verify:
+            argv += ["--verify", self.config.verify]
+        if self.config.implementer_profile:
+            argv += ["--profile", self.config.implementer_profile]
+        # The run is foreground here on purpose: exactly one issue starts
+        # this way, its slot is the one the caller already reserved, and a
+        # PR is opened only from a run that exited clean.
+        log(f"issue {issue}: implementing in {wt}")
+        rc = subprocess.run(argv).returncode
+        if rc != 0:
+            log(f"issue {issue}: implementer exit {rc}; keeping the worktree "
+                f"for a person, opening no PR")
+            return False
+        pushed = subprocess.run(["git", "-C", str(wt), "push", "-u", "origin",
+                                 branch], capture_output=True, text=True)
+        if pushed.returncode != 0:
+            log(f"issue {issue}: push failed: "
+                f"{(pushed.stderr or '').strip().splitlines()[:1]}")
+            return False
+        body = (f"Implements #{issue}.\n\nCloses #{issue}. Opened by "
+                f"pr-loop implement from issue {issue}.")
+        try:
+            out = self.gh_json(
+                f"repos/{self.repo}/pulls",
+                "-f", f"title=Implement #{issue}",
+                "-f", f"head={branch}",
+                "-f", f"base={default_branch}",
+                "-f", f"body={body}",
+                "-F", "draft=true")
+            number = out.get("number")
+        except (RuntimeError, json.JSONDecodeError) as exc:
+            log(f"issue {issue}: could not open the PR: {exc}")
+            return False
+        if isinstance(number, int):
+            self.gh("api", "-X", "POST",
+                    f"repos/{self.repo}/issues/{number}/labels",
+                    "-f", f"labels[]={PR_LABEL}", capture=False)
+            log(f"issue {issue}: opened draft PR {number}")
+        return True
+
+    # ----- per-PR handling -------------------------------------------------------
+
+    def handle_pr(self, entry: dict, default_branch: str) -> str | None:
+        """One PR, one gate read, one action. Returns the gate verb."""
+        number = entry["number"]
+        if number in self.running:
+            return None
+        if pr_loop.base_blocked(entry, default_branch, self.scope_cache):
+            if self.last_gate.get(number) != "WAIT base":
+                log(f"PR {number}: gate WAIT base "
+                    f"(base {entry.get('base', {}).get('ref')} is an "
+                    f"unagreed PR)")
+                self.last_gate[number] = "WAIT base"
+            return None
+        parsed = self.gate(number)
+        if parsed is None:
+            # An unreadable gate line is an error reading this PR, and
+            # it counts toward the three that end the loop.
+            return "ERR"
+        verb, arg = parsed
+        line = f"{verb} {arg}".strip()
+        if self.last_gate.get(number) != line:
+            log(f"PR {number}: gate {line}")
+            self.last_gate[number] = line
+        if verb == "ERR":
+            return verb
+        if verb == "ESCALATE":
+            # The gate gave up on this PR (max-rounds, or whatever the
+            # gate names). Same path a twice-failed run takes: label,
+            # comment the reason, notify, free the slot. A person
+            # decides what happens next.
+            self.escalate(number, arg or "the gate escalated this PR")
+            return verb
+
+        if self.role == "implement":
+            if verb == "FIX":
+                # The fix tool takes the review id the gate named:
+                # agent-fix-pr runs the lane on the PR's branch, posts the
+                # answers, and pushes the fix.
+                argv = [self.config.fix_cmd, "--pr", str(number),
+                        "--review", arg, "--repo", self.repo]
+                if self.config.implementer_profile:
+                    argv += ["--profile", self.config.implementer_profile]
+                live = self.minimax_live()
+                if (pr_loop.can_start(self.role,
+                                      self.config.implementer_profile,
+                                      list(self.running.values()),
+                                      self.config, live)
+                        and number not in self.running):
+                    self.start_run(number, "fix", argv)
+                return verb
+            if verb == "AGREED":
+                self.agreed(number, arg)
+                return verb
+        else:  # review
+            if verb == "REVIEW":
+                argv = [self.config.review_cmd, "--pr", str(number),
+                        "--sha", arg, "--repo", self.repo]
+                if self.config.reviewer_profile:
+                    argv += ["--profile", self.config.reviewer_profile]
+                if pr_loop.can_start(self.role, self.config.reviewer_profile,
+                                     list(self.running.values()), self.config,
+                                     self.minimax_live()) and number not in self.running:
+                    self.start_run(number, "review", argv)
+                    # The other side usually answers soon after our post.
+                    self.interval = pr_loop.MIN_INTERVAL_SEC
+                return verb
+            if verb == "REAPPROVE":
+                if self.approve_no_model(number, arg):
+                    log(f"PR {number}: re-approved head {arg[:7]} "
+                        f"(tree unchanged, no model run)")
+                return verb
+        return verb
+
+    def approve_no_model(self, number: int, head: str) -> bool:
+        proc = self.gh("pr", "review", str(number), "--repo", self.repo,
+                       "--approve")
+        return proc.returncode == 0
+
+    # ----- the tick -------------------------------------------------------------
+
+    def tick(self) -> str:
+        """One poll. Returns 'changed', 'quiet', 'error', 'empty', or
+        'fatal <reason>'."""
+        self.reap_runs()
+        # Failed runs escalate: two in a row is the loop giving up.
+        for number, fails in list(self.failures.items()):
+            if pr_loop.should_escalate(fails) and fails < 10**5:
+                self.escalate(number,
+                              f"the {self.role} run failed {fails} times; "
+                              f"see {self.log_dir}")
+                self.failures[number] = 10**6
+
+        changed, etag, body = self.conditional_get(
+            f"repos/{self.repo}/pulls?state=open&sort=updated&per_page=100",
+            self.list_etag)
+        if changed is None:
+            self.gate_errors += 1
+            log(f"list poll error: {etag}")
+            if pr_loop.gate_error_is_terminal(self.gate_errors):
+                return f"fatal list endpoint failing: {body}"
+            return "error"
+        self.list_etag = etag or self.list_etag
+        if not changed:
+            # The list says nothing moved, but per-PR endpoints may know
+            # more: reviews, inline comments and thread replies do not
+            # move the list ETag (measured, #133).
+            return self.tick_pr_activity()
+        try:
+            entries = json.loads(body or "[]")
+        except json.JSONDecodeError as exc:
+            self.gate_errors += 1
+            return f"fatal list body unreadable: {exc}"
+        # The counter is of consecutive gate ERRs, not of failed polls:
+        # a list that answers fine while the gate keeps erroring is
+        # exactly the failure the issue wants the loop to exit on, so a
+        # good list read must not clear it. Only a good gate read (the
+        # per-PR else below) does.
+        self.scope_cache = pr_loop.scope_prs(entries, self.from_n)
+        try:
+            default_branch = self.default_branch()
+        except RuntimeError as exc:
+            self.gate_errors += 1
+            if pr_loop.gate_error_is_terminal(self.gate_errors):
+                return f"fatal default branch unreadable: {exc}"
+            return "error"
+        for entry in self.scope_cache:
+            try:
+                verb = self.handle_pr(entry, default_branch)
+            except (RuntimeError, OSError) as exc:
+                # One PR's gh hiccup is that PR's error, not the loop's
+                # end: it counts, and the next poll re-reads GitHub.
+                log(f"PR {entry['number']}: {exc}")
+                verb = "ERR"
+            if verb == "ERR":
+                self.gate_errors += 1
+                if pr_loop.gate_error_is_terminal(self.gate_errors):
+                    return f"fatal gate failing on PR {entry['number']}"
+            else:
+                self.gate_errors = 0
+        self.interval = pr_loop.next_interval(self.interval, True)
+        if self.role == "implement":
+            self.maybe_take_issue(entries, default_branch)
+        if not self.scope_cache and not self.running:
+            return "empty"
+        return "changed"
+
+    def tick_pr_activity(self) -> str:
+        """Quiet list: conditional GET on each scoped PR's own endpoint."""
+        any_changed = False
+        for entry in getattr(self, "scope_cache", []):
+            number = entry["number"]
+            if number in self.running:
+                continue
+            changed, etag, body = self.conditional_get(
+                f"repos/{self.repo}/pulls/{number}",
+                self.pr_etags.get(number))
+            if changed is None:
+                self.gate_errors += 1
+                if pr_loop.gate_error_is_terminal(self.gate_errors):
+                    return f"fatal PR endpoint failing on {number}: {body}"
+                continue
+            self.pr_etags[number] = etag or self.pr_etags.get(number)
+            if changed:
+                any_changed = True
+                # Re-read the entry itself from the PR endpoint's body so
+                # base/labels are current.
+                try:
+                    fresh = json.loads(body or "{}")
+                    merged = dict(entry, **{
+                        k: fresh[k] for k in ("base", "head", "draft")
+                        if k in fresh})
+                    if isinstance(fresh.get("labels"), list):
+                        merged["labels"] = fresh["labels"]
+                    self.handle_pr(merged, self.default_branch())
+                except json.JSONDecodeError:
+                    pass
+        self.interval = pr_loop.next_interval(self.interval, any_changed)
+        return "changed" if any_changed else "quiet"
+
+    def maybe_take_issue(self, entries: list, default_branch: str) -> None:
+        """Advance to the next item: the lowest open labelled PR still to
+        do, or else the lowest eligible issue. A PR whose last gate line
+        was AGREED or DONE is finished waiting for its merge and does not
+        hold the lane off a new issue."""
+        if len(self.running) >= self.config.slots:
+            return
+        for entry in self.scope_cache:
+            number = entry["number"]
+            if number in self.running:
+                continue  # working on it now
+            if AGREED_LABEL in pr_loop.pr_labels(entry):
+                continue  # agreed, waiting on GitHub to merge
+            last = self.last_gate.get(number, "")
+            if last.startswith("AGREED") or last.startswith("DONE"):
+                continue
+            return  # an open PR still needs this loop; no issue today
+        claimed = set()
+        for e in entries:
+            head = e.get("head")
+            if isinstance(head, dict) and isinstance(head.get("ref"), str):
+                m = re.fullmatch(r"loop/issue-(\d+)", head["ref"])
+                if m:
+                    claimed.add(int(m.group(1)))
+        try:
+            issues = self.gh_json(
+                f"repos/{self.repo}/issues?state=open&per_page=100"
+                "&sort=created&direction=asc")
+        except (RuntimeError, json.JSONDecodeError):
+            return
+        # The issues endpoint mixes PRs in; next_issue drops them.
+        issue = pr_loop.next_issue(issues, self.config.issue_label,
+                                   self.from_n, claimed)
+        if issue is not None:
+            self.open_pr_for_issue(issue, default_branch)
+
+    # ----- main loop -------------------------------------------------------------
+
+    def run(self, config_path: Path) -> int:
+        self.scope_cache = []
+        signal.signal(signal.SIGTERM, self._stop)
+        signal.signal(signal.SIGINT, self._stop)
+        while not self.stopped:
+            outcome = self.tick()
+            if self.once:
+                log(f"once: {outcome}")
+                return 1 if outcome.startswith("fatal") else 0
+            if outcome.startswith("fatal"):
+                log(outcome)
+                return 1
+            if outcome == "empty":
+                log("nothing left in scope")
+                return 0
+            time.sleep(self.interval)
+        # Stopped by signal: no child is left running behind us.
+        for entry in list(self.running.values()):
+            entry["proc"].terminate()
+        deadline = time.time() + 30
+        for entry in self.running.values():
+            remaining = max(0.0, deadline - time.time())
+            try:
+                entry["proc"].wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                entry["proc"].kill()
+        log("stopped")
+        return 0
+
+    def _stop(self, signum, frame) -> None:
+        self.stopped = True
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="pr-loop", description=__doc__.splitlines()[0])
+    parser.add_argument("role", choices=("implement", "review"))
+    parser.add_argument("repo", help="owner/repo")
+    parser.add_argument("--from", dest="from_n", type=int, default=0,
+                        metavar="N", help="lowest PR/issue number in scope")
+    parser.add_argument("--once", action="store_true",
+                        help="one poll, then exit (for tests and cron-free "
+                             "supervision)")
+    parser.add_argument("--config", type=Path,
+                        default=Path(os.environ.get("PR_LOOP_CONFIG",
+                                                    DEFAULT_CONFIG)),
+                        help="config path (default $PR_LOOP_CONFIG, else "
+                             f"{DEFAULT_CONFIG})")
+    args = parser.parse_args(argv)
+
+    if "/" not in args.repo:
+        print(f"pr-loop: repo must be owner/repo, got {args.repo!r}",
+              file=sys.stderr)
+        return 2
+    missing = [t for t in ("pr-loop-gate", "gh")
+               if shutil.which(t) is None]
+    if missing:
+        print(f"pr-loop: {', '.join(missing)} not on PATH", file=sys.stderr)
+        return 2
+    try:
+        loop = Loop(args.role, args.repo, args.from_n, args.config, args.once)
+    except ConfigError as exc:
+        print(f"pr-loop: {exc}", file=sys.stderr)
+        return 2
+    loop.load_notify(args.config)
+    return loop.run(args.config)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
