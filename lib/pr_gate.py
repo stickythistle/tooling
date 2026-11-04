@@ -37,6 +37,15 @@ PENDING_REVIEW_STATE = "PENDING"
 # its `status`, where `COMPLETED` is the only finished value.
 PENDING_STATUS_CONTEXTS = ("PENDING", "EXPECTED")
 
+# The conclusions that are evidence *for* a branch. A conclusion outside
+# the API's vocabulary is no pass: treating "concluded" as "green" is what
+# let a failed check through the merge gate.
+PASSING_CHECK_CONCLUSIONS = ("SUCCESS", "NEUTRAL", "SKIPPED")
+
+# The states that are evidence for a commit status. The statuses API
+# answers the same vocabulary as the check runs, in upper case.
+PASSING_STATUS_STATES = ("SUCCESS", "NEUTRAL", "SKIPPED")
+
 
 class Malformed(Exception):
     """A fetched entry carries a shape outside the API's.
@@ -177,6 +186,42 @@ def pending_checks(checks: list) -> bool:
             if isinstance(state, str) and state in PENDING_STATUS_CONTEXTS:
                 return True
     return False
+
+
+def failed_check_names(checks: list) -> list[str]:
+    """The names of the checks that concluded against the branch.
+
+    A check is a `CheckRun` (a `conclusion`) or a `StatusContext` (a
+    `state`), told apart by `__typename`. A running check is never named.
+
+    Only `success`, `neutral` and `skipped` count as evidence.
+    """
+    failed: list[str] = []
+    for entry in checks:
+        if not isinstance(entry, dict):
+            continue
+        typename = entry.get("__typename")
+        if typename == "CheckRun":
+            status = entry.get("status")
+            if isinstance(status, str) and status != "COMPLETED":
+                # Still running. Not a failure.
+                continue
+            conclusion = entry.get("conclusion")
+            if isinstance(conclusion, str) and \
+                    conclusion.upper() in PASSING_CHECK_CONCLUSIONS:
+                continue
+            name = entry.get("name")
+            failed.append(str(name) if isinstance(name, str) and name else "?")
+        elif typename == "StatusContext":
+            state = entry.get("state")
+            if isinstance(state, str) and state.upper() in PENDING_STATUS_CONTEXTS:
+                # Still running. Not a failure.
+                continue
+            if isinstance(state, str) and state.upper() in PASSING_STATUS_STATES:
+                continue
+            context = entry.get("context")
+            failed.append(str(context) if isinstance(context, str) and context else "?")
+    return failed
 
 
 def validate_comments(comments: list) -> list:

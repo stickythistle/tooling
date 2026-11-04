@@ -28,8 +28,9 @@ the agent host, not this conversation, is the record of what each round did.
    block it changed, and says which flagged blocks it kept and why.
 4. The coordinator waits for CI, then runs `pr-ready`, which takes the PR out of
    draft when the gates and the prose pass.
-5. The coordinator checks the condense pass for lost instructions and reversed
-   negations, confirms the change since its last review is prose only, then
+5. The coordinator runs `merge-check N <worktree>` (see Merge readiness),
+   checks the condense pass for lost instructions and reversed negations,
+   confirms the change since its last review is prose only, then
    approves at that sha.
 6. The coordinator merges.
 
@@ -171,6 +172,28 @@ not another round's.
 ## Merge readiness
 
 Approval means the reviewer has no change to ask for. It comes after `pr-ready` has taken the PR out of draft and after the prose-only check, at the final sha. It does not merge. Say in the approval what the reviewer did not check, such as a merge order two PRs share.
+
+Before approving, run `merge-check N <worktree>` from the lane's worktree. It is the last gate, and it checks what the reviewer used to check from habit:
+
+- the head merges cleanly onto the current base (`git merge-tree` reports no conflict). A branch behind the base needs a rebase only when it conflicts. For a one-commit PR, `HEAD^` is its own merge base.
+- the changed-file set equals that of the sha the reviewer last reviewed. A file the head now changes is a change nobody reviewed.
+- every commit is the lane's identity, as author and as committer alike.
+- in a repository that declares the DCO rule, every commit carries exactly one `Signed-off-by:` trailer naming its author.
+- every check on the head has concluded. Every one of them passed. Only `success`, `neutral` and `skipped` are evidence for a branch. A check that concluded `failure` refuses the merge.
+- no comment from outside the loop is unanswered, in the issue comments, the inline comments, or the reviews. A bot's comment never blocks.
+- the PR carries no `needs-decision` label.
+
+It prints the exact merge line, `gh pr merge --rebase --match-head-commit <sha>`, when every check passes.
+
+A refusal names the check and the observed fact, and asks for no review round. The fix is whichever of them it is:
+
+- the branch conflicts with the base (rebase)
+- a file changed after the review (re-read and re-review, or send it back)
+- a check failed (fix and re-run)
+- the push landed unsigned (re-push)
+- somebody commented (read the comment and answer it)
+
+Run it again when the fact is fixed.
 
 The merge note lists every call the coordinator made on its own.
 

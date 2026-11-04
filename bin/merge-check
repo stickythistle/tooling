@@ -1,0 +1,576 @@
+#!/usr/bin/env python3
+"""Print whether a pull request is ready to merge, and the command that merges it.
+
+    merge-check <pr> [worktree] [--reviewed SHA] [--base REF]
+                  [--signoff|--no-signoff] [--name NAME] [--email EMAIL]
+                  [--reviewer LOGIN] [--implementer LOGIN]
+
+A `gh` failure ends the run with `ERR`.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from merge_check import MergeOutcome, decide  # noqa: E402
+from pr_gate import failed_check_names, pending_checks  # noqa: E402
+
+
+class FetchError(Exception):
+    """A `gh` call failed. `endpoint` names what was being asked for."""
+
+
+def gh(endpoint: str, *args: str) -> str:
+    """Run one `gh api` call and return its stdout.
+
+    A non-zero exit is a failure naming the endpoint.
+    """
+    cmd = ["gh", "api", endpoint, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"{endpoint}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"{endpoint}: {reason}")
+    return proc.stdout
+
+
+def gh_json(endpoint: str, *args: str):
+    """Run one `gh api` call and parse its stdout as JSON."""
+    out = gh(endpoint, *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"{endpoint}: response was not JSON: {exc}") from exc
+
+
+def git(repo_dir: str, *args: str) -> str:
+    """Run one git command in the checkout and return its stdout.
+
+    `cwd` is the checkout, not the caller's directory: a tool invoked from
+    outside the repository would otherwise diff nothing.
+    """
+    cmd = ["git", "-C", repo_dir, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise FetchError(f"git {' '.join(args)}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"git exited {proc.returncode}"
+        raise FetchError(f"git {' '.join(args)}: {reason}")
+    return proc.stdout
+
+
+def git_ok(repo_dir: str, *args: str) -> bool:
+    """Whether a git command succeeds. A command that answers "no" raises
+    nothing."""
+    cmd = ["git", "-C", repo_dir, *args]
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True).returncode == 0
+    except OSError as exc:
+        raise FetchError(f"git {' '.join(args)}: {exc}") from exc
+
+
+def parse_conflict_files(output: str) -> list[str]:
+    """The paths the merge could not resolve, from merge-tree's output.
+
+    Each path is named once, whatever stages it carries. An add/add
+    conflict carries no stage-1 entry: the base never held the path.
+    """
+    lines = output.splitlines()
+    # `--name-only` prints the tree it wrote on the first line, then the
+    # conflicted paths, one per line, then a blank line ending the list.
+    files = []
+    for line in lines[1:]:
+        if not line.strip():
+            break
+        files.append(line)
+    return files
+
+
+def merge_outcome(repo_dir: str, base_tip: str, head: str) -> MergeOutcome:
+    """What merging the base tip into the head would do.
+
+    `git merge-tree --write-tree` writes objects only: the worktree is
+    untouched.
+
+    A conflict and an unusable base tip both exit 1, and the output
+    tells them apart.
+    """
+    cmd = ["git", "-C", repo_dir, "merge-tree", "--write-tree", "--name-only",
+           base_tip, head]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        return MergeOutcome("error", detail=str(exc))
+    output = proc.stdout or ""
+    if proc.returncode == 0:
+        return MergeOutcome("clean")
+    if proc.returncode == 1:
+        files = parse_conflict_files(output)
+        if files:
+            return MergeOutcome("conflict", files=files)
+        # No conflict list on stdout: the command failed for another
+        # reason, and stderr says which.
+        detail = (proc.stderr or "").strip().splitlines()
+        reason = detail[0] if detail else "the merge failed with no conflict list"
+        return MergeOutcome("error", detail=reason)
+    detail = (proc.stderr or "").strip().splitlines()
+    reason = detail[0] if detail else f"git merge-tree exited {proc.returncode}"
+    return MergeOutcome("error", detail=reason)
+
+
+def lane_identity(repo_dir: str) -> tuple[str, str]:
+    """The identity the commits must carry: the lane's, as the harness
+    pins it elsewhere.
+
+    `LANE_GIT_NAME` and `LANE_GIT_EMAIL` are the only source, and one
+    alone refuses. The error message says why the checkout's git config
+    is never consulted.
+    """
+    name = os.environ.get("LANE_GIT_NAME", "").strip()
+    email = os.environ.get("LANE_GIT_EMAIL", "").strip()
+    if not name or not email:
+        raise FetchError(
+            "cannot pin the lane identity: set LANE_GIT_NAME and "
+            "LANE_GIT_EMAIL to the identity the commits must carry. The "
+            "checkout's git config is not used: it says what this "
+            "machine would commit as, not what the repository requires")
+    return name, email
+
+
+def review_login(repo: str, reviewer: str | None) -> str:
+    """The login whose review counts as the review.
+
+    The reviewer is the repository's owner unless told otherwise: the
+    same rule `pr-loop-gate` uses, so the two tools agree about whose
+    review is the review.
+    """
+    return (reviewer or os.environ.get("REVIEWER_LOGIN")
+            or repo.split("/", 1)[0])
+
+
+def latest_review_sha(reviews: list, reviewer: str) -> str:
+    """The commit the reviewer read, from their latest review in any state.
+
+    Any state counts: a review that asked for changes is as much a
+    review as an approval. Only the reviewer's own reviews count.
+    """
+    mine = [
+        r for r in reviews
+        if isinstance(r, dict)
+        and isinstance(r.get("user"), dict)
+        and (r["user"].get("login") or "").casefold() == reviewer.casefold()
+        and isinstance(r.get("commit_id"), str)
+        and r.get("commit_id")
+    ]
+    if not mine:
+        return ""
+
+    def key(r):
+        submitted = r.get("submitted_at")
+        return (submitted if isinstance(submitted, str) else "",
+                r.get("id") if isinstance(r.get("id"), int) else 0)
+
+    return max(mine, key=key)["commit_id"]
+
+
+def blocking_posts(reviews: list, comments: list, reviewer: str,
+                   implementers: list[str]) -> list[dict]:
+    """The third-party posts that nobody has answered yet.
+
+    All three channels are read: the issue comments, the inline
+    comments on the diff, and the reviews.
+
+    A bot is no person. Its posts never block.
+    """
+    ours = {reviewer.casefold()} | {name.casefold() for name in implementers}
+    posts = []
+
+    def post_time(entry: dict) -> str:
+        for key in ("submitted_at", "created_at"):
+            value = entry.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return ""
+
+    for group in (comments, reviews):
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            user = entry.get("user")
+            if not isinstance(user, dict):
+                continue
+            login = user.get("login")
+            if not isinstance(login, str) or not login:
+                continue
+            if login.casefold() in ours:
+                continue
+            if user.get("type") == "Bot":
+                continue
+            posts.append({"login": login, "created_at": post_time(entry),
+                          "at": post_time(entry)})
+
+    # The reviewer's own posts answer a third party's. The latest one
+    # is the only one that matters: a post after it is unanswered, and
+    # a post before it was answered.
+    answered_at = ""
+    for group in (reviews, comments):
+        for entry in group:
+            if not isinstance(entry, dict):
+                continue
+            user = entry.get("user")
+            if not isinstance(user, dict):
+                continue
+            login = user.get("login")
+            if not isinstance(login, str) or login.casefold() != reviewer.casefold():
+                continue
+            when = post_time(entry)
+            if when > answered_at:
+                answered_at = when
+
+    blocking = []
+    for post in posts:
+        when = post["at"]
+        if when and answered_at and when < answered_at:
+            continue
+        blocking.append({"login": post["login"],
+                         "created_at": post["created_at"]})
+    return blocking
+
+
+def commits_between(repo_dir: str, base_ref: str, head: str) -> list[dict]:
+    """The commits the pull request adds, with their author, committer
+    and message.
+
+    The list comes from the object database, not the API: the API's
+    compare paginates, and a longer pull request would leave commits
+    the sign-off check never saw.
+    """
+    out = git(repo_dir, "log", "--format=%H%n%an%n%ae%n%cn%n%ce%n%B%x00",
+              f"{base_ref}..{head}")
+    records = []
+    for block in out.split("\x00"):
+        lines = block.split("\n")
+        if len(lines) < 6 or not lines[0].strip():
+            continue
+        sha = lines[0].strip()
+        name, email = lines[1], lines[2]
+        committer_name, committer_email = lines[3], lines[4]
+        message = "\n".join(lines[5:])
+        records.append({
+            "sha": sha,
+            "author_name": name,
+            "author_email": email,
+            "committer_name": committer_name,
+            "committer_email": committer_email,
+            "message": message,
+        })
+    return records
+
+
+def repo_declares_dco(repo_dir: str) -> bool:
+    """Whether the repository declares the DCO rule.
+
+    The rule is read from the repository's own contribution file.
+
+    "DCO" is matched as a word. A substring match found it inside
+    "hardcoded", and a file saying so turned on the sign-off requirement.
+    """
+    for name in ("CONTRIBUTING.md", "CONTRIBUTING", "CONTRIBUTING.rst",
+                 "contrib/README.md", "docs/CONTRIBUTING.md"):
+        path = Path(repo_dir) / name
+        try:
+            text = path.read_text(errors="replace")
+        except OSError:
+            continue
+        low = text.lower()
+        if "signed-off-by" in low or "developer certificate of origin" in low \
+                or re.search(r"\bdco\b", low):
+            return True
+    return False
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="merge-check",
+        description="Print whether a pull request is ready to merge, and the "
+                    "command that merges it.",
+    )
+    parser.add_argument("pr", help="pull request number")
+    parser.add_argument("worktree", nargs="?", default=None,
+                        help="the checkout to run in (default: the current "
+                             "directory)")
+    parser.add_argument("--reviewed", default=None,
+                        help="the commit the reviewer read (default: the "
+                             "latest approval's commit, else the head)")
+    parser.add_argument("--base", default=None,
+                        help="the base ref to compare against (default: the "
+                             "pull request's own base branch)")
+    parser.add_argument("--signoff", dest="signoff", action="store_true",
+                        default=None,
+                        help="require a DCO Signed-off-by: trailer")
+    parser.add_argument("--no-signoff", dest="signoff", action="store_false",
+                        help="do not require a sign-off trailer")
+    parser.add_argument("--name", default=None,
+                        help="the identity the commits must carry (default: "
+                             "the lane's)")
+    parser.add_argument("--email", default=None,
+                        help="the identity's email (default: the lane's)")
+    parser.add_argument("--reviewer", default=None,
+                        help="the login whose review counts as the review "
+                             "(default: the repository's owner)")
+    parser.add_argument("--implementer", action="append", default=None,
+                        help="a login whose comments are the loop's own "
+                             "rather than a third party's; may be repeated")
+    args = parser.parse_args(argv)
+
+    if not args.pr.isdigit():
+        print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
+        return 2
+    if bool(args.name) != bool(args.email):
+        print("ERR identity: --name and --email must be given together",
+              file=sys.stderr)
+        return 2
+
+    repo_dir = args.worktree or os.getcwd()
+    number = args.pr
+    try:
+        # The pull request's repository, from the checkout's origin
+        # remote: the same read `hermes-review-pr` makes. A path remote
+        # (a test fixture) parses to the last two path components, which
+        # is a valid slug for the `gh` calls the test intercepts.
+        if not git_ok(repo_dir, "rev-parse", "--is-inside-work-tree"):
+            raise FetchError(
+                f"{repo_dir} is not a git checkout: name the worktree "
+                "the pull request lives in")
+        remote = subprocess.run(
+            ["git", "-C", repo_dir, "remote", "get-url", "origin"],
+            capture_output=True, text=True)
+        if remote.returncode != 0:
+            raise FetchError(
+                f"{repo_dir} has no origin remote: name a checkout of "
+                "the repository the pull request lives in")
+        url = remote.stdout.strip().removesuffix(".git")
+        if "://" in url:
+            url = url.split("://", 1)[1]
+        if ":" in url:
+            url = url.rsplit(":", 1)[-1]
+        parts = url.rstrip("/").split("/")
+        if len(parts) < 2 or not parts[-2] or not parts[-1]:
+            raise FetchError(
+                f"cannot read owner/repo from the origin remote "
+                f"{remote.stdout.strip()!r}")
+        repo = "/".join(parts[-2:])
+        pr = gh_json(f"repos/{repo}/pulls/{number}")
+        head = pr.get("head")
+        head_sha = head.get("sha") if isinstance(head, dict) else None
+        if not isinstance(head_sha, str) or not head_sha:
+            raise FetchError(f"repos/{repo}/pulls/{number}: no head sha")
+        base_ref = args.base
+        if base_ref is None:
+            base_branch = pr.get("base")
+            base_branch = base_branch.get("ref") if isinstance(base_branch, dict) else None
+            if not isinstance(base_branch, str) or not base_branch:
+                raise FetchError(f"repos/{repo}/pulls/{number}: no base branch")
+            base_ref = f"origin/{base_branch}"
+        else:
+            base_branch = base_ref.split("/", 1)[-1]
+
+        # The checkout the git checks run in: the caller's directory, which
+        # is the repository the lane works in.
+        #
+        # The base is fetched with an explicit refspec: `git fetch origin
+        # main` writes FETCH_HEAD and leaves `origin/main` where it was.
+        subprocess.run(["git", "-C", repo_dir, "fetch", "--quiet", "origin",
+                        f"{base_branch}:refs/remotes/origin/{base_branch}"],
+                       capture_output=True, text=True)
+
+        # The PR's head is fetched by the ref GitHub mirrors it under, not
+        # by sha: a raw sha from a fork cannot be fetched, and
+        # `refs/pull/<n>/head` is always present on the base repository.
+        proc = subprocess.run(
+            ["git", "-C", repo_dir, "fetch", "--quiet", "origin",
+             f"refs/pull/{number}/head"],
+            capture_output=True, text=True)
+        if proc.returncode != 0:
+            detail = (proc.stderr or "").strip().splitlines()
+            reason = detail[0] if detail else f"git exited {proc.returncode}"
+            raise FetchError(f"git fetch refs/pull/{number}/head: {reason}")
+        # A stale mirror would make the git facts and the API facts
+        # disagree, so the fetched tip is checked against the API.
+        head_git = git(repo_dir, "rev-parse", "FETCH_HEAD").strip()
+        if head_git != head_sha:
+            raise FetchError(
+                f"the pull request's head moved while checking "
+                f"({head_git[:12]} != {head_sha[:12]})")
+
+        base_tip = git(repo_dir, "rev-parse", base_ref).strip()
+        merge_base = git(repo_dir, "merge-base", base_ref, head_sha).strip()
+        head_parent = None
+        if git_ok(repo_dir, "rev-parse", "--verify", "--quiet", f"{head_sha}^"):
+            head_parent = git(repo_dir, "rev-parse", f"{head_sha}^").strip()
+
+        # The merge the base would make, when the branch is behind it.
+        # A branch that carries everything the base has needs no merge,
+        # and none is run.
+        merge = None
+        if merge_base != base_tip:
+            merge = merge_outcome(repo_dir, base_tip, head_sha)
+        # The commit count comes from the object database, not the API's
+        # list: the API paginates and a long-lived PR would undercount.
+        #
+        # Two dots: the commits the branch adds over the base, not the
+        # symmetric difference, which counts base commits too.
+        head_files = git(repo_dir, "diff", "--name-only",
+                         f"{base_ref}...{head_sha}").split()
+        commits = commits_between(repo_dir, base_ref, head_sha)
+        commit_count = len(commits)
+
+        # The reviewed commit: the reviewer's latest review, in any
+        # state. A review that asked for changes is as much a review as
+        # an approval, and it is the newer one when the reviewer changed
+        # their mind.
+
+        # Only the reviewer's own reviews count. The reviewer is the
+        # repository's owner unless told otherwise.
+        reviewer = review_login(repo, args.reviewer)
+        reviews = gh_json(f"repos/{repo}/pulls/{number}/reviews")
+        if not isinstance(reviews, list):
+            reviews = []
+        reviewed_sha = args.reviewed
+        if reviewed_sha is None:
+            reviewed_sha = latest_review_sha(reviews, reviewer)
+            if not reviewed_sha:
+                # The reviewer has never reviewed. There is nothing to
+                # compare the file set against, and falling back to the
+                # head compares the head with itself -- which cannot
+                # fail, and so says nothing.
+                raise FetchError(
+                    f"the reviewer {reviewer} has not reviewed this pull "
+                    f"request: there is no reviewed commit to compare the "
+                    f"head against")
+        if not git_ok(repo_dir, "rev-parse", "--verify", "--quiet",
+                      f"{reviewed_sha}^{{commit}}"):
+            raise FetchError(
+                f"cannot diff against the reviewed sha "
+                f"{reviewed_sha[:12]}: it is not in the checkout")
+        reviewed_files = git(repo_dir, "diff", "--name-only",
+                             f"{base_ref}...{reviewed_sha}").split()
+
+        checks = gh_json(f"repos/{repo}/commits/{head_sha}/check-runs",
+                         "-f", "per_page=100")
+        rollup = []
+        if isinstance(checks, dict):
+            for run in checks.get("check_runs") or []:
+                if isinstance(run, dict):
+                    entry = dict(run)
+                    entry["__typename"] = "CheckRun"
+                    rollup.append(entry)
+        statuses = gh_json(f"repos/{repo}/commits/{head_sha}/status")
+        if isinstance(statuses, dict):
+            for ctx in statuses.get("statuses") or []:
+                if isinstance(ctx, dict):
+                    entry = dict(ctx)
+                    entry["__typename"] = "StatusContext"
+                    # The REST statuses API answers a lowercase `state`
+                    # (`pending`, `success`), while `pending_checks` was
+                    # written for the GraphQL rollup, whose StatusContext
+                    # carries `PENDING` and `EXPECTED`.
+
+                    # Normalizing here keeps the shared helper honest for
+                    # both shapes; a lowercase `pending` left as-is would
+                    # go uncounted and the tool would say READY while a
+                    # status ran.
+                    state = entry.get("state")
+                    if isinstance(state, str):
+                        entry["state"] = state.upper()
+                    rollup.append(entry)
+        checks_pending = pending_checks(rollup)
+        pending_names = []
+        for entry in rollup:
+            if entry.get("__typename") == "CheckRun":
+                if entry.get("status") != "COMPLETED":
+                    pending_names.append(str(entry.get("name") or "?"))
+            elif entry.get("__typename") == "StatusContext":
+                if entry.get("state") in ("PENDING", "EXPECTED"):
+                    pending_names.append(str(entry.get("context") or "?"))
+        # The checks that concluded against the branch. A check that
+        # concluded is no thereby green: only `success`, `neutral` and
+        # `skipped` are, and anything else refuses the merge.
+        failing_names = failed_check_names(rollup)
+
+        labels = []
+        for label in pr.get("labels") or []:
+            if isinstance(label, dict) and isinstance(label.get("name"), str):
+                labels.append(label["name"])
+
+        # A person who commented is input to the loop. The three
+        # channels are read: the issue comments, the inline comments on
+        # the diff, and the reviews.
+        issue_comments = gh_json(f"repos/{repo}/issues/{number}/comments")
+        inline_comments = gh_json(f"repos/{repo}/pulls/{number}/comments")
+        implementers = list(args.implementer or [])
+        implementers += (os.environ.get("IMPLEMENTER_LOGINS") or "").split()
+        third_party = blocking_posts(
+            reviews,
+            (list(issue_comments) if isinstance(issue_comments, list) else [])
+            + (list(inline_comments) if isinstance(inline_comments, list) else []),
+            reviewer, implementers)
+
+        if args.name and args.email:
+            expected_name, expected_email = args.name, args.email
+        else:
+            expected_name, expected_email = lane_identity(repo_dir)
+
+        require_signoff = args.signoff
+        if require_signoff is None:
+            require_signoff = repo_declares_dco(repo_dir)
+
+        verdict = decide(
+            base_tip=base_tip,
+            head=head_sha,
+            merge_base=merge_base,
+            head_parent=head_parent,
+            commit_count=commit_count,
+            merge=merge,
+            head_files=head_files,
+            reviewed_files=reviewed_files,
+            reviewed_sha=reviewed_sha,
+            commits=commits,
+            expected_name=expected_name,
+            expected_email=expected_email,
+            require_signoff=require_signoff,
+            checks_pending=checks_pending,
+            pending_names=pending_names,
+            failing_names=failing_names,
+            third_party=third_party,
+            labels=labels,
+        )
+    except FetchError as exc:
+        print(f"ERR {exc}", file=sys.stderr)
+        return 1
+
+    if not verdict.ok:
+        for failure in verdict.failures:
+            print(f"FAIL {failure}", file=sys.stderr)
+        print(f"NOT READY: {len(verdict.failures)} check(s) failed", file=sys.stderr)
+        return 1
+
+    print("READY")
+    print(verdict.merge_command)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

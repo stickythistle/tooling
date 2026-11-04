@@ -45,6 +45,18 @@ name = "main watch tests"
 when = '^(bin/main-watch|lib/main_watch\.py|tests/test_main_watch\.py)$'
 run = "python3 tests/test_main_watch.py"
 
+# The merge gate and its test. `merge-check` is the reviewer's last gate:
+# the head sits on the current base, the change is the change that was
+# reviewed, the commits are signed the way the repository asks, and CI
+# has finished.
+
+# It prints the command that merges the pull request. The decision is
+# tested against recorded facts, so the suite needs no pull request.
+[[gates]]
+name = "merge-check tests"
+when = '^(bin/merge-check|lib/merge_check\.py|tests/test_merge_check\.py)$'
+run = "python3 tests/test_merge_check.py"
+
 [[gates]]
 name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'
