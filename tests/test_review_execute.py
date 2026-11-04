@@ -862,7 +862,7 @@ def test_driver_execute_phase_parks_findings_naming_the_reviewed_head():
             "observed": "AssertionError", "recommendation": "fix",
         }])
         assert result.returncode == 0, f"exit {result.returncode}: {result.stderr}"
-        wt = tmp / "wt" / "review-pr-1"
+        wt = tmp / "wt" / "review-pr-1-rev"
         notes = wt / "EXECUTION_NOTES.json"
         assert notes.exists(), result.stderr
         doc = json.loads(notes.read_text())
@@ -929,8 +929,8 @@ def test_driver_execute_phase_uses_a_worktree_at_the_reviewed_head():
             "the execution worktree is not at the reviewed head"
         # And the artifact worktree is on its own branch, carrying the
         # findings commit.
-        artifact_wt = tmp / "wt" / "review-pr-1"
-        assert git(artifact_wt, "rev-parse", "--abbrev-ref", "HEAD") == "review/pr-1"
+        artifact_wt = tmp / "wt" / "review-pr-1-rev"
+        assert git(artifact_wt, "rev-parse", "--abbrev-ref", "HEAD") == "review/pr-1-rev"
 
 
 def main() -> int:

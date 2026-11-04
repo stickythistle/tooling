@@ -266,6 +266,12 @@ def build_tool(tmp: Path, reviewer: Path) -> Path:
     (tool_root / "bin" / "hermes-review-pr").chmod(0o755)
     for name in ("stack-attrib", "stack-plan"):
         shutil.copy(REPO_ROOT / "bin" / name, tool_root / "bin" / name)
+    # The driver refuses to start when the execution lane is not
+    # executable beside it, so the copy has to carry it.
+    execute = REPO_ROOT / "bin" / "review-execute"
+    if execute.exists():
+        shutil.copy(execute, tool_root / "bin" / "review-execute")
+        (tool_root / "bin" / "review-execute").chmod(0o755)
     scripts_dir = tool_root / "skills" / "hermes-review" / "scripts"
     scripts_dir.mkdir(parents=True)
     shutil.copy(reviewer, scripts_dir / "hermes-scrutinize.sh")
