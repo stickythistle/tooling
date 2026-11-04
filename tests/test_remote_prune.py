@@ -12,10 +12,12 @@ decision is pinned without depending on the local clock.
 The dry-run report is what an operator reads before `--prune`, so every label it
 prints is pinned against the bench it was given.
 """
+import hashlib
 import os
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -94,9 +96,15 @@ def make_fakebin(tmpdir: Path, idle_days: int = 0,
     """A fake ssh answering the bench listing and the size queries.
 
     `idle_days=0` makes every unlanded tree old by the predicate, so the idle
-    path runs without depending on the clock. `landed_bytes` is what `du -sb`
-    returns, pinned so a regression that zeroes the sum without changing a
-    label is caught. `bench_rc` non-zero exercises the unreachable branch.
+    path runs without depending on the clock. `landed_bytes` is what the
+    bench-info query returns as the size, pinned so a regression that zeroes
+    the sum without changing a label is caught. `bench_rc` non-zero exercises
+    the unreachable branch.
+
+    The bench-info query (`bash -s -- <name>`) returns `<mtime> <size>`; the
+    mtime is `date +%s`, i.e. now, which is strictly after the test branch was
+    created, so the fresh-branch signal does not fire. The idle query
+    (`bash -s -- <name> <days>`) is the two-arg form.
     """
     fake = tmpdir / "fakebin"
     fake.mkdir()
@@ -122,15 +130,20 @@ case "$HOST" in
   fakehost)
     if [[ "$CMD" == "ls -1 \\$HOME/bench"* ]]; then
 {bench_block}      exit {bench_rc}
-    elif [[ "$CMD" == "du -sb "* ]]; then
-      # Both `du -sb <tree>` (landed) and the per-idle check return a
-      # fixed byte count; the test pins labels, not numbers, so this is
-      # enough to exercise the report and the lock-protected rm.
-      echo "{landed_bytes}"
     elif [[ "$CMD" == "flock \\$HOME/bench/.lock"* ]]; then
       cat
     elif [ "$1" = "bash" ] && [ "$2" = "-s" ]; then
-{inc_block}    fi
+      shift 3
+      if [ "$#" -eq 1 ]; then
+        # bench-info query: one arg (the dir name). mtime defaults to now
+        # (newer than the branch's creation, so the fresh-branch signal
+        # does not fire); the test can pin an old mtime via
+        # FAKE_BENCH_MTIME to exercise that signal instead.
+        echo "${{FAKE_BENCH_MTIME:-$(date +%s)}} {landed_bytes}"
+      else
+        # idle query: two args (dir name, days).
+{inc_block}      fi
+    fi
     ;;
 esac
 """
@@ -138,6 +151,69 @@ esac
     p.write_text(script)
     p.chmod(0o755)
     return fake
+
+
+def make_bench_fake(tmpdir: Path, bench_names: tuple,
+                    mtime_expr: str, size: int = 777) -> Path:
+    """A fake ssh that lists exactly `bench_names` and answers the
+    bench-info query with a caller-chosen mtime. `mtime_expr` is a shell
+    word (e.g. `$(date +%s)` or a literal) so a test can pin the bench
+    dir's mtime relative to a branch's creation. The idle query answers
+    non-zero so no incremental dir is ever proposed.
+    """
+    fake = tmpdir / "benchfake"
+    fake.mkdir()
+    block = "\n".join(f'echo "{n}"' for n in bench_names) + "\n"
+    script = f"""#!/bin/bash
+HOST=$1; shift
+CMD="$*"
+case "$HOST" in
+  fakehost)
+    if [[ "$CMD" == "ls -1 \\$HOME/bench"* ]]; then
+{block}    elif [[ "$CMD" == "flock \\$HOME/bench/.lock"* ]]; then
+      cat
+    elif [ "$1" = "bash" ] && [ "$2" = "-s" ]; then
+      shift 3
+      if [ "$#" -eq 1 ]; then
+        echo "{mtime_expr} {size}"
+      else
+        cat > /dev/null
+        exit 1
+      fi
+    fi
+    ;;
+esac
+"""
+    (fake / "ssh").write_text(script)
+    (fake / "ssh").chmod(0o755)
+    return fake
+
+
+def add_fresh_branch_worktree(project: Path, tmpdir: Path,
+                              dirname: str, dirty: bool) -> Path:
+    """A worktree on a fresh branch cut from main, with no commits ahead.
+
+    `dirname` is in the alphabet tree_name emits, so the bench dir a
+    builder would make for it is named exactly `dirname`. `dirty` leaves
+    uncommitted edits in the tree.
+    """
+    wt = tmpdir / dirname
+    git(project, "worktree", "add", "--quiet", str(wt), "-b",
+        dirname + "_branch", "main")
+    if dirty:
+        (wt / "WIP").write_text("mid-implementation\n")
+    return wt.resolve()
+
+
+def write_lane_final(state_root: Path, worktree: Path,
+                     sha: str) -> None:
+    """Plant the lane-final record so `lane-settled` reads the tree as
+    settled at `sha`. A settled, clean tree is the shape where the
+    fresh-branch signal is the only thing that keeps its bench dir."""
+    h = hashlib.sha256(str(worktree).encode()).hexdigest()
+    target = state_root / "lane-final" / h
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"sha={sha}\nlast_edit_at={time.strftime('%Y-%m-%dT%H:%M:%SZ')}\n")
 
 
 def run_prune(project: Path, fakebin: Path, *args: str,
@@ -262,13 +338,17 @@ case "$HOST" in
     if [[ "$CMD" == "ls -1 \\$HOME/bench"* ]]; then
       echo "wt_landed"
       echo "ghost_tree"
-    elif [[ "$CMD" == "du -sb "* ]]; then
-      echo "9999"
     elif [[ "$CMD" == "flock \\$HOME/bench/.lock"* ]]; then
       cat > "{log_file}"
     elif [ "$1" = "bash" ] && [ "$2" = "-s" ]; then
-      cat > /dev/null
-      echo "0"
+      shift 3
+      if [ "$#" -eq 1 ]; then
+        # bench-info query: mtime now, size 9999.
+        echo "$(date +%s) 9999"
+      else
+        cat > /dev/null
+        echo "0"
+      fi
     fi
     ;;
 esac
@@ -482,6 +562,118 @@ def test_hostile_bench_name_is_refused(failures: list) -> None:
                   "not one this tooling produces", r.stdout, failures)
 
 
+
+def test_fresh_branch_dirty_keeps_bench(failures: list) -> None:
+    """The issue's bug: a fresh branch with uncommitted edits and no commits
+    ahead of main reads "landed" from `git cherry`, and its bench dir went in
+    the `landed` set and was removed whole. A dirty tree carries work, so the
+    dir must stay under `--prune`.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project, _ = setup_project(tmp)
+        add_fresh_branch_worktree(project, tmp, "wt_fresh", dirty=True)
+        fake = make_bench_fake(tmp, ("wt_fresh",), "$(date +%s)")
+        r = run_prune(project, fake, "--prune")
+        if r.returncode != 0:
+            fail(failures, "fresh-dirty exit", f"got {r.returncode} {r.stderr!r}")
+        # It is carried, not landed.
+        assert_in("fresh-dirty named carrying",
+                  "carrying unlanded work", r.stdout, failures)
+        assert_in("fresh-dirty name under carrying", "wt_fresh", r.stdout, failures)
+        landed = r.stdout.split("landed, safe to remove")[-1].split("==>")[0]             if "landed, safe to remove" in r.stdout else ""
+        assert_not_in("fresh-dirty not in landed list",
+                      "wt_fresh", landed, failures)
+        # --prune must not list it for rm either: the only rm list is the
+        # landed one, and it is empty here.
+        assert_not_in("fresh-dirty not rm'd",
+                      "rm -rf $wt_fresh", r.stdout, failures)
+
+
+def test_fresh_branch_clean_and_settled_keeps_bench(failures: list) -> None:
+    """The other half of the bug with the dirty-tree signal removed: a clean,
+    settled fresh branch still carries no commits, and the bench dir's mtime
+    predates the branch. The fresh-branch signal is the only one left to keep
+    it.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project, _ = setup_project(tmp)
+        wt = add_fresh_branch_worktree(project, tmp, "wt_freshc", dirty=False)
+        # Settle the tree so the lane-held and dirty signals are both false:
+        # the fresh-branch signal is the only thing left to keep the dir.
+        state = tmp / "state"
+        state.mkdir()
+        tip = git(wt, "rev-parse", "HEAD").stdout.strip()
+        write_lane_final(state, wt, tip)
+        # mtime pinned to the epoch: strictly older than the branch created
+        # seconds ago, so the bench dir predates the branch.
+        fake = make_bench_fake(tmp, ("wt_freshc",), "1")
+        r = run_prune(project, fake, env_extra={"AGENT_STATE_DIR": str(state)})
+        if r.returncode != 0:
+            fail(failures, "fresh-clean exit", f"got {r.returncode} {r.stderr!r}")
+        assert_in("fresh-clean named carrying",
+                  "carrying unlanded work", r.stdout, failures)
+        assert_in("fresh-clean name under carrying", "wt_freshc", r.stdout, failures)
+
+
+def test_fresh_branch_dirty_and_new_bench_keeps_bench(failures: list) -> None:
+    """Signal isolation: the bench dir's mtime postdates the branch (so the
+    fresh-branch signal is false) and a live lane holds the tree (so the
+    lane-held signal is true).
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project, _ = setup_project(tmp)
+        wt = add_fresh_branch_worktree(project, tmp, "wt_livelane", dirty=True)
+        state = tmp / "state"
+        state.mkdir()
+        # A live pid (the test's own) in the lane-active marker: lane-settled
+        # reports the tree as held and exits 1.
+        import hashlib
+        h = hashlib.sha256(str(wt).encode()).hexdigest()
+        act = state / "lane-active" / h
+        act.parent.mkdir(parents=True, exist_ok=True)
+        act.write_text(str(os.getpid()) + "\n")
+        fake = make_bench_fake(tmp, ("wt_livelane",), "$(date +%s)")
+        r = run_prune(project, fake, env_extra={"AGENT_STATE_DIR": str(state)})
+        if r.returncode != 0:
+            fail(failures, "live-lane exit", f"got {r.returncode} {r.stderr!r}")
+        assert_in("live-lane named carrying",
+                  "carrying unlanded work", r.stdout, failures)
+        assert_in("live-lane name under carrying", "wt_livelane", r.stdout, failures)
+
+
+def test_merged_clean_branch_still_lands(failures: list) -> None:
+    """The counter-case that must not be over-corrected: a clean, settled
+    branch whose commits are on main and whose bench dir's mtime postdates
+    the branch. All three carry-work signals are false, so the dir still
+    goes in the `landed` set.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        project, _ = setup_project(tmp)
+        wt = add_fresh_branch_worktree(project, tmp, "wt_merged", dirty=False)
+        state = tmp / "state"
+        state.mkdir()
+        tip = git(wt, "rev-parse", "HEAD").stdout.strip()
+        write_lane_final(state, wt, tip)
+        # mtime now: newer than the branch's creation, so the fresh-branch
+        # signal is false.
+        fake = make_bench_fake(tmp, ("wt_merged",), "$(date +%s)")
+        r = run_prune(project, fake, "--prune",
+                      env_extra={"AGENT_STATE_DIR": str(state)})
+        if r.returncode != 0:
+            fail(failures, "merged exit", f"got {r.returncode} {r.stderr!r}")
+        assert_in("merged named landed", "landed, safe to remove", r.stdout, failures)
+        landed = r.stdout.split("landed, safe to remove")[-1].split("==>")[0]
+        assert_in("merged name under landed", "wt_merged", landed, failures)
+        if "carrying unlanded work" in r.stdout:
+            carrying = r.stdout.split("carrying unlanded work")[-1].split("==>")[0]
+            assert_not_in("merged not under carrying",
+                          "wt_merged", carrying, failures)
+
+
 def main() -> int:
     failures: list = []
     test_dry_run_partitions_bench(failures)
@@ -492,6 +684,10 @@ def main() -> int:
     test_fresh_incremental_is_not_dropped(failures)
     test_trunk_checkout_is_not_landed(failures)
     test_hostile_bench_name_is_refused(failures)
+    test_fresh_branch_dirty_keeps_bench(failures)
+    test_fresh_branch_clean_and_settled_keeps_bench(failures)
+    test_fresh_branch_dirty_and_new_bench_keeps_bench(failures)
+    test_merged_clean_branch_still_lands(failures)
 
     if failures:
         print("FAIL:")
