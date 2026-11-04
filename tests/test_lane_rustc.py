@@ -272,6 +272,17 @@ def _write_fresh_lane_implementer(tmp: Path) -> Path:
                 *) shift ;;
             esac
         done
+        # The worktree is required, and an empty one is refused rather
+        # than defaulted. `git -C ""` means the current directory, so a
+        # fake run by hand without --worktree would commit into
+        # whatever repository the shell happened to be in -- which, in a
+        # lane's own worktree, is the lane's branch. The parameter
+        # expansion below refuses with the variable's name rather than a
+        # message someone has to keep in step with the code.
+        #
+        # The braces are doubled: this is an f-string, and a single
+        # brace would be read as a Python substitution.
+        : "${{wt:?the fake implementer needs --worktree; refusing to act on the current directory}}"
         # wt is like <tmp>/wt/issue-1; the script's parent <tmp>
         # holds repo/ next to wt/ and origin.git. The repo is the
         # primary checkout bound to `main`, so amending it rewrites

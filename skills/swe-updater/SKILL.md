@@ -177,6 +177,17 @@ reviewer has to agree with, so name them rather than leaving them to be found.
   consumer. List those paths, check that each one has the inputs your check
   reads, and prefer the mechanism the project already runs everywhere over a new
   one that only your command exercises.
+- **Experiments happen in a scratch copy, never in the worktree you are
+  changing.** A fake, a helper, a destructive git command — a
+  `git commit --amend`, a `git reset --hard`, a `git clean` — runs in a
+  `mktemp -d` copy. A fake given an empty worktree path acts on the
+  current directory instead: it amends *this* branch and takes your
+  uncommitted work with it.
+- **Do not export `GIT_*` or driver settings in the shell you commit from.**
+  An export persists into every later command in that shell, so a
+  `GIT_AUTHOR_NAME` you exported to try something out is the identity
+  your commits carry. Set it for one command, or in a subshell, or not at
+  all.
 
 ## Pitfalls
 - **Touching a trunk.** All work stays on the caller's branch.

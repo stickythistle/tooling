@@ -279,6 +279,16 @@ name = "finding-check tests"
 when = '^(bin/finding-check|tests/test_finding_check\.py)$'
 run = "python3 tests/test_finding_check.py"
 
+# The fakes that run git on a path from their arguments, and the lane
+# skills that say an experiment belongs in a scratch copy. The gate
+# names the test files whose fakes are guarded and the two skills that
+# carry the rule, so a change to any of them runs the suite that pins
+# them.
+[[gates]]
+name = "fake guards tests"
+when = '^(tests/test_fake_guards\.py|tests/test_agent_fix_pr\.py|tests/test_lane_rustc\.py|tests/test_lane_settled\.py|skills/swe-updater/SKILL\.md|skills/swe-review-fix/SKILL\.md)$'
+run = "python3 tests/test_fake_guards.py"
+
 [[gates]]
 name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'

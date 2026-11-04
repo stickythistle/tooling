@@ -86,6 +86,13 @@ FAKE_IMPLEMENTER = textwrap.dedent("""\
     #!/usr/bin/env bash
     # --worktree is the tree the lane is handed.
     while [[ $# -gt 0 ]]; do [[ $1 == --worktree ]] && wt=$2; shift; done
+    # The worktree is required, and an empty one is refused rather than
+    # defaulted. `cd ""` succeeds and stays where it is, so a fake run
+    # by hand without --worktree would amend whatever repository the
+    # shell happened to be in -- which, in a lane's own worktree, is
+    # the lane's branch. ${wt:?} refuses with the variable's name
+    # rather than a message someone has to keep in step with the code.
+    : "${wt:?the fake implementer needs --worktree; refusing to act on the current directory}"
     work=$(mktemp -d)
     echo "fixed it" >"$work/HANDOVER.md"
     cd "$wt"
