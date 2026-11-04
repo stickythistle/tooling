@@ -37,8 +37,8 @@ SETTLE=${HERMES_IMPLEMENT_SETTLE:-120}
 usage() {
 	cat <<'EOF'
 usage: hermes-implement --issue N --worktree PATH [--repo OWNER/NAME]
-                        [--verify CMD] [--extra TEXT] [--profile NAME]
-                        [--no-commit]
+                        [--verify CMD] [--extra TEXT] [--brief FILE]
+                        [--profile NAME] [--no-commit]
 
 --profile selects the agent profile, which chooses both the model and the host.
 Your profiles are your own; `issue-grade --lanes` names the same set, and the
@@ -61,14 +61,21 @@ the flag, a run that commits nothing has failed, and says so.
 --verify defaults to `gate-verify <worktree>`, which picks its gates from the
 diff rather than from whoever wrote the dispatch.
 
-Prints the run's private directory on stdout. It holds the issue text, every
-attempt's transcript, the session name the run resumed, and the lane's
-HANDOVER.md, and is the lane's TMPDIR.
+--brief names a written brief: the work item, with its own format, context,
+mechanism and acceptance criteria. The file is copied into the run directory
+and the lane is pointed at it, so a brief of any size reaches the lane
+whole. It sits beside --extra, which stays for short notes: --extra is text
+in the prompt, --brief is a file. A brief outranks the issue text, and the
+`brief` skill says what a brief is.
+
+Prints the run's private directory on stdout. It holds the issue text, the
+brief, every attempt's transcript, the session name the run resumed, and the
+lane's HANDOVER.md, and is the lane's TMPDIR.
 EOF
 }
 
 # Empty means the root profile, which is the dense 27B quality lane.
-ISSUE="" WORKTREE="" REPO="" EXTRA="" VERIFY="" PROFILE=""
+ISSUE="" WORKTREE="" REPO="" EXTRA="" VERIFY="" PROFILE="" BRIEF=""
 # Whether the brief asks for a commit. A run that is meant to leave the
 # branch alone is a different thing from a run that failed to change it,
 # and the verdict at the end has to tell them apart.
@@ -80,6 +87,7 @@ while [[ $# -gt 0 ]]; do
 	--repo) REPO="$2"; shift 2 ;;
 	--verify) VERIFY="$2"; shift 2 ;;
 	--extra) EXTRA="$2"; shift 2 ;;
+	--brief) BRIEF="$2"; shift 2 ;;
 	--profile) PROFILE="$2"; shift 2 ;;
 	--no-commit) NO_COMMIT=1; shift ;;
 	-h | --help) usage; exit 0 ;;
@@ -161,6 +169,58 @@ else
 	COMMIT_INSTRUCTION="Commit your work on $BRANCH and stop."
 fi
 
+# The brief is copied into the run directory and the lane is pointed at it.
+# The copy is kept: a run has to record what it was asked to do.
+BRIEF_PATH=""
+if [[ -n "$BRIEF" ]]; then
+	[[ -r "$BRIEF" ]] || { echo "brief not readable: $BRIEF" >&2; exit 2; }
+	BRIEF_PATH="$WORK/brief.md"
+	# The copy is checked, not just attempted. A `cp` inside an `if` block
+	# leaves the script up under `set -e`, so a brief that cannot be copied
+	# would leave an empty file and the lane would believe it had one.
+	if ! cp "$BRIEF" "$BRIEF_PATH"; then
+		echo "could not copy the brief into the run directory: $BRIEF" >&2
+		exit 1
+	fi
+	[[ -s "$BRIEF_PATH" ]] || { echo "the brief is empty: $BRIEF" >&2; exit 2; }
+fi
+
+# The brief reaches the lane as a path, not as text. A brief inside the
+# prompt competes with the prompt for the reader's attention. The prompt
+# says where it is and that it outranks the issue text.
+BRIEF_PROMPT=""
+if [[ -n "$BRIEF_PATH" ]]; then
+	BRIEF_PROMPT="
+**The work item is a brief, not the issue text.** The brief is at
+$BRIEF_PATH. Read it in full before editing anything, and follow it in
+place of the issue text: where the brief and the issue disagree, the
+brief wins. The brief names the files to read first, the mechanism and
+the tempting wrong one, the constraints, the test that must fail first,
+and the acceptance criteria. If the brief contradicts the code, write
+BLOCKED.md in the worktree and stop rather than guess.
+
+The brief's format is defined by the brief skill. Load it alongside the
+one you are already using:
+"
+fi
+
+# The skills the lane runs with. A brief is composed with the skill that
+# carries the work out: the brief skill defines the format, and the other
+# skill still knows how to implement, verify and commit.
+SKILLS="${HERMES_IMPLEMENT_SKILLS:-swe-updater,swe-tester}"
+if [[ -n "$BRIEF_PATH" ]]; then
+	SKILLS="brief,$SKILLS"
+fi
+
+# The retry names the brief too. A resumed attempt that has lost the
+# brief's path re-derives the work from the issue text.
+BRIEF_RETRY=""
+if [[ -n "$BRIEF_PATH" ]]; then
+	BRIEF_RETRY="
+The brief is at $BRIEF_PATH. It is still the work item, and it still
+outranks the issue text."
+fi
+
 PROMPT=$(
 	cat <<EOF
 Implement one issue in the repository checked out at $WORKTREE.
@@ -169,6 +229,7 @@ Follow the swe-updater skill. The branch and worktree already exist: you are on
 $BRANCH, based on the remote default branch. Skip the skill's ingest phase --
 the work item is the issue below, not a REVIEW_NOTES.md file -- and do not
 create, switch, or push any branch. $COMMIT_INSTRUCTION
+$BRIEF_PROMPT
 
 **An accidental \`gh\` call in this run fails, and that is deliberate.** \`gh\`
 is pointed at an empty config directory here, so \`gh auth status\` inside this
@@ -637,6 +698,7 @@ $uncommitted
 - $WORK/HANDOVER.md: $handover_state
 
 $resume_instruction The issue is #$ISSUE at $WORK/issue.txt.
+$BRIEF_RETRY
 $EXTRA
 
 Follow the same brief the first attempt got.
