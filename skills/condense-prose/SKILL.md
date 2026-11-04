@@ -28,6 +28,8 @@ Findings, most-mechanical first:
 | `negative-space` | describes what a thing isn't or where it isn't | delete or restructure until self-evident |
 | `oversize` | over `--min-words` (40) | rewrite as one flat declarative per surviving fact |
 
+A table is never oversize: its length comes from its row count, and a row is judged on its own.
+
 ## Cut beyond what the finder sees
 
 - **Same rule stated three ways.** Keep one. "Verification accumulates … a requirement is verified by the set of tests that mark it … so a partial test still marks it" is one sentence, not three.

@@ -113,6 +113,33 @@ BODY_WITH_SESSION_LINK = (
 )
 BODY_WITHOUT_SESSION_LINK = "Why this exists.\n\nCloses #1\n"
 
+# A Markdown table long enough to be flagged ``oversize`` when the whole table
+# is scored as one block. Each row's description is short; the table's length
+# comes from its row count, not from any one row saying too much.
+TABLE_OVERSIZE = """\
+# Gauntlet
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `FOO` | The first knob that the operator turns when a build goes sideways | `bar` |
+| `BAZ` | The second knob that the operator turns when a build goes sideways | `qux` |
+"""
+
+# The same table beside a paragraph the file states in prose, with one row
+# repeating that paragraph's wording. The row is an echo. The second row's
+# wording is deliberately unlike the paragraph, so a test can tell the rows
+# apart.
+TABLE_WITH_ECHO_ROW = """\
+# Gauntlet
+
+The first knob that the operator turns when a build goes sideways.
+
+| Variable | Meaning | Default |
+| --- | --- | --- |
+| `FOO` | The first knob that the operator turns when a build goes sideways | `bar` |
+| `BAZ` | Retention window, in hours, for the cached index | `qux` |
+"""
+
 
 def _load_module() -> ModuleType:
     """Import find_prose.py from disk so the test reads the same source the gate invokes, not a cached copy installed elsewhere."""
@@ -639,6 +666,282 @@ def case_hash_commented_files_scanned(failures: list[str]) -> None:
                      f"paths={sorted(paths)}")
 
 
+def case_table_is_never_oversize(failures: list[str]) -> None:
+    """A table's length comes from its row count, so no table is ever
+    ``oversize``. A table longer than ``--min-words`` reports nothing."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "table.md").write_text(TABLE_OVERSIZE)
+        proc = run_find_prose("table.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        tables = [b for b in blocks if b["kind"] == "table"]
+        if tables:
+            fail(failures, "table-oversize: table flagged",
+                 f"findings={[b['findings'] for b in tables]}")
+        if any("oversize" in b["findings"] for b in blocks):
+            fail(failures, "table-oversize: oversize raised on a table's rows",
+                 f"blocks={[(b['kind'], b['findings']) for b in blocks]}")
+
+    # The table really is long enough to trip the old whole-block scoring.
+    module = _load_module()
+    blocks = module.markdown_blocks("table.md", TABLE_OVERSIZE)
+    table = [b for b in blocks if b.kind == "table"]
+    if not table:
+        fail(failures, "table-oversize: no table block parsed")
+        return
+    if table[0].words <= 40:
+        fail(failures, "table-oversize: fixture is not over the threshold",
+             f"words={table[0].words}")
+
+
+def case_table_rows_are_rows(failures: list[str]) -> None:
+    """``table_rows`` yields one entry per table line, not one per cell, and
+    skips the header separator."""
+    module = _load_module()
+    blocks = module.markdown_blocks("table.md", TABLE_OVERSIZE)
+    table = [b for b in blocks if b.kind == "table"]
+    if not table:
+        fail(failures, "table-rows: no table block parsed")
+        return
+
+    rows = module.table_rows(table[0])
+    if len(rows) != 3:
+        fail(failures, "table-rows: expected 3 rows (header + 2 body)",
+             f"got {len(rows)}: {rows!r}")
+        return
+
+    # The separator row carries no prose and must not be a row.
+    for _, text, _cells in rows:
+        if set(text) <= set("-: |"):
+            fail(failures, "table-rows: header separator yielded as a row",
+                 f"rows={rows!r}")
+
+    # A row is the whole line, so it holds every one of that row's cells.
+    body = [text for _, text, _cells in rows if "`FOO`" in text]
+    if not body:
+        fail(failures, "table-rows: no row holds the FOO cell")
+        return
+    row_text = body[0]
+    for cell in ("`FOO`", "The first knob that the operator turns", "`bar`"):
+        if cell not in row_text:
+            fail(failures, f"table-rows: row missing the {cell} cell",
+                 f"row={row_text!r}")
+
+    # The row's cells are kept, so a cell can be judged on its own.
+    body_cells = [cells for _, text, cells in rows if "`FOO`" in text]
+    if not body_cells:
+        fail(failures, "table-rows: no row kept its cells")
+        return
+    if not any("`FOO`" in cell for cell in body_cells[0]):
+        fail(failures, "table-rows: the row's cells do not hold the FOO cell",
+             f"cells={body_cells[0]!r}")
+
+    # The header row is a row too, and holds only the header cells.
+    header = [text for _, text, _cells in rows if "Variable" in text]
+    if not header:
+        fail(failures, "table-rows: no header row yielded")
+        return
+    for cell in ("Variable", "Meaning", "Default"):
+        if cell not in header[0]:
+            fail(failures, f"table-rows: header row missing the {cell} cell",
+                 f"row={header[0]!r}")
+
+    # A row's cells are judged together: the header's cells are in the
+    # header's row, not spread across the table's rows.
+    if "Meaning" in row_text:
+        fail(failures, "table-rows: header cell leaked into a body row",
+             f"row={row_text!r}")
+
+
+def case_table_row_repeating_prose_is_echoes_prose(failures: list[str]) -> None:
+    """A row that repeats a paragraph in the same file is still
+    ``echoes-prose``."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "echo.md").write_text(TABLE_WITH_ECHO_ROW)
+        proc = run_find_prose("echo.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        tables = [b for b in blocks if b["kind"] == "table"]
+        if not tables:
+            fail(failures, "echo-row: no table block reported",
+                 f"blocks={[(b['kind'], b['findings']) for b in blocks]}")
+            return
+        findings = tables[0]["findings"]
+        if "echoes-prose" not in findings:
+            fail(failures, "echo-row: repeating row not flagged echoes-prose",
+                 f"findings={findings!r}")
+        if "oversize" in findings:
+            fail(failures, "echo-row: table flagged oversize",
+                 f"findings={findings!r}")
+
+
+def case_diff_judges_only_touched_rows(failures: list[str]) -> None:
+    """Under ``--diff``, only the rows the diff touched are judged."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        # The base carries a table whose second row repeats the paragraph.
+        (repo / "table.md").write_text(TABLE_WITH_ECHO_ROW)
+        git(repo, "add", "table.md")
+        git(repo, "commit", "-q", "-m", "set up table")
+
+        # The branch edits the BAZ row (line 8) and touches the echoing
+        # FOO row (line 7) not at all.
+        text = (repo / "table.md").read_text().splitlines(keepends=True)
+        text[7] = text[7].replace("`qux`", "`quux`")
+        (repo / "table.md").write_text("".join(text))
+        git(repo, "add", "table.md")
+        git(repo, "commit", "-q", "-m", "edit the non-echoing table row")
+
+        proc = run_find_prose("table.md", "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-rows: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        flagged = [b for b in blocks if b["kind"] == "table"]
+        for b in flagged:
+            if "echoes-prose" in b["findings"]:
+                fail(failures,
+                     "diff-rows: untouched echoing row was judged",
+                     f"findings={b['findings']!r}")
+
+
+def case_diff_reports_touched_row_that_echoes(failures: list[str]) -> None:
+    """A row the diff touched IS judged, and its echo is still found."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        (repo / "table.md").write_text(TABLE_WITH_ECHO_ROW)
+        git(repo, "add", "table.md")
+        git(repo, "commit", "-q", "-m", "set up table")
+
+        # The branch edits the echoing row itself.
+        text = (repo / "table.md").read_text().splitlines(keepends=True)
+        text[6] = text[6].replace("`bar`", "`baz`")
+        (repo / "table.md").write_text("".join(text))
+        git(repo, "add", "table.md")
+        git(repo, "commit", "-q", "-m", "edit the echoing table row")
+
+        proc = run_find_prose("table.md", "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, "diff-echo-row: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        flagged = [b for b in blocks if b["kind"] == "table"]
+        if not flagged:
+            fail(failures, "diff-echo-row: touched table row not reported",
+                 f"blocks={blocks!r}")
+            return
+        if "echoes-prose" not in flagged[0]["findings"]:
+            fail(failures, "diff-echo-row: touched echoing row not flagged",
+                 f"findings={flagged[0]['findings']!r}")
+
+
+def case_a_row_repeating_one_sentence_of_a_long_paragraph_is_echoes_prose(
+    failures: list[str]
+) -> None:
+    """A row restating one sentence of a long paragraph is still an echo.
+
+    The paragraph is several sentences long and the row repeats one of
+    them. A cell repeating a sentence of the paragraph is an echo too.
+    """
+    paragraph = (
+        "The runner reads its token from the environment before every job. "
+        "The builder caches compiled targets per branch and evicts them "
+        "weekly when space runs low. Retries back off exponentially and "
+        "stop after five attempts, reporting the last error to the "
+        "operator channel."
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "doc.md").write_text(
+            paragraph
+            + "\n\n| Setting | Meaning |\n|---|---|\n"
+            "| `RETRY` | retries back off exponentially and stop after "
+            "five attempts |\n"
+        )
+        proc = run_find_prose("doc.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        tables = [b for b in blocks if b["kind"] == "table"]
+        if not tables:
+            fail(failures, "echo-long-paragraph: no table block reported",
+                 f"blocks={[(b['kind'], b['findings']) for b in blocks]}")
+            return
+        if "echoes-prose" not in tables[0]["findings"]:
+            fail(failures,
+                 "echo-long-paragraph: a row repeating one sentence of a "
+                 "long paragraph was not flagged echoes-prose",
+                 f"findings={tables[0]['findings']!r}")
+
+
+def case_echo_row_with_extra_cells_is_still_an_echo(failures: list[str]) -> None:
+    """A row that repeats a paragraph is an echo even when the row carries
+    cells of its own.
+
+    The row's extra cells dilute its share of the paragraph; the cell that
+    carries the paragraph is an echo on its own.
+    """
+    module = _load_module()
+    paragraph = "The first knob that the operator turns when a build goes sideways."
+    # The repeating row carries a value cell of its own, with enough words in
+    # it to push the row-side ratio under the threshold.
+    table = (
+        "| Variable | Meaning | Default |\n"
+        "| --- | --- | --- |\n"
+        "| `FOO` | " + paragraph + " | retention window hours cached index |\n"
+    )
+    source = "# Gauntlet\n\n" + paragraph + "\n\n" + table
+    blocks = module.markdown_blocks("t.md", source)
+    prose = [b for b in blocks if b.kind not in {"table", "heading"}]
+    table_block = [b for b in blocks if b.kind == "table"]
+    if not prose or not table_block:
+        fail(failures, "echo-extra-cells: fixture did not parse")
+        return
+
+    # The row's own content words, counted the way the finder counts them.
+    _, row_text, cells = module.table_rows(table_block[0])[1]
+    row_words = {w.lower() for w in module.WORD.findall(row_text)} - module.STOPWORDS
+    paragraph_words = prose[0].content_words
+
+    # The row repeats the whole paragraph.
+    ratio = len(row_words & paragraph_words) / len(paragraph_words)
+    if ratio < 0.7:
+        fail(failures, "echo-extra-cells: fixture row does not repeat the paragraph",
+             f"ratio={ratio:.3f}")
+
+    # The row on its own stays under the threshold.
+    row_side = len(row_words & paragraph_words) / len(row_words)
+    if row_side >= 0.7:
+        fail(failures, "echo-extra-cells: fixture does not distinguish the two measures",
+             f"row-side ratio={row_side:.3f}")
+
+    # And the cell that repeats the paragraph is judged on its own.
+    echoing = [
+        cell for cell in cells
+        if len({w.lower() for w in module.WORD.findall(cell)} - module.STOPWORDS) >= 3
+        and len({w.lower() for w in module.WORD.findall(cell)} & paragraph_words)
+        / len({w.lower() for w in module.WORD.findall(cell)} - module.STOPWORDS) >= 0.7
+    ]
+    if not echoing:
+        fail(failures, "echo-extra-cells: no cell repeats the paragraph",
+             f"cells={cells!r}")
+
+    # And the finder must still call the row an echo.
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        (cwd / "t.md").write_text(source)
+        proc = run_find_prose("t.md", cwd=cwd)
+        blocks = blocks_for(proc)
+        tables = [b for b in blocks if b["kind"] == "table"]
+        if not tables:
+            fail(failures, "echo-extra-cells: no table block reported",
+                 f"blocks={[(b['kind'], b['findings']) for b in blocks]}")
+            return
+        if "echoes-prose" not in tables[0]["findings"]:
+            fail(failures, "echo-extra-cells: echoing row not flagged",
+                 f"findings={tables[0]['findings']!r}")
+
+
 def main() -> int:
     failures: list[str] = []
     case_rust_extension_in_prose_set(failures)
@@ -660,6 +963,13 @@ def main() -> int:
     case_diff_explicit_two_dot_range_keeps_today_behavior(failures)
     case_diff_uncommitted_edit_on_branch_is_reported(failures)
     case_hash_commented_files_scanned(failures)
+    case_table_is_never_oversize(failures)
+    case_table_rows_are_rows(failures)
+    case_table_row_repeating_prose_is_echoes_prose(failures)
+    case_diff_judges_only_touched_rows(failures)
+    case_diff_reports_touched_row_that_echoes(failures)
+    case_a_row_repeating_one_sentence_of_a_long_paragraph_is_echoes_prose(failures)
+    case_echo_row_with_extra_cells_is_still_an_echo(failures)
 
     if failures:
         print("FAIL", file=sys.stderr)

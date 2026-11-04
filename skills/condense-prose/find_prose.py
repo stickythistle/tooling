@@ -108,6 +108,11 @@ class Block:
     kind: str
     text: str
     findings: list[str] = field(default_factory=list)
+    # The block's source lines, kept only for tables: a table's rows are
+    # judged one at a time, and the `--diff` filter judges only the
+    # rows the diff touched, so each row has to carry the line it sits
+    # on.
+    lines: list[str] = field(default_factory=list)
 
     @property
     def words(self) -> int:
@@ -298,16 +303,60 @@ def _markdown_block(rel: str, start: int, end: int, lines: list[str]) -> Block:
         kind = "heading"
     elif lines[0].lstrip().startswith("|"):
         kind = "table"
-    return Block(rel, start, end, kind, text)
+    # A table keeps its lines, so its rows can carry the line they sit
+    # on for the `--diff` filter.
+    return Block(rel, start, end, kind, text, lines=list(lines) if kind == "table" else [])
 
 
-def table_rows(block: Block) -> list[str]:
-    cells = []
-    for row in block.text.split("|"):
-        row = row.strip()
-        if row and not set(row) <= set("-: "):
-            cells.append(row)
-    return cells
+def table_rows(block: Block) -> list[tuple[int, str, list[str]]]:
+    """The table's rows, one per line, with the line each sits on.
+
+    Each entry is `(line, text, cells)`: the whole line, so its cells are
+    judged together, and the cells are kept so one can be judged alone.
+    """
+    rows: list[tuple[int, str, list[str]]] = []
+    for offset, line in enumerate(block.lines):
+        if not line.strip().startswith("|"):
+            continue
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        text = " ".join(cell for cell in cells if cell)
+        if not text:
+            continue
+        # The header separator carries no prose. The header row is a row,
+        # and a header repeating the prose above the table is an echo of it.
+        if set(text) <= set("-: "):
+            continue
+        rows.append((block.line + offset, text, cells))
+    return rows
+
+
+def _echoes(words: set[str], prose: list[Block]) -> bool:
+    """True when these words repeat one of the paragraphs.
+
+    The measure is the share of *these* words found in the paragraph.
+    """
+    for p in prose:
+        if not p.content_words:
+            continue
+        if overlap(words, p.content_words) >= 0.7:
+            return True
+    return False
+
+
+def _row_echoes(row: str, cells: list[str], prose: list[Block]) -> bool:
+    """True when a row, or one of its cells, repeats a paragraph."""
+    row_words = {w.lower() for w in WORD.findall(row)} - STOPWORDS
+    if len(row_words) >= 3 and _echoes(row_words, prose):
+        return True
+    for cell in cells:
+        cell_words = {w.lower() for w in WORD.findall(cell)} - STOPWORDS
+        # A cell with fewer than three content words is a name or a
+        # value, and is skipped.
+        if len(cell_words) < 3:
+            continue
+        if _echoes(cell_words, prose):
+            return True
+    return False
 
 
 def stems(text: str) -> set[str]:
@@ -362,9 +411,16 @@ def restated_in_raise(block: Block, raised: str) -> bool:
 
 
 def collect(
-    paths: list[Path], root: Path, min_words: int, rev: str | None = None
+    paths: list[Path],
+    root: Path,
+    min_words: int,
+    rev: str | None = None,
+    touched: dict[str, set[int]] | None = None,
 ) -> list[Block]:
-    """Scan ``paths``; with ``rev`` set, read them out of that commit, not the tree."""
+    """Scan ``paths``; with ``rev`` set, read them out of that commit.
+
+    With ``touched`` set, only the lines a diff named are judged.
+    """
     blocks: list[Block] = []
     for path in paths:
         try:
@@ -390,7 +446,9 @@ def collect(
 
         prose = [b for b in found if b.kind not in {"table", "heading"}]
         for block in found:
-            if block.words > min_words:
+            # A table's length comes from its row count, so no table is
+            # oversize. The per-row checks below still apply to it.
+            if block.kind != "table" and block.words > min_words:
                 block.findings.append("oversize")
             if PROVENANCE.search(block.text):
                 block.findings.append("provenance")
@@ -407,11 +465,21 @@ def collect(
                 if code and overlap(block.content_words, code) >= 0.6:
                     block.findings.append("echoes-code")
             if block.kind == "table":
-                for row in table_rows(block):
-                    row_words = {w.lower() for w in WORD.findall(row)} - STOPWORDS
-                    if len(row_words) < 3:
-                        continue
-                    if any(overlap(row_words, p.content_words) >= 0.7 for p in prose):
+                judged = table_rows(block)
+                if touched is not None:
+                    # A row the diff never touched stays unjudged.
+                    diff_lines = touched.get(block.path, set())
+                    judged = [
+                        (lineno, text, cells)
+                        for lineno, text, cells in judged
+                        if lineno in diff_lines
+                    ]
+                for _, row, cells in judged:
+                    # The row is the unit: a row that restates the
+                    # paragraph is an echo. A cell is judged the same
+                    # way, because a row's own cells dilute its share
+                    # of the paragraph.
+                    if _row_echoes(row, cells, prose):
                         block.findings.append("echoes-prose")
                         break
         blocks += found
@@ -520,7 +588,13 @@ def main() -> int:
             elif path.suffix in PROSE_SUFFIXES or hash_commented(path):
                 candidates.append(path)
 
-    blocks = collect(sorted(set(candidates)), root, args.min_words, rev)
+    blocks = collect(
+        sorted(set(candidates)),
+        root,
+        args.min_words,
+        rev,
+        touched if args.diff else None,
+    )
     if args.diff:
         blocks = [
             b
