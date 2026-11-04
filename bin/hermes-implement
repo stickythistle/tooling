@@ -36,6 +36,7 @@ usage() {
 	cat <<'EOF'
 usage: hermes-implement --issue N --worktree PATH [--repo OWNER/NAME]
                         [--verify CMD] [--extra TEXT] [--profile NAME]
+                        [--no-commit]
 
 --profile selects the agent profile, which chooses both the model and the host.
 Your profiles are your own; `issue-grade --lanes` names the same set, and the
@@ -49,6 +50,12 @@ three shapes worth having are:
              run a second stream, since a host serving one request at a time
              makes two runs queue rather than overlap.
 
+--no-commit says the brief asks for no commit. A push-and-open-PR run, a
+rebase check, a review readback: work that finishes without changing the
+branch. In that mode a clean tree and a handover is success, and a commit is
+the failure -- the run was asked to leave the branch alone and did not. Without
+the flag, a run that commits nothing has failed, and says so.
+
 --verify defaults to `gate-verify <worktree>`, which picks its gates from the
 diff rather than from whoever wrote the dispatch.
 
@@ -59,6 +66,10 @@ EOF
 
 # Empty means the root profile, which is the dense 27B quality lane.
 ISSUE="" WORKTREE="" REPO="" EXTRA="" VERIFY="" PROFILE=""
+# Whether the brief asks for a commit. A run that is meant to leave the
+# branch alone is a different thing from a run that failed to change it,
+# and the verdict at the end has to tell them apart.
+NO_COMMIT=0
 while [[ $# -gt 0 ]]; do
 	case "$1" in
 	--issue) ISSUE="$2"; shift 2 ;;
@@ -67,6 +78,7 @@ while [[ $# -gt 0 ]]; do
 	--verify) VERIFY="$2"; shift 2 ;;
 	--extra) EXTRA="$2"; shift 2 ;;
 	--profile) PROFILE="$2"; shift 2 ;;
+	--no-commit) NO_COMMIT=1; shift ;;
 	-h | --help) usage; exit 0 ;;
 	*) echo "unknown argument: $1" >&2; usage >&2; exit 2 ;;
 	esac
@@ -106,6 +118,25 @@ GH_ARGS=(issue view "$ISSUE")
 [[ -n "$REPO" ]] && GH_ARGS+=(--repo "$REPO")
 gh "${GH_ARGS[@]}" >"$WORK/issue.txt"
 
+# The commit the run starts from. The base is what a no-commit run has to
+# leave the branch at, and what the FAILED line names.
+BASE=$(git rev-parse HEAD)
+BASE_SHORT=$(git rev-parse --short HEAD)
+
+# What the lane is told to do with the branch. The two modes are
+# opposites, and the prompt has to say which one this is.
+#
+# In the no-commit mode the lane still writes its handover. It must
+# not commit.
+if [[ "$NO_COMMIT" == 1 ]]; then
+	COMMIT_INSTRUCTION="This run is not to make a commit. Do not stage
+anything and do not run \`git commit\`. Leave the branch exactly as you found
+it, at $BASE_SHORT, and stop. Your handover goes in the run directory
+($WORK/HANDOVER.md), which is outside the branch and is not part of it."
+else
+	COMMIT_INSTRUCTION="Commit your work on $BRANCH and stop."
+fi
+
 PROMPT=$(
 	cat <<EOF
 Implement one issue in the repository checked out at $WORKTREE.
@@ -113,7 +144,7 @@ Implement one issue in the repository checked out at $WORKTREE.
 Follow the swe-updater skill. The branch and worktree already exist: you are on
 $BRANCH, based on the remote default branch. Skip the skill's ingest phase --
 the work item is the issue below, not a REVIEW_NOTES.md file -- and do not
-create, switch, or push any branch. Commit your work on $BRANCH and stop.
+create, switch, or push any branch. $COMMIT_INSTRUCTION
 
 **Every file you write belongs to $WORKTREE.** Not only source files, and not
 only git: nothing outside that directory is yours to change. Config files,
@@ -153,13 +184,11 @@ could not verify, and anything you deliberately left out.
 EOF
 )
 
-BASE=$(git rev-parse HEAD)
-BASE_SHORT=$(git rev-parse --short HEAD)
 # Pin the lane identity before the agent starts. An honest agent
-# inherits the env vars and commits as the expected identity; the
-# verifier below is the backstop for one that overrides them. Refusing
-# up front makes a missing setting a named error rather than a commit
-# that points at nobody.
+# inherits the env vars and commits as the expected one; the verifier
+# below is the backstop for one that overrides them.
+#
+# Refusing up front names a missing setting.
 if ! export_lane_identity_env "$WORKTREE"; then
 	exit 3
 fi
@@ -434,6 +463,12 @@ refusal_owner() { # <stderr file> -> "session <id> pid <n>"
 STOP_RC="" STOP_LIVE_AGENT=""
 i=1
 refusals=0
+# The attempts that actually ran. A refusal spends none: the attempt
+# number is retried, so the count is the times an agent was started.
+#
+# Naming the limit made a run that failed once read as one that
+# failed four times.
+ATTEMPTS_RUN=0
 while (( i <= ATTEMPTS )); do
 	label="attempt$i"
 	# Nothing from an earlier attempt may still be writing this worktree
@@ -469,6 +504,20 @@ while (( i <= ATTEMPTS )); do
 		else
 			handover_state="missing"
 		fi
+		# The same mode: a no-commit run must not be told to commit on
+		# the resume, or the lane commits anyway and the run fails for
+		# obeying the brief.
+		#
+		# The line breaks are here, so a test's sentence stays whole.
+		if [[ "$NO_COMMIT" == 1 ]]; then
+			resume_instruction="Finish each uncommitted change and verify it with '$VERIFY', then leave it uncommitted: this run is not to make a commit.
+A change you cannot verify is named in $WORK/HANDOVER.md.
+Never discard, stash, or reset work to make the tree clean -- a clean tree is what follows from finishing the work, not the goal in itself."
+		else
+			resume_instruction="Finish each uncommitted change, verify it with '$VERIFY', and commit it on $BRANCH.
+A change you cannot verify stays uncommitted and is named in $WORK/HANDOVER.md.
+Never discard, stash, or reset work to make the tree clean -- a clean tree is what follows from finishing the work, not the goal in itself."
+		fi
 		REMAINING=$(cat <<EOF
 The task is not finished. Resume it with tool calls, not with a plan.
 
@@ -479,11 +528,7 @@ $committed
 $uncommitted
 - $WORK/HANDOVER.md: $handover_state
 
-Finish each uncommitted change, verify it with '$VERIFY', and commit it
-on $BRANCH. A change you cannot verify stays uncommitted and is named in
-$WORK/HANDOVER.md. Never discard, stash, or reset work to make the tree
-clean -- a clean tree is what follows from finishing the work, not the
-goal in itself. The issue is #$ISSUE at $WORK/issue.txt.
+$resume_instruction The issue is #$ISSUE at $WORK/issue.txt.
 $EXTRA
 
 Follow the same brief the first attempt got.
@@ -517,6 +562,10 @@ EOF
 		sleep "$SETTLE"
 		continue
 	fi
+	# The attempt ran to an end that was not a refusal, so it spent an
+	# attempt. Counted here, and not at the top of the loop, since a
+	# refusal retries the same attempt number and must not count twice.
+	ATTEMPTS_RUN=$((ATTEMPTS_RUN + 1))
 	refusals=0
 	finished && break
 	i=$((i + 1))
@@ -547,13 +596,28 @@ fi
 # Name the missing piece on a line of its own: stranded uncommitted
 # files, a committed branch with no handover, a no-commit nothing-tried,
 # or a lane the identity verifier refused.
+#
+# The count is the attempts that ran, not the limit.
 DIRTY=$(git -C "$WORKTREE" status --porcelain 2>/dev/null || true)
 HEAD=$(git -C "$WORKTREE" rev-parse HEAD 2>/dev/null || echo "")
 if [[ -n "$DIRTY" ]]; then
-	echo "FAILED: $ATTEMPTS attempts left $BRANCH with uncommitted files:" >&2
+	echo "FAILED: $ATTEMPTS_RUN attempts left $BRANCH with uncommitted files:" >&2
 	printf '%s\n' "$DIRTY" >&2
+elif [[ "$NO_COMMIT" == 1 ]]; then
+	# The brief asked for no commit. A clean tree and a handover is the
+	# run finished correctly, and there is nothing to report.
+	#
+	# A commit is the failure here: the run changed a branch it was
+	# told to leave alone.
+	if [[ "$HEAD" != "$BASE" ]]; then
+		echo "FAILED: $ATTEMPTS_RUN attempts left $BRANCH at $(git -C "$WORKTREE" rev-parse --short HEAD 2>/dev/null || echo "$HEAD"):" \
+			"the brief asked for no commit and the run made one" >&2
+	elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
+		echo "FAILED: $ATTEMPTS_RUN attempts left $BRANCH with no handover:" \
+			"the brief asked for no commit and the run wrote none" >&2
+	fi
 elif [[ "$HEAD" == "$BASE" ]]; then
-	echo "FAILED: $ATTEMPTS attempts left $BRANCH at $BASE_SHORT" >&2
+	echo "FAILED: $ATTEMPTS_RUN attempts left $BRANCH at $BASE_SHORT" >&2
 elif [[ ! -s "$WORK/HANDOVER.md" ]]; then
 	echo "WARNING: $BRANCH has a commit but no handover was written" >&2
 elif [[ "$IDENTITY_RC" -ne 0 ]]; then
