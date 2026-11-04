@@ -23,6 +23,8 @@ import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 BIN = REPO_ROOT / "bin" / "agent-fix-pr"
 REPO = "owner/proj"
 BRANCH = "feature"
@@ -196,9 +198,16 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
     if replies is None:
         replies = [{"comment_id": 11, "body": "Fixed."}]
     replies_src.write_text(json.dumps(replies))
+    # The driver's skills check reads the agent's skill trees. The test
+    # needs its own. Without it a host whose profiles are stale fails every
+    # test here for a reason unrelated to the round.
+    hermes_home = tmp / "hermes-home"
+    (hermes_home / "skills").mkdir(parents=True)
+    install_skills(hermes_home)
     env = _clean_env(
         PATH=f"{fakebin}:{os.environ['PATH']}",
         AGENT_STATE_DIR=str(state),
+        HERMES_HOME=str(hermes_home),
         TOOLS_ENV=str(tmp / "no-env"),
         PIPELINE_IMPLEMENTER=str(fakebin / "implementer"),
         AGENT_FIX_PR_VERIFY=str(gate),
@@ -722,9 +731,15 @@ def test_clone_is_chosen_per_repo_via_PIPELINE_REPO_owner_name():
         replies_src.write_text(json.dumps([{"comment_id": "review", "body": "Pushed back."}]))
         state = tmp / "state"
         ledger_dir = state / "fix-pr" / "owner_proj-5"
+        hermes_home = tmp / "hermes-home"
+        (hermes_home / "skills").mkdir(parents=True)
+        # The driver refuses a round whose dispatched skill differs from the
+        # repository's copy.
+        install_skills(hermes_home)
         env = _clean_env(
             PATH=f"{tmp/'fakebin'}:{os.environ['PATH']}",
             AGENT_STATE_DIR=str(state),
+            HERMES_HOME=str(hermes_home),
             TOOLS_ENV=str(tmp / "no-env"),
             # The wrong clone as the default, the right clone as the
             # per-repo override: the per-repo must win.

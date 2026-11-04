@@ -21,6 +21,8 @@ import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 SCRIPT = REPO_ROOT / "pipeline" / "review.sh"
 MAX_ARG_STRLEN = 131072
 
@@ -127,8 +129,12 @@ def setup(tmp: Path, prev_notes: str | None, *,
     stub.chmod(0o755)
     home = tmp / "home"
     home.mkdir()
+    # The phase refuses to start when swe-reviewer differs from the
+    # repository's copy. The profile the picker falls back to is `default`.
+    install_skills(home, ["default"])
     env = {k: v for k, v in os.environ.items() if not k.startswith(("PIPELINE_", "GPU_GROUP"))}
     env.update(HOME=str(home), TMPDIR=str(tmp),
+               HERMES_HOME=str(home),
                AGENT_PIPELINE_ENV=str(tmp / "no-env"),
                PIPELINE_REPO=str(work), PIPELINE_GH_REPO="owner/proj",
                PIPELINE_VERIFY="true", PIPELINE_AGENT=agent_cmd,

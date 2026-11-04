@@ -95,6 +95,16 @@ for tool in "$LIVE"/bin/*; do
 	run ln -sfn "$tool" "$BIN_DIR/$name"
 done
 
+# The skills a lane loads come from the profile's own tree. Nothing else
+# copies them there, so a merged change to `skills/` stops at the
+# repository and every later lane runs the rules from whenever the profile
+# was last installed.
+#
+# The install runs out of the live checkout, which is the copy the lanes
+# run from. A profile's own skill the repository leaves out is left alone.
+say "==> skills: install the repository's copies into the agent's trees"
+run env SKILLS_REPO="$LIVE" "$LIVE/bin/hermes-skills-sync"
+
 # pr-ready resolves the prose finder through its link, so leaving one on the
 # working checkout means a scheduled job runs a skill from whatever branch
 # someone left that checkout on.

@@ -15,6 +15,8 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 
 
@@ -152,6 +154,9 @@ def run_lane(tmpdir: Path, worktree: Path, state_dir: Path | str,
         env["STUB_FAIL"] = "1"
     else:
         env.pop("STUB_FAIL", None)
+    home = tmpdir / "home"
+    install_skills(home)
+    env["HERMES_HOME"] = str(home)
     return subprocess.run(
         [str(HERMES_IMPLEMENT), "--issue", "1", "--worktree", str(worktree)],
         capture_output=True, text=True, env=env, timeout=120, cwd=cwd)

@@ -21,6 +21,7 @@ PIPELINE_IMPLEMENT = REPO_ROOT / "pipeline" / "implement.sh"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_hermes_implement_tmp import (  # noqa: E402
     HERMES_IMPLEMENT, git, make_worktree, write_stub_gh)
+from skill_install_fixture import install as install_skills  # noqa: E402
 
 STUB_HERMES = """#!/usr/bin/env python3
 import os, subprocess
@@ -54,11 +55,14 @@ def lane_wrapper(root: Path, role: str, stub: Path, gh_dir: Path) -> str:
     git(wt, "commit", "--quiet", "-m", "manifest")
     state = root / "state"
     state.mkdir()
+    home = root / "home"
+    install_skills(home)
     proc = subprocess.run(
         [str(HERMES_IMPLEMENT), "--issue", "1", "--worktree", str(wt)],
         capture_output=True, text=True, timeout=120,
         env={**os.environ, "HERMES_PYTHON": str(stub),
              "AGENT_STATE_DIR": str(state),
+             "HERMES_HOME": str(home),
              "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
              "HERMES_IMPLEMENT_ATTEMPTS": "1",
              "HERMES_IMPLEMENT_TIMEOUT": "30"})
@@ -393,6 +397,7 @@ def _nightly_env(tmp: Path, repo: Path, *, refuse: bool = False
 
     home = tmp / "home"
     home.mkdir(exist_ok=True)
+    install_skills(home)
     state = home / "state"
     queue = home / "queue"
     state.mkdir(exist_ok=True)
@@ -420,7 +425,8 @@ def _nightly_env(tmp: Path, repo: Path, *, refuse: bool = False
            # per-case via LANE_GIT_IDENTITY.
            "LANE_GIT_NAME": "Expected",
            "LANE_GIT_EMAIL": "expected@example.invalid",
-           "PIPELINE_RESUME_MAX": "1"}
+           "PIPELINE_RESUME_MAX": "1",
+           "HERMES_HOME": str(home)}
     if refuse:
         env["LANE_GIT_IDENTITY"] = "refuse"
     return env

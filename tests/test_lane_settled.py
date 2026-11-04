@@ -29,6 +29,8 @@ import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 LANE_SETTLED = REPO_ROOT / "bin" / "lane-settled"
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 
@@ -254,8 +256,10 @@ def run_hermes_implement(worktree: Path, extra: str,
                          log_path: Path, bin_dir: Path) -> subprocess.CompletedProcess:
     """Invoke bin/hermes-implement against `worktree`. The fake
     hermes lives at `bin_dir/fake-hermes`; its log is `log_path`. The
-    full environment is built so the script never touches the host's
+    The full environment is built so the script never touches the host's
     ~/.hermes or ~/.local/state directories."""
+    home = log_path.parent / "home"
+    install_skills(home)
     env = {
         # The host's HOME still has to be a real directory -- bash
         # uses it for `~` expansion in some code paths -- but every
