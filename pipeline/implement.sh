@@ -106,6 +106,23 @@ Its output from the last run is below. Fix what it names and nothing else: this
 is a repair, not a second attempt at the feature.
 
 $(tail -60 "/tmp/nightly-resume-$n.log")"
+		# The lane identity is configuration, and the repair agent
+		# cannot start without it: `export_lane_identity_env` refuses
+		# when LANE_GIT_NAME / LANE_GIT_EMAIL are unset, and a repair
+		# that pins no identity commits as nobody.
+		#
+		# The check is outside the subshell below, so the refusal skips
+		# this lane and the run carries on to the next one. One lane
+		# missing its configuration must not take the whole pipeline
+		# down: under `set -e` a refusal inside the subshell ends it,
+		# and a subshell that ends non-zero ends the script with it.
+		#
+		# `lane_expected_identity` resolves without exporting, so this
+		# shell carries no pinned identity into the rest of the run.
+		if ! lane_expected_identity >/dev/null; then
+			echo "  issue $n: no lane identity configured; skipping the repair" >&2
+			continue
+		fi
 		REPAIR_PROMPT_FILE="/tmp/nightly-repair-$n.prompt"
 		printf '%s' "$REPAIR_PROMPT" >"$REPAIR_PROMPT_FILE"
 		(
@@ -116,9 +133,12 @@ $(tail -60 "/tmp/nightly-resume-$n.log")"
 			# Pin the lane identity before the repair agent starts. The
 			# env vars reach the agent via the timeout subshell; the
 			# verifier before push is the backstop for one that overrode
-			# them. Refusing here makes a missing identity a named error
-			# rather than a repair that pushes as nobody.
-			export_lane_identity_env "$wt"
+			# them.
+			#
+			# The check that resolved the identity sits outside this
+			# subshell: under `set -e` a refusal inside it ends the whole
+			# script.
+			export_lane_identity_env || exit 1
 			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" "$BASH" -c '
 				. "$1/lib/common.sh"
 				shift

@@ -569,6 +569,10 @@ def run_lane(tmp: Path, repo: Path, *, extra_env: dict | None = None):
         # The implementer role's credentials, and the login they give.
         "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
         "IMPLEMENTER_LOGINS": "implementer-login",
+        # The lane identity is configuration; the lane refuses
+        # without it.
+        "LANE_GIT_NAME": "Lane",
+        "LANE_GIT_EMAIL": "lane@example.invalid",
     }
     # A token in the parent's environment: the lane must not inherit it.
     env["GH_TOKEN"] = "parent-token-value"
@@ -689,6 +693,10 @@ def test_the_prompt_says_what_is_enforced():
             "HERMES_IMPLEMENT_TIMEOUT": "60",
             "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
             "IMPLEMENTER_LOGINS": "implementer-login",
+            # The lane identity is configuration; the lane refuses
+            # without it.
+            "LANE_GIT_NAME": "Lane",
+            "LANE_GIT_EMAIL": "lane@example.invalid",
         }
         result = subprocess.run(
             [str(IMPLEMENT), "--issue", "1", "--worktree", str(repo),
@@ -934,6 +942,10 @@ def test_the_script_itself_keeps_its_own_github_access():
             "HERMES_IMPLEMENT_TIMEOUT": "60",
             "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
             "IMPLEMENTER_LOGINS": "implementer-login",
+            # The lane identity is configuration; the lane refuses
+            # without it.
+            "LANE_GIT_NAME": "Lane",
+            "LANE_GIT_EMAIL": "lane@example.invalid",
         }
         result = subprocess.run(
             [str(IMPLEMENT), "--issue", "1", "--worktree", str(repo),

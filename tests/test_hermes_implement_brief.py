@@ -104,6 +104,10 @@ class Harness:
         # the login the call would act as and refuses unless it is
         # one of these.
         self.env["IMPLEMENTER_LOGINS"] = "test-implementer"
+        # The lane identity is configuration; the lane refuses
+        # without it.
+        self.env["LANE_GIT_NAME"] = "Lane"
+        self.env["LANE_GIT_EMAIL"] = "lane@example.invalid"
         # The lane refuses to start when a dispatched skill differs from the
         # repository's copy. The install is the operator's own, so the suite
         # makes one for its temporary home rather than turning the check off.

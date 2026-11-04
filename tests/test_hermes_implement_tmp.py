@@ -157,6 +157,10 @@ def run_lane(tmpdir: Path, worktree: Path, state_dir: Path | str,
         # by default). The stub exits 0 immediately either way.
         "HERMES_IMPLEMENT_ATTEMPTS": "2",
         "HERMES_IMPLEMENT_TIMEOUT": "30",
+        # The lane identity is configuration; the lane refuses
+        # without it.
+        "LANE_GIT_NAME": "Lane",
+        "LANE_GIT_EMAIL": "lane@example.invalid",
     }
     if chdir:
         env["STUB_CHDIR"] = chdir

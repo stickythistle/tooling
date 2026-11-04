@@ -303,25 +303,23 @@ tree_name() { basename "$1" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//';
 
 repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
 
-# The identity a lane's commits must carry. The caller override is
-# LANE_GIT_NAME / LANE_GIT_EMAIL. Setting either one selects it;
-# setting only one is incomplete and refuses rather than mixing in
-# the worktree's config. With neither set, fall back to `git -C
-# <worktree> config user.name` / user.email. Both fields must
-# resolve; either empty returns non-zero so the caller can refuse
-# before the agent starts. No host, account or project name is
-# interpolated -- the identity is the operator's, not ours.
-lane_expected_identity() { # <worktree>  -> stdout: "<name>|<email>"
-	local wt="$1" name="" email=""
-	if [ -n "${LANE_GIT_NAME:-}${LANE_GIT_EMAIL:-}" ]; then
-		name=${LANE_GIT_NAME:-}
-		email=${LANE_GIT_EMAIL:-}
-	else
-		name=$(git -C "$wt" config --get user.name 2>/dev/null || true)
-		email=$(git -C "$wt" config --get user.email 2>/dev/null || true)
-	fi
+# The identity a lane's commits must carry. It is configuration and
+# nothing else: LANE_GIT_NAME and LANE_GIT_EMAIL, both set and both
+# non-empty.
+#
+# It is never inferred from the worktree's `git config user.name` /
+# user.email. A host whose git config is wrong -- a scratch identity
+# left behind by a CI workflow, say -- would then pin every lane to
+# that identity and pass its own check.
+#
+# Either variable unset or empty refuses: one line naming both, on
+# stderr, and a non-zero return so the caller stops before the agent
+# starts. No host, account or project name is interpolated -- the
+# identity is the operator's, not ours.
+lane_expected_identity() { # -> stdout: "<name>|<email>"
+	local name="${LANE_GIT_NAME:-}" email="${LANE_GIT_EMAIL:-}"
 	if [ -z "$name" ] || [ -z "$email" ]; then
-		echo "cannot pin lane identity: set LANE_GIT_NAME and LANE_GIT_EMAIL, or configure user.name and user.email in $wt" >&2
+		echo "cannot pin lane identity: set LANE_GIT_NAME and LANE_GIT_EMAIL" >&2
 		return 1
 	fi
 	printf '%s|%s\n' "$name" "$email"
@@ -332,9 +330,9 @@ lane_expected_identity() { # <worktree>  -> stdout: "<name>|<email>"
 # and the worktree config, so the common case lands authored by the
 # expected identity. `--author` and `GIT_AUTHOR_NAME=...` on the
 # agent's command line bypass this; the verifier is the backstop.
-export_lane_identity_env() { # <worktree>
+export_lane_identity_env() {
 	local identity name email
-	identity=$(lane_expected_identity "$1") || return $?
+	identity=$(lane_expected_identity) || return $?
 	name=${identity%%|*}
 	email=${identity##*|}
 	export GIT_AUTHOR_NAME="$name"
@@ -438,7 +436,7 @@ verify_lane_identity() { # <worktree> <base> [handover_path] [default_branch]
 		echo "refusing: base $base_sha is not an ancestor of $head_sha in $wt (history rewritten)" >&2
 		return 2
 	fi
-	identity=$(lane_expected_identity "$wt") || return 1
+	identity=$(lane_expected_identity) || return 1
 	name=${identity%%|*}
 	email=${identity##*|}
 	# The lane's own commits, computed once and used for both the check
