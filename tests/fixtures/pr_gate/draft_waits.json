@@ -1,0 +1,31 @@
+{
+  "pr": {
+    "state": "open",
+    "merged": false,
+    "draft": true,
+    "head": {
+      "sha": "1111111111111111111111111111111111111111"
+    },
+    "base": {
+      "sha": "5555555555555555555555555555555555555555"
+    },
+    "mergeable": true
+  },
+  "reviews": [],
+  "comments": [],
+  "checks": [
+    {
+      "__typename": "CheckRun",
+      "status": "COMPLETED",
+      "conclusion": "SUCCESS",
+      "name": "Gates"
+    }
+  ],
+  "trees": {},
+  "compares": {},
+  "patch_equal": null,
+  "implementers": [
+    "harbord-st"
+  ],
+  "expected": "WAIT draft"
+}

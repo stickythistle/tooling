@@ -26,7 +26,49 @@ HEAD2 = "2222222222222222222222222222222222222222"
 COMMIT_A = "3333333333333333333333333333333333333333"
 COMMIT_B = "4444444444444444444444444444444444444444"
 TREE_1 = "aaaaaaaa00000000000000000000000000000000"
-TREE_2 = "bbbbbbbb00000000000000000000000000000000"
+TREE_2 = "bbbbbbbb00000000000000000000000000000000000"
+BASE = "5555555555555555555555555555555555555555"
+
+# The patch a compare reports for a commit.
+PATCH_BODY = ("--- a/lib/x.py\n"
+              "+++ b/lib/x.py\n"
+              "@@ -10,3 +10,3 @@ def f():\n"
+              "-old line\n"
+              "+new line\n"
+              " keep\n")
+
+# The blob sha of a compare-reported file: git's object name for its
+# content, so the same content always carries the same sha.
+BLOB_SHA = "cccccccc00000000000000000000000000000000"
+OTHER_BLOB_SHA = "dddddddd00000000000000000000000000000000"
+
+# The sha value meaning "this file carries no sha at all", as opposed to
+# "not chosen yet".
+NO_SHA = ""
+
+
+def compare_file(filename="lib/x.py", status="modified",
+                 patch: str | None = PATCH_BODY, sha: str | None = None):
+    """Return one file of a compare response.
+
+    `sha` of None picks the sha that goes with the filename; NO_SHA
+    leaves the field out, as the API reports for a file it has no
+    content for.
+    """
+    chosen = sha
+    if chosen is None:
+        chosen = OTHER_BLOB_SHA if filename != "lib/x.py" else BLOB_SHA
+    entry = {"filename": filename, "status": status}
+    if chosen != NO_SHA:
+        entry["sha"] = chosen
+    if patch is not None:
+        entry["patch"] = patch
+    return entry
+
+
+def compare_files(patch: str | None = PATCH_BODY, filename="lib/x.py",
+                  sha: str | None = None):
+    return [compare_file(filename=filename, patch=patch, sha=sha)]
 
 
 # ----- fixture builders ---------------------------------------------------
@@ -42,10 +84,11 @@ def review(rid, state, commit, submitted, login=REVIEWER, body="a review"):
     }
 
 
-def comment(cid, created, login, body="a comment", in_reply_to=None):
+def comment(cid, created, login, body="a comment", in_reply_to=None,
+            user_type="User"):
     entry = {
         "id": cid,
-        "user": {"login": login, "type": "User"},
+        "user": {"login": login, "type": user_type},
         "created_at": created,
         "body": body,
     }
@@ -72,284 +115,315 @@ def status_context(state: str = "SUCCESS", name: str = "ci"):
     return {"__typename": "StatusContext", "state": state, "context": name}
 
 
-def pr(state="open", merged=False, head=HEAD):
-    return {"state": state, "merged": merged, "draft": False,
-            "head": {"sha": head}, "base": {"sha": COMMIT_B},
-            "mergeable": "MERGEABLE"}
+def pr(state="open", merged=False, head=HEAD, draft=False,
+       mergeable: bool | None = True, base=BASE):
+    return {"state": state, "merged": merged, "draft": draft,
+            "head": {"sha": head}, "base": {"sha": base},
+            "mergeable": mergeable}
 
 
 # ----- scenario table -----------------------------------------------------
 #
-# Each scenario is (name, pr, reviews, comments, checks, trees, expected).
-# `reviews` is the flattened list of reviews; the end-to-end run puts it on
-# one page unless the scenario is about pages.
+# Each scenario is (name, pr, reviews, comments, checks, trees, expected,
+# extra). `extra` carries:
+#
+#   patch_equal  what decide() is told about the patch comparison
+#   compares     the compare responses the stub gh serves, keyed by
+#                "<base>...<commit>"
+
 
 def scenarios():
     out = []
 
+    def add(name, pr_obj, reviews, comments, checks, trees, expected,
+            extra=None):
+        out.append((name, pr_obj, reviews, comments, checks, trees,
+                    expected, extra or {}))
+
     # Row 1: merged.
-    out.append(("merged", pr(state="closed", merged=True),
-                [], [], [], {}, "DONE merged"))
+    add("merged", pr(state="closed", merged=True),
+                [], [], [], {}, "DONE merged")
 
     # Row 2: closed without a merge.
-    out.append(("closed", pr(state="closed"),
-                [], [], [], {}, "DONE closed"))
+    add("closed", pr(state="closed"),
+                [], [], [], {}, "DONE closed")
 
     # Row 3a: a CheckRun that has not completed.
-    out.append(("checks_running", pr(),
+    add("checks_running", pr(),
                 [], [], [check_run(status="IN_PROGRESS", conclusion=None)],
-                {}, "WAIT checks"))
+                {}, "WAIT checks")
 
     # Row 3b: a StatusContext that is still pending.
-    out.append(("status_pending", pr(),
+    add("status_pending", pr(),
                 [], [], [status_context(state="PENDING")],
-                {}, "WAIT checks"))
+                {}, "WAIT checks")
 
     # Row 3c: an EXPECTED status context is also still running.
-    out.append(("status_expected", pr(),
+    add("status_expected", pr(),
                 [], [], [status_context(state="EXPECTED")],
-                {}, "WAIT checks"))
+                {}, "WAIT checks")
 
     # Row 3d: an empty rollup is WAIT never.
-    out.append(("no_checks", pr(),
-                [], [], [], {}, "REVIEW " + HEAD))
+    add("no_checks", pr(),
+                [], [], [], {}, "REVIEW " + HEAD)
 
     # Row 4: the reviewer has never ruled.
-    out.append(("no_verdict", pr(),
-                [], [], [check_run()], {}, "REVIEW " + HEAD))
+    add("no_verdict", pr(),
+                [], [], [check_run()], {}, "REVIEW " + HEAD)
 
     # Row 4b: only COMMENTED reviews by the reviewer. A thread reply is
     # no verdict, so this is still "no verdict".
-    out.append(("only_commented", pr(),
+    add("only_commented", pr(),
                 [review(900, "COMMENTED", HEAD, "2026-10-20T00:00:00Z", body="")],
-                [], [check_run()], {}, "REVIEW " + HEAD))
+                [], [check_run()], {}, "REVIEW " + HEAD)
 
     # Row 5: the verdict is stale but the tree is unchanged -- the squash
     # case.
-    out.append(("reapprove", pr(),
+    add("reapprove", pr(),
                 [review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [], [check_run()],
-                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD))
+                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD)
 
     # Row 5, with an objection. The reviewer approves at B, a person
     # objects, and the lane then squashes to H with the same tree, so the
     # shortcut must not re-approve H over an unruled objection.
-    out.append(("squash_after_objection", pr(),
+    add("squash_after_objection", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "a-person",
                          body="this drops the retry, please keep it")],
                 [check_run()],
-                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REVIEW " + HEAD))
+                {HEAD: TREE_1, COMMIT_A: TREE_1},
+                "REVIEW " + HEAD + " " + COMMIT_A)
 
     # The objection is the only thing that changes, so the two together
     # pin that the guard is on the objection, not on the shape.
-    out.append(("squash_without_objection", pr(),
+    add("squash_without_objection", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [], [check_run()],
-                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD))
+                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD)
 
     # The objection before the verdict is part of the round the verdict
     # already answered, so it leaves the shortcut open.
-    out.append(("squash_objection_before_verdict", pr(),
+    add("squash_objection_before_verdict", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T02:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "a-person")],
                 [check_run()],
-                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD))
+                {HEAD: TREE_1, COMMIT_A: TREE_1}, "REAPPROVE " + HEAD)
 
     # The caller's own unsubmitted review. `GET pulls/N/reviews` returns
     # it with no `submitted_at`, and it must not fail the run.
-    out.append(("pending_review_alongside_approval", pr(),
+    add("pending_review_alongside_approval", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z"),
                  {"id": 999, "user": {"login": IMPLEMENTER, "type": "User"},
                   "state": "PENDING", "commit_id": HEAD, "submitted_at": None,
                   "body": "a draft nobody has submitted"}],
-                [], [check_run()], {HEAD: TREE_1}, "AGREED " + HEAD))
+                [], [check_run()], {HEAD: TREE_1}, "AGREED " + HEAD)
 
     # Row 6: the verdict is stale and the work really did change.
     #
     # An unknown tree is a state the gate cannot reach: a failed lookup
     # is a hard error.
-    out.append(("stale_changed_tree", pr(),
+    add("stale_changed_tree", pr(),
                 [review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [], [check_run()],
-                {HEAD: TREE_2, COMMIT_A: TREE_1}, "REVIEW " + HEAD))
+                {HEAD: TREE_2, COMMIT_A: TREE_1},
+                "REVIEW " + HEAD + " " + COMMIT_A,
+                {"patch_equal": False,
+                 "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                              f"{BASE}...{HEAD}": compare_files(
+                                  filename="lib/y.py")}})
 
     # Row 7: a person comments after the approval.
-    out.append(("third_party_after_approval", pr(),
+    add("third_party_after_approval", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "someone-else")],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # Row 7b: the third party's post is before the verdict, so it is part
     # of the round the verdict already answered.
-    out.append(("third_party_before", pr(),
+    add("third_party_before", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T02:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "someone-else")],
-                [check_run()], {}, "AGREED " + HEAD))
+                [check_run()], {}, "AGREED " + HEAD)
 
     # Row 7c: the reviewer's own post after the verdict is no third
     # party.
-    out.append(("reviewer_post_after", pr(),
+    add("reviewer_post_after", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", REVIEWER)],
-                [check_run()], {}, "AGREED " + HEAD))
+                [check_run()], {}, "AGREED " + HEAD)
 
     # Row 7d: a marked post from a listed implementer is the loop's own
     # reply, never a third party's comment.
-    out.append(("marked_post_is_ours", pr(),
+    add("marked_post_is_ours", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body=marker(701, HEAD))],
-                [check_run()], {}, "AGREED " + HEAD))
+                [check_run()], {}, "AGREED " + HEAD)
 
     # A marker's format proves nothing: from a login outside the
     # implementer set it reads as a person speaking, and rule 7 asks for
     # a ruling.
-    out.append(("marked_post_untrusted", pr(),
+    add("marked_post_untrusted", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "someone-else",
                          body=marker(701, HEAD))],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # The reviewer wearing the loop's marker is a third party too.
-    out.append(("marked_post_by_reviewer", pr(),
+    add("marked_post_by_reviewer", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", REVIEWER,
                          body=marker(701, HEAD))],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # No implementers configured: no marker is trusted.
-    out.append(("marked_post_no_implementers", pr(),
+    add("marked_post_no_implementers", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body=marker(701, COMMIT_A))],
                 [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
-                "REVIEW " + HEAD))
+                "REVIEW " + HEAD + " " + COMMIT_A)
 
     # The trusted twin of the three above: the same stale approval, the
     # same marked post, now from a listed implementer. No third-party
     # trip, so the squash shortcut stands.
-    out.append(("trusted_marker_no_trip", pr(),
+    add("trusted_marker_no_trip", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body=marker(701, COMMIT_A))],
                 [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
-                "REAPPROVE " + HEAD))
+                "REAPPROVE " + HEAD)
 
     # Logins are case-insensitive on GitHub: a configured implementer in
     # a different case still matches the API login.
-    out.append(("implementer_case_differs", pr(),
+    add("implementer_case_differs", pr(),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body=marker(701, COMMIT_A))],
                 [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1},
-                "REAPPROVE " + HEAD))
+                "REAPPROVE " + HEAD)
 
     # Row 8: approved on the head.
-    out.append(("agreed", pr(),
+    add("agreed", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
-                [], [check_run()], {}, "AGREED " + HEAD))
+                [], [check_run()], {}, "AGREED " + HEAD)
 
     # Row 9: changes requested, and the implementer answered with a
     # marker naming that review, without a new commit. The round's
     # summary (status marker) rides along; only the answer counts.
-    out.append(("answered_without_commit", pr(),
+    add("answered_without_commit", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body="here is the fix\n" + marker(801, HEAD)),
                  comment(2, "2026-10-20T01:00:01Z", IMPLEMENTER,
                          body="Review round 1: answered\n"
                               + status_marker(801, HEAD))],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # A failed round: its summary is the loop's only post. The status
     # marker keeps it from reading as a person speaking, and claims no
     # answer, so the fix stays in hand.
-    out.append(("failed_round_summary_only", pr(),
+    add("failed_round_summary_only", pr(),
                 [review(77, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body="Review round 1: no commit\n"
                               + status_marker(77, HEAD))],
-                [check_run()], {}, "FIX 77"))
+                [check_run()], {}, "FIX 77")
 
     # A status marker from outside the implementer set is a forgery like
     # any other: rule 7 asks for a ruling.
-    out.append(("status_marker_untrusted", pr(),
+    add("status_marker_untrusted", pr(),
                 [review(77, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "someone-else",
                          body=status_marker(77, HEAD))],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # Row 9b: marker_names_older
-    out.append(("marker_names_older", pr(),
+    add("marker_names_older", pr(),
                 [review(800, "CHANGES_REQUESTED", COMMIT_A,
                         "2026-10-19T00:00:00Z"),
                  review(801, "CHANGES_REQUESTED", HEAD,
                         "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body=marker(800, HEAD))],
-                [check_run()], {}, "FIX 801"))
+                [check_run()], {}, "FIX 801")
 
     # Row 10: max_rounds
-    out.append(("max_rounds", pr(),
+    add("max_rounds", pr(),
                 [review(1, "CHANGES_REQUESTED", HEAD, "2026-10-16T00:00:00Z"),
                  review(2, "CHANGES_REQUESTED", HEAD, "2026-10-17T00:00:00Z"),
                  review(3, "CHANGES_REQUESTED", HEAD, "2026-10-18T00:00:00Z"),
                  review(4, "CHANGES_REQUESTED", HEAD, "2026-10-19T00:00:00Z")],
-                [], [check_run()], {}, "ESCALATE max-rounds"))
+                [], [check_run()], {}, "ESCALATE max-rounds")
 
     # Row 10b: one round short of the limit. Still a fix.
-    out.append(("under_max_rounds", pr(),
+    add("under_max_rounds", pr(),
                 [review(1, "CHANGES_REQUESTED", HEAD, "2026-10-16T00:00:00Z"),
                  review(2, "CHANGES_REQUESTED", HEAD, "2026-10-17T00:00:00Z"),
                  review(3, "CHANGES_REQUESTED", HEAD, "2026-10-18T00:00:00Z")],
-                [], [check_run()], {}, "FIX 3"))
+                [], [check_run()], {}, "FIX 3")
 
     # Row 11: changes requested, unanswered.
-    out.append(("fix", pr(),
+    add("fix", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
-                [], [check_run()], {}, "FIX 801"))
+                [], [check_run()], {}, "FIX 801")
 
     # Row 11b: dismissed_newer
-    out.append(("dismissed_newer", pr(),
+    add("dismissed_newer", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z"),
                  review(702, "DISMISSED", HEAD, "2026-10-20T03:00:00Z")],
-                [], [check_run()], {}, "AGREED " + HEAD))
+                [], [check_run()], {}, "AGREED " + HEAD)
 
     # Row 11c: a COMMENTED review newer than the changes-requested one.
     # A thread reply is no verdict.
-    out.append(("commented_newer", pr(),
+    add("commented_newer", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z"),
                  review(802, "COMMENTED", HEAD, "2026-10-20T02:00:00Z", body="")],
-                [], [check_run()], {}, "FIX 801"))
+                [], [check_run()], {}, "FIX 801")
 
     # The issue's four fixtures, each recorded on disk under
     # tests/fixtures/pr_gate/ and described there.
 
     # (a) thread_reply_empty_body
-    out.append(("thread_reply_empty_body", pr(),
+    add("thread_reply_empty_body", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z"),
                  review(802, "COMMENTED", HEAD, "2026-10-20T01:00:00Z", body="")],
-                [], [check_run()], {}, "FIX 801"))
+                [], [check_run()], {}, "FIX 801")
 
     # (b) review_and_reply_same_poll
-    out.append(("review_and_reply_same_poll", pr(),
+    add("review_and_reply_same_poll", pr(),
                 [review(801, "CHANGES_REQUESTED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", IMPLEMENTER,
                          body="answering\n" + marker(801, HEAD))],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # (c) person_comment_after_approval
-    out.append(("person_comment_after_approval", pr(),
+    add("person_comment_after_approval", pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [comment(1, "2026-10-20T01:00:00Z", "a-person")],
-                [check_run()], {}, "REVIEW " + HEAD))
+                [check_run()], {},
+                "REVIEW " + HEAD + " " + HEAD)
 
     # (d) head_moved
-    out.append(("head_moved", pr(head=HEAD2),
+    add("head_moved", pr(head=HEAD2),
                 [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
                 [], [check_run()],
-                {HEAD2: TREE_2, COMMIT_A: TREE_1}, "REVIEW " + HEAD2))
+                {HEAD2: TREE_2, COMMIT_A: TREE_1},
+                "REVIEW " + HEAD2 + " " + COMMIT_A,
+                {"patch_equal": False,
+                 "compares": {f"{BASE}...{COMMIT_A}": compare_files(),
+                              f"{BASE}...{HEAD2}": compare_files(
+                                  filename="lib/y.py")}})
+
+    # The rules this change adds are recorded as fixtures under
+    # tests/fixtures/pr_gate/, which the suite reads below.
 
     return out
 
@@ -391,6 +465,7 @@ case "$1" in
       */issues/*/comments) name=issue_comments ;;
       */pulls/*/comments)  name=pull_comments ;;
       */git/commits/*)     name=tree ;;
+      */compare/*)         name=compare ;;
       */pulls/*)           name=pr ;;
       *) name=other ;;
     esac
@@ -409,6 +484,19 @@ if sha not in trees:
     print("gh: Not Found (HTTP 404)", file=sys.stderr)
     sys.exit(1)
 print(json.dumps({"tree": {"sha": trees[sha]}}))' "$sha"
+        exit $?
+        ;;
+      */compare/*)
+        # The compare is keyed by "<base>...<commit>".
+        pair="${endpoint##*/compare/}"
+        cat "$STUB_DATA/compares.json" 2>/dev/null \
+          | python3 -c 'import json,sys
+compares = json.load(sys.stdin)
+pair = sys.argv[1]
+if pair not in compares:
+    print("gh: Not Found (HTTP 404)", file=sys.stderr)
+    sys.exit(1)
+print(json.dumps({"files": compares[pair]}))' "$pair"
         exit $?
         ;;
       */pulls/*/reviews)   file=reviews.json ;;
@@ -442,11 +530,13 @@ def write_stub_gh(bin_dir: Path) -> None:
     gh.chmod(0o755)
 
 
-def install(data_dir: Path, pr_obj, reviews, comments, checks, trees) -> None:
+def install(data_dir: Path, pr_obj, reviews, comments, checks, trees,
+            compares=None) -> None:
     """Write the scenario's canned JSON into the data dir.
 
     The reviews are written as the array of pages `--slurp` returns, so the
-    fetcher's flattening is exercised.
+    fetcher's flattening is exercised. The compares are keyed by
+    "<base>...<commit>".
     """
     (data_dir / "pr.json").write_text(json.dumps(pr_obj))
     (data_dir / "reviews.json").write_text(json.dumps([reviews]))
@@ -455,6 +545,7 @@ def install(data_dir: Path, pr_obj, reviews, comments, checks, trees) -> None:
     (data_dir / "checks.json").write_text(
         json.dumps({"statusCheckRollup": checks}))
     (data_dir / "trees.json").write_text(json.dumps(trees))
+    (data_dir / "compares.json").write_text(json.dumps(compares or {}))
 
 
 def run_gate(data_dir: Path, bin_dir: Path, *extra: str,
@@ -501,13 +592,16 @@ def main() -> int:
         bin_dir.mkdir()
         write_stub_gh(bin_dir)
 
-        for name, pr_obj, reviews, comments, checks, trees, expected in scenarios():
+        for name, pr_obj, reviews, comments, checks, trees, expected, extra \
+                in scenarios():
             implementers = implementers_for(name)
+            patch_equal = extra.get("patch_equal")
+            compares = extra.get("compares")
             # 1. Through the pure function.
             try:
                 got = pr_gate.decide(pr_obj, list(reviews), list(comments),
                                      list(checks), dict(trees), REVIEWER, 4,
-                                     frozenset(implementers))
+                                     frozenset(implementers), patch_equal)
             except Exception as exc:  # noqa: BLE001 - the point is to report it
                 got = f"<raised {exc!r}>"
             if got != expected:
@@ -518,7 +612,7 @@ def main() -> int:
             data = tmp / f"data_{name}"
             data.mkdir()
             install(data, pr_obj, list(reviews), list(comments),
-                    list(checks), dict(trees))
+                    list(checks), dict(trees), compares)
             r = run_gate(data, bin_dir, implementers=implementers)
             if r.returncode != 0:
                 failures.append(
@@ -547,13 +641,16 @@ def main() -> int:
                 reviews = [r for page in fixture["reviews_pages"] for r in page]
             expected = fixture["expected"]
             fixture_implementers = fixture.get("implementers", [IMPLEMENTER])
+            compares = fixture.get("compares")
+            patch_equal = fixture.get("patch_equal")
 
             try:
                 got = pr_gate.decide(fixture["pr"], list(reviews),
                                      list(fixture["comments"]),
                                      list(fixture["checks"]),
                                      dict(fixture["trees"]), REVIEWER, 4,
-                                     frozenset(fixture_implementers))
+                                     frozenset(fixture_implementers),
+                                     patch_equal)
             except pr_gate.Malformed as exc:
                 got = f"<malformed: {exc}>"
             if got != expected:
@@ -564,7 +661,7 @@ def main() -> int:
             data.mkdir()
             install(data, fixture["pr"], list(reviews),
                     list(fixture["comments"]), list(fixture["checks"]),
-                    dict(fixture["trees"]))
+                    dict(fixture["trees"]), compares)
             if "reviews_pages" in fixture:
                 (data / "reviews.json").write_text(
                     json.dumps(fixture["reviews_pages"]))
@@ -635,6 +732,31 @@ def main() -> int:
                 failures.append(
                     f"gh_fail_{endpoint}: stderr did not name the endpoint: "
                     f"{r.stderr!r}")
+
+        # A compare that fails is an error, never a quiet `REVIEW`: the
+        # gate must not answer from a comparison it did not make.
+        data = tmp / "data_fail_compare"
+        data.mkdir()
+        install(data, pr(),
+                [review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [], [check_run()], {HEAD: TREE_2, COMMIT_A: TREE_1},
+                {f"{BASE}...{COMMIT_A}": compare_files()})
+        (data / "gh_fail_compare").write_text("")
+        r = run_gate(data, bin_dir)
+        if r.returncode != 1:
+            failures.append(
+                f"gh_fail_compare: expected exit 1, got {r.returncode}")
+        if r.stdout != "":
+            failures.append(
+                f"gh_fail_compare: stdout was {r.stdout!r}, expected empty")
+        if not r.stderr.startswith("ERR "):
+            failures.append(
+                f"gh_fail_compare: stderr was {r.stderr!r}, expected to start "
+                "with 'ERR '")
+        if f"compare/{BASE}...{COMMIT_A}" not in r.stderr:
+            failures.append(
+                f"gh_fail_compare: stderr did not name the endpoint: "
+                f"{r.stderr!r}")
 
         # A malformed entry: a review with no `user`. Skipping it could
         # hide a verdict, so it is a failure.
@@ -877,7 +999,8 @@ def main() -> int:
             for path in data.iterdir():
                 if path.name not in ("gh.log", "pr.json", "reviews.json",
                                      "issue_comments.json", "pull_comments.json",
-                                     "checks.json", "trees.json"):
+                                     "checks.json", "trees.json",
+                                     "compares.json"):
                     failures.append(
                         f"no_writes: the gate wrote {path.name}")
 
@@ -943,11 +1066,16 @@ def main() -> int:
         gate_src = (REPO_ROOT / "bin" / "pr-loop-gate").read_text()
         lib_src = (REPO_ROOT / "lib" / "pr_gate.py").read_text()
 
-        # The caller's tree choice goes through the same helper.
-        if "verdict_reviews(" not in gate_src:
+        # The gate asks the decision which review is V through the same
+        # helper, rather than picking one of its own.
+        if "early_decision(" not in gate_src:
             failures.append(
-                "v_agreement: bin/pr-loop-gate does not read the verdicts "
-                "through verdict_reviews()")
+                "v_agreement: bin/pr-loop-gate does not ask the decision "
+                "which review is V through early_decision()")
+        if "verdict_reviews(" in gate_src:
+            failures.append(
+                "v_agreement: bin/pr-loop-gate picks the verdict itself; "
+                "the rule must live in one place")
         # The decision carries no filter or sort of its own.
         decide_body = lib_src.split("def decide(", 1)[-1]
         for stray in ('r["state"] in VERDICT_STATES',
@@ -969,9 +1097,10 @@ def main() -> int:
                 [comment(1, "2026-10-20T01:00:00Z", "a-person")],
                 [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1})
         r = run_gate(data, bin_dir)
-        if r.returncode != 0 or r.stdout.strip() != "REVIEW " + HEAD:
+        expected = "REVIEW " + HEAD + " " + COMMIT_A
+        if r.returncode != 0 or r.stdout.strip() != expected:
             failures.append(
-                f"no_trees_when_interrupted: expected 'REVIEW {HEAD}', got "
+                f"no_trees_when_interrupted: expected {expected!r}, got "
                 f"rc={r.returncode} stdout={r.stdout.strip()!r} "
                 f"stderr={r.stderr.strip()!r}")
         log = (data / "gh.log").read_text()
@@ -1024,6 +1153,196 @@ def main() -> int:
                 failures.append(
                     f"tree_count_stale: tree lookup used a sha that is not "
                     f"40 characters: {line!r}")
+
+        # The compares are fetched lazily, as the trees are.
+        data = tmp / "data_compare_is_lazy"
+        data.mkdir()
+        install(data, pr(),
+                [review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [], [check_run()], {HEAD: TREE_1, COMMIT_A: TREE_1})
+        run_gate(data, bin_dir)
+        log = (data / "gh.log").read_text()
+        compares = [ln for ln in log.splitlines() if "/compare/" in ln]
+        if compares:
+            failures.append(
+                f"compare_is_lazy: the gate compared {len(compares)} patch(es) "
+                f"for an equal tree: {compares!r}")
+
+        # A verdict on the head needs no tree and no compare.
+        data = tmp / "data_compare_not_needed"
+        data.mkdir()
+        install(data, pr(),
+                [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
+                [], [check_run()], {HEAD: TREE_1})
+        run_gate(data, bin_dir)
+        log = (data / "gh.log").read_text()
+        compares = [ln for ln in log.splitlines() if "/compare/" in ln]
+        if compares:
+            failures.append(
+                f"compare_not_needed: the gate compared {len(compares)} "
+                f"patch(es) for a verdict on the head: {compares!r}")
+
+        # A third party since the verdict stops the comparison.
+        data = tmp / "data_compare_not_when_interrupted"
+        data.mkdir()
+        install(data, pr(),
+                [review(701, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [comment(1, "2026-10-20T01:00:00Z", "a-person")],
+                [check_run()], {HEAD: TREE_2, COMMIT_A: TREE_1})
+        run_gate(data, bin_dir)
+        log = (data / "gh.log").read_text()
+        compares = [ln for ln in log.splitlines() if "/compare/" in ln]
+        if compares:
+            failures.append(
+                f"compare_not_when_interrupted: the gate compared "
+                f"{len(compares)} patch(es) that the decision cannot use: "
+                f"{compares!r}")
+
+        # ---- the early rules, before the comparisons -------------------
+        #
+        # A draft, a running check, a failing check and a conflict settle
+        # without the trees and the patches: a broken comparison endpoint
+        # must not turn one of them into an error.
+        #
+        # Each scenario carries a stale verdict, so the gate would compare
+        # the patches if it did not settle the pull request first. Both
+        # comparison endpoints fail.
+        early_cases = [
+            ("draft", pr(draft=True), [check_run()], "WAIT draft"),
+            ("checks_running", pr(),
+             [check_run(status="IN_PROGRESS", conclusion=None)],
+             "WAIT checks"),
+            ("failed_checks", pr(), [check_run(conclusion="FAILURE")],
+             "FIX checks"),
+            ("conflict", pr(mergeable=False), [check_run()], "FIX conflict"),
+            ("merged", pr(state="closed", merged=True), [check_run()],
+             "DONE merged"),
+            ("closed", pr(state="closed"), [check_run()], "DONE closed"),
+        ]
+        for label, pr_obj, checks, expected in early_cases:
+            data = tmp / f"data_early_{label}"
+            data.mkdir()
+            install(data, pr_obj,
+                    [review(501, "APPROVED", COMMIT_A,
+                            "2026-10-20T00:00:00Z")],
+                    [], checks, {HEAD: TREE_2, COMMIT_A: TREE_1},
+                    {f"{BASE}...{COMMIT_A}": compare_files()})
+            # Both endpoints fail. Neither may be reached.
+            (data / "gh_fail_tree").write_text("")
+            (data / "gh_fail_compare").write_text("")
+            r = run_gate(data, bin_dir)
+            if r.returncode != 0 or r.stdout.strip() != expected:
+                failures.append(
+                    f"early_{label}: expected {expected!r}, got "
+                    f"rc={r.returncode} stdout={r.stdout.strip()!r} "
+                    f"stderr={r.stderr.strip()!r}")
+            log = (data / "gh.log").read_text()
+            trees = [ln for ln in log.splitlines() if "/git/commits/" in ln]
+            compares = [ln for ln in log.splitlines() if "/compare/" in ln]
+            if trees or compares:
+                failures.append(
+                    f"early_{label}: the gate asked for {len(trees)} tree(s) "
+                    f"and {len(compares)} compare(s) that cannot change the "
+                    f"answer: {trees!r} {compares!r}")
+
+        # The same, with a broken tree endpoint only. The comparison is
+        # reached only through the trees, so neither may be asked for.
+        for label, pr_obj, checks, expected in early_cases:
+            data = tmp / f"data_early_tree_{label}"
+            data.mkdir()
+            install(data, pr_obj,
+                    [review(501, "APPROVED", COMMIT_A,
+                            "2026-10-20T00:00:00Z")],
+                    [], checks, {HEAD: TREE_2, COMMIT_A: TREE_1})
+            (data / "gh_fail_tree").write_text("")
+            r = run_gate(data, bin_dir)
+            if r.returncode != 0 or r.stdout.strip() != expected:
+                failures.append(
+                    f"early_tree_{label}: expected {expected!r}, got "
+                    f"rc={r.returncode} stdout={r.stdout.strip()!r} "
+                    f"stderr={r.stderr.strip()!r}")
+
+        # A comparison that IS needed still fails the run, and names the
+        # endpoint: the early rules are not a licence to answer from a
+        # comparison the gate did not make.
+        data = tmp / "data_early_then_compare_needed"
+        data.mkdir()
+        install(data, pr(),
+                [review(501, "APPROVED", COMMIT_A, "2026-10-20T00:00:00Z")],
+                [], [check_run()], {HEAD: TREE_2, COMMIT_A: TREE_1},
+                {f"{BASE}...{COMMIT_A}": compare_files()})
+        (data / "gh_fail_compare").write_text("")
+        r = run_gate(data, bin_dir)
+        if r.returncode != 1:
+            failures.append(
+                f"early_then_compare_needed: expected exit 1, got "
+                f"{r.returncode}")
+        if r.stdout != "":
+            failures.append(
+                f"early_then_compare_needed: stdout was {r.stdout!r}, "
+                "expected empty")
+        if f"compare/{BASE}...{COMMIT_A}" not in r.stderr:
+            failures.append(
+                f"early_then_compare_needed: stderr did not name the "
+                f"endpoint: {r.stderr!r}")
+
+        # ---- the patch comparison, through the pure helper ------------
+
+        # Equal blob shas are equal work, whatever the patch text says:
+        # the sha names the file's content, and the same content needs
+        # no second proof.
+        shifted = PATCH_BODY.replace("@@ -10,3 +10,3 @@", "@@ -99,3 +99,3 @@")
+        if not pr_gate.same_patch(compare_files(), compare_files()):
+            failures.append("same_patch: identical responses are not equal")
+        if not pr_gate.same_patch(compare_files(), compare_files(
+                patch=shifted)):
+            failures.append(
+                "same_patch: equal blob shas under differing patch text "
+                "are not equal")
+
+        # A file the API will not show a patch for -- binary, or too
+        # large to diff -- is still comparable: its blob sha names its
+        # content, and an equal sha needs no patch text beside it.
+        if not pr_gate.same_patch(compare_files(), compare_files(patch=None)):
+            failures.append(
+                "same_patch: a file with equal sha and no patch is not equal")
+
+        # A differing blob is different work, and the patch text proves
+        # nothing about the content: two patches can read alike over
+        # different files.
+        if pr_gate.same_patch(compare_files(),
+                              compare_files(sha=OTHER_BLOB_SHA)):
+            failures.append(
+                "same_patch: a differing blob sha compares equal")
+        if pr_gate.same_patch(compare_files(),
+                              compare_files(sha=OTHER_BLOB_SHA,
+                                            patch=None)):
+            failures.append(
+                "same_patch: a differing blob with no patch compares equal")
+
+        # A file with no `sha` cannot be compared either: the blob sha
+        # is what says the two commits left the same content, and
+        # without it there is nothing to compare.
+        if pr_gate.same_patch(compare_files(), compare_files(sha=NO_SHA)):
+            failures.append(
+                "same_patch: a file with no sha compares equal")
+
+        # 300 files is a truncated list, so it cannot be compared.
+        many = [compare_file(filename=f"lib/f{i}.py") for i in range(300)]
+        if pr_gate.same_patch(many, many):
+            failures.append(
+                "same_patch: a 300-file response compares equal")
+
+        many = [compare_file(filename=f"lib/f{i}.py") for i in range(299)]
+        if not pr_gate.same_patch(many, many):
+            failures.append(
+                "same_patch: a 299-file response does not compare equal")
+
+        # A different file is a different patch.
+        if pr_gate.same_patch(compare_files(),
+                              compare_files(filename="lib/y.py")):
+            failures.append(
+                "same_patch: a patch touching another file is equal")
 
     if failures:
         print("FAIL:")
