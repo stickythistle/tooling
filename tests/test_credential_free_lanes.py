@@ -31,6 +31,8 @@ import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 LIB = REPO_ROOT / "lib" / "common.sh"
 IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 
@@ -546,6 +548,10 @@ def run_lane(tmp: Path, repo: Path, *, extra_env: dict | None = None):
     envfile.write_text("")
     home = tmp / "home"
     home.mkdir()
+    # The lane refuses to start when a dispatched skill differs from the
+    # repository's copy. The install is the operator's own, so the suite
+    # makes one for its temporary home rather than turning the check off.
+    install_skills(home)
     state = tmp / "state"
     state.mkdir()
     env = {
@@ -664,6 +670,10 @@ def test_the_prompt_says_what_is_enforced():
         envfile.write_text("")
         home = tmp / "home"
         home.mkdir()
+        # The lane refuses to start when a dispatched skill differs from
+        # the repository's copy, so the suite installs the repository's
+        # skills into its temporary home.
+        install_skills(home)
         state = tmp / "state"
         state.mkdir()
         env = {
@@ -905,6 +915,10 @@ def test_the_script_itself_keeps_its_own_github_access():
         envfile.write_text("")
         home = tmp / "home"
         home.mkdir()
+        # The lane refuses to start when a dispatched skill differs from
+        # the repository's copy, so the suite installs the repository's
+        # skills into its temporary home.
+        install_skills(home)
         state = tmp / "state"
         state.mkdir()
         env = {
