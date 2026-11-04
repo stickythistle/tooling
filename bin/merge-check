@@ -53,6 +53,38 @@ def gh_json(endpoint: str, *args: str):
         raise FetchError(f"{endpoint}: response was not JSON: {exc}") from exc
 
 
+def fetch_check_rollup(repo: str, number: str) -> list:
+    """The pull request's check rollup: check runs and commit statuses
+    in one list.
+
+    `statusCheckRollup` mixes `CheckRun` and `StatusContext` entries;
+    they are told apart by `__typename`, in the decision.
+
+    Read from `gh pr view --json statusCheckRollup`, the way
+    `pr-loop-gate` reads it: it is a union, and the two tools then read
+    one shape. A pull request with no checks reports a null rollup, and
+    that is "there is nothing to wait for", not a failure.
+    """
+    proc = subprocess.run(
+        ["gh", "pr", "view", number, "-R", repo, "--json", "statusCheckRollup"],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise FetchError(f"statusCheckRollup: {reason}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise FetchError(f"statusCheckRollup: response was not JSON: {exc}") from exc
+    rollup = payload.get("statusCheckRollup") if isinstance(payload, dict) else None
+    if rollup is None:
+        return []
+    if not isinstance(rollup, list):
+        raise FetchError("statusCheckRollup: rollup was not an array")
+    return rollup
+
+
 def git(repo_dir: str, *args: str) -> str:
     """Run one git command in the checkout and return its stdout.
 
@@ -256,8 +288,10 @@ def commits_between(repo_dir: str, base_ref: str, head: str) -> list[dict]:
     The list comes from the object database, not the API: the API's
     compare paginates, and a longer pull request would leave commits
     the sign-off check never saw.
+
+    `-z` ends each record with a NUL only, so every commit parses.
     """
-    out = git(repo_dir, "log", "--format=%H%n%an%n%ae%n%cn%n%ce%n%B%x00",
+    out = git(repo_dir, "log", "-z", "--format=%H%n%an%n%ae%n%cn%n%ce%n%B",
               f"{base_ref}..{head}")
     records = []
     for block in out.split("\x00"):
@@ -468,34 +502,9 @@ def main(argv: list[str] | None = None) -> int:
         reviewed_files = git(repo_dir, "diff", "--name-only",
                              f"{base_ref}...{reviewed_sha}").split()
 
-        checks = gh_json(f"repos/{repo}/commits/{head_sha}/check-runs",
-                         "-f", "per_page=100")
-        rollup = []
-        if isinstance(checks, dict):
-            for run in checks.get("check_runs") or []:
-                if isinstance(run, dict):
-                    entry = dict(run)
-                    entry["__typename"] = "CheckRun"
-                    rollup.append(entry)
-        statuses = gh_json(f"repos/{repo}/commits/{head_sha}/status")
-        if isinstance(statuses, dict):
-            for ctx in statuses.get("statuses") or []:
-                if isinstance(ctx, dict):
-                    entry = dict(ctx)
-                    entry["__typename"] = "StatusContext"
-                    # The REST statuses API answers a lowercase `state`
-                    # (`pending`, `success`), while `pending_checks` was
-                    # written for the GraphQL rollup, whose StatusContext
-                    # carries `PENDING` and `EXPECTED`.
-
-                    # Normalizing here keeps the shared helper honest for
-                    # both shapes; a lowercase `pending` left as-is would
-                    # go uncounted and the tool would say READY while a
-                    # status ran.
-                    state = entry.get("state")
-                    if isinstance(state, str):
-                        entry["state"] = state.upper()
-                    rollup.append(entry)
+        # The rollup is the shape `pr_gate`'s readers take, as in
+        # `pr-loop-gate`.
+        rollup = fetch_check_rollup(repo, number)
         checks_pending = pending_checks(rollup)
         pending_names = []
         for entry in rollup:
