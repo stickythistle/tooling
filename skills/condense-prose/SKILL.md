@@ -5,6 +5,34 @@ description: Condense docstrings, code comments, markdown docs, and PR bodies do
 
 # Condense prose
 
+## What cannot be cut
+
+Read this before the finder, and before you cut anything.
+
+**In a skill file, an instruction, a rule's example, a trigger phrase in the
+description, or a negation cannot be cut or reworded.** Only restatements,
+filler and history can.
+
+A skill file is not prose that describes behaviour. It *is* the behaviour:
+a lane loads it and acts on it. So in a skill file:
+
+| | |
+|---|---|
+| an instruction | "run the gate before the commit" is the gate running. Cut it and the gate does not run |
+| a rule's example | the example is often the only place the rule says what it means. "a route's response is tested through the route, not through the repo function under it" is not decoration |
+| a trigger phrase in the description | the description is how the skill is chosen at all. "Triggers - 'hermes review', 'scrutinize this'" is what makes it load. Cut a phrase and the skill stops being found |
+| a negation | "say what the reviewer did **not** check" and "name what was checked" are opposites. A negation carries the meaning; a rewrite that keeps the words can reverse it |
+
+The rest of this skill is about ordinary prose. A skill file is not ordinary
+prose, and the finder treats it as such: an `oversize` flag on a skill file
+is a question about whether a rule can lose its example, not an instruction
+to shorten it.
+
+**If a flagged block has none of those to remove, it stays, and you report it
+as kept.** Say which block and why you kept it. A block you left alone
+because it was protected is a result; a block you left alone because you ran
+out of time is a gap, and the two must not look the same.
+
 `find_prose.py` finds candidates mechanically. Every deletion is still a judgment call.
 
 ```bash
@@ -29,6 +57,10 @@ Findings, most-mechanical first:
 | `oversize` | over `--min-words` (40) | rewrite as one flat declarative per surviving fact |
 
 A table is never oversize: its length comes from its row count, and a row is judged on its own.
+
+A block in a `skills/*/SKILL.md` carries the context mark `skill-file`. It is
+not a finding: the block is still scanned, and a restatement in a skill file
+is still reported. The mark says how to read a finding there.
 
 ## Cut beyond what the finder sees
 
@@ -68,6 +100,34 @@ A two-line replacement usually loses; a one-line replacement usually survives.
 3. Rewrite, don't trim. Target one flat declarative sentence per fact that survives.
 4. Verify: run the project's test gate and formatter, check the line-length limit. Prose edits must not change behavior, and a reflowed docstring can break a lint.
 5. Report per-file before/after line counts, plus anything cut that a reviewer had explicitly asked for — that needs their sign-off, not yours.
+
+## Report what you changed, sentence by sentence
+
+**For every block you changed, report the sentence before and the sentence
+after.** The coordinator reads those pairs instead of reconstructing them
+from the diff, and the difference is the whole point: a diff shows that
+words went, and only the pair shows that the *meaning* went with them.
+
+Write the report to a file and hand it over. One entry per changed block:
+
+    skills/pr-review-coordinator/SKILL.md:167
+    - "Say in the approval what the reviewer did not check, such as a merge order two PRs share."
+    + "Name what was checked, such as a merge order two PRs share."
+    kept: negation — "not" is the meaning, and the rewrite reversed it.
+
+Two lines per block, and the text on both sides is the sentence as it
+stands in the file — not a paraphrase. A pair whose "after" reads like the
+"before" with a word missing is exactly the case the coordinator needs to
+see.
+
+**Report the blocks you kept, too, and say why.** A block kept because it
+carries an instruction, an example, a trigger phrase or a negation is a
+result. A block kept because you had no time is a gap, and the two must not
+look the same in the report. The `kept:` line says which.
+
+Nothing else in the report: the before/after pairs and the kept blocks, per
+file, in the order the finder flagged them. The per-file word counts go in
+the same file.
 
 ## Expect several passes
 

@@ -24,10 +24,12 @@ the agent host, not this conversation, is the record of what each round did.
 2. The coordinator reviews the draft with `COMMENT` reviews, and the fix rounds
    run on the draft.
 3. When nothing is left to change, a finishing run condenses the prose, squashes
-   and pushes.
+   and pushes. The condense pass reports the sentence before and after for every
+   block it changed, and says which flagged blocks it kept and why.
 4. The coordinator waits for CI, then runs `pr-ready`, which takes the PR out of
    draft when the gates and the prose pass.
-5. The coordinator confirms the change since its last review is prose only, then
+5. The coordinator checks the condense pass for lost instructions and reversed
+   negations, confirms the change since its last review is prose only, then
    approves at that sha.
 6. The coordinator merges.
 
@@ -233,7 +235,36 @@ comment marker is not a comment: the marker can be literal data.
 - A removed blank line may be literal data too: a blank line inside a heredoc
   or a raw string.
 
-**3. The regex comparison is a helper, never the proof.** The filters below
+**3. Check the condense pass for lost instructions and reversed negations.**
+A finishing run that shortens a sentence can shorten away the thing the
+sentence was for. A diff shows that words went; only the before/after pairs
+show that the meaning went with them.
+
+Read the condense pass's own report first — the lane writes the sentence
+before and after for every block it changed, and names the blocks it kept.
+Then check the pairs:
+
+- **Did an instruction survive?** "Run the gate before the commit" is the
+  gate running. A rewrite that keeps the topic and drops the imperative has
+  removed the instruction while leaving the sentence looking fine.
+- **Did a rule keep its example?** The example is often the only place the
+  rule says what it means: "a route's response is tested through the route,
+  not through the repo function under it" is not decoration. An example cut
+  for length is a rule that now says nothing about the case it covers.
+- **Did a trigger phrase survive the description?** The description is how
+  the skill is chosen at all. A phrase cut from it stops the skill being
+  found.
+- **Did a negation keep its direction?** "Say in the approval what the
+  reviewer did **not** check" and "Name what was checked" are opposites, and
+  a rewrite that keeps every word can still reverse the meaning. Read the
+  pair for what it now says, not for the words it kept.
+
+A skill file is the behaviour, not a description of it: a lane loads it and
+acts on it, so a cut instruction is a changed lane and a reversed negation
+is a wrong instruction. **Do not approve a finishing run whose condense pass
+lost one.** Ask for the block to be restored.
+
+**4. The regex comparison is a helper, never the proof.** The filters below
 say where to look. They cannot tell a comment from a comment-shaped string, so
 a passing diff is not a passing check. Narrow the file with the filter, then
 confirm every ignored line by hand against step 2.
@@ -265,7 +296,7 @@ diff <(git show <approved-sha>:<file> | grep -vE '^\s*//' | grep -vE '^\s*$') \
   || echo "CHANGED: <file>"
 ```
 
-**4. Anything ambiguous is a review, not an approval.** A line whose lexical
+**5. Anything ambiguous is a review, not an approval.** A line whose lexical
 context you cannot settle from the diff — a comment marker inside a string, a
 heredoc, a macro, a generated file, a blank line whose meaning is not visible
 — gets the normal treatment: a review round against the change, and a reply

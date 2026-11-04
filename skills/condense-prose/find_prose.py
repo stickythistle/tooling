@@ -92,6 +92,17 @@ TRAILING_CLAUSE = re.compile(
 )
 BACKTICKED = re.compile(r"``([^`]+)``|`([^`]+)`")
 WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
+
+# A skill file is not prose that describes behaviour. It *is* the behaviour:
+# a lane loads it and acts on it. So an instruction, a rule's example, a
+# trigger phrase in the description, or a negation in a skill file cannot be
+# cut or reworded -- only restatements, filler and history can.
+#
+# The finder cannot tell an instruction from a restatement, so it marks the
+# block and leaves the judgement to the reader. The mark is context, not a
+# finding.
+SKILL_FILE = re.compile(r"(^|/)skills/[^/]+/SKILL\.md$")
+
 STOPWORDS = frozenset(
     "a an the and or but if is are was were be been being to of in on for with "
     "that this it its as at by from so no not can will each every one two per "
@@ -113,6 +124,10 @@ class Block:
     # rows the diff touched, so each row has to carry the line it sits
     # on.
     lines: list[str] = field(default_factory=list)
+    # Context marks where a block came from. They change how a finding is
+    # read, so they travel with the block, but they are not findings
+    # themselves and a count of findings ignores them.
+    context: list[str] = field(default_factory=list)
 
     @property
     def words(self) -> int:
@@ -445,7 +460,12 @@ def collect(
             found, raised = comment_blocks(rel, src, lexer), ""
 
         prose = [b for b in found if b.kind not in {"table", "heading"}]
+        # A skill file's blocks are marked, not protected: the mark says
+        # how to read a finding there, it does not stand in for one.
+        in_skill = bool(SKILL_FILE.search(rel))
         for block in found:
+            if in_skill:
+                block.context.append("skill-file")
             # A table's length comes from its row count, so no table is
             # oversize. The per-row checks below still apply to it.
             if block.kind != "table" and block.words > min_words:
@@ -527,6 +547,24 @@ def report(blocks: list[Block], groups: list[list[Block]]) -> None:
     for block in flagged:
         by_kind[block.findings[0]].append(block)
 
+    # The skill-file notice comes first, because it changes what every
+    # other finding on those blocks means.
+    skill_blocks = [b for b in flagged if "skill-file" in b.context]
+    if skill_blocks:
+        print(
+            "skill-file: these blocks are in a skill file, which is the "
+            "behaviour rather than a description of it."
+        )
+        print(
+            "  An instruction, a rule's example, a trigger phrase in the "
+            "description, or a negation cannot be cut or reworded."
+        )
+        print(
+            "  Only restatements, filler and history can. A flagged block with "
+            "none of those to remove stays, and is reported as kept."
+        )
+        print()
+
     grouped_ids = {id(b) for group in groups for b in group}
     for group in groups:
         kind = group[0].findings[0]
@@ -545,7 +583,11 @@ def report(blocks: list[Block], groups: list[list[Block]]) -> None:
         ]
         for block in rest:
             tags = ",".join(block.findings)
-            print(f"{tags}: {block.path}:{block.line} ({block.words} words, {block.kind})")
+            note = f" [{','.join(block.context)}]" if block.context else ""
+            print(
+                f"{tags}{note}: {block.path}:{block.line} "
+                f"({block.words} words, {block.kind})"
+            )
             print(f"  {block.preview()}")
             print()
 
@@ -605,6 +647,9 @@ def main() -> int:
     rank_findings(blocks)
 
     if args.json:
+        # Only a block with a finding is listed. Context marks ride along
+        # on the blocks that are listed, so a count of the array is a count
+        # of findings and nothing else.
         json.dump(
             [
                 {
@@ -613,6 +658,7 @@ def main() -> int:
                     "kind": b.kind,
                     "words": b.words,
                     "findings": b.findings,
+                    "context": b.context,
                     "text": b.text,
                 }
                 for b in blocks
