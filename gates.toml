@@ -197,7 +197,10 @@ run = "bash -n bin/repo-branch-sweep"
 
 [[gates]]
 name = "hermes review tests"
-when = '^(skills/hermes-review/scripts/hermes-scrutinize\.sh|tests/test_hermes_scrutinize\.py)$'
+# The suite drives the review script it runs and the driver that runs
+# it -- which sources lib/common.sh, so a change to the shared helper is
+# a change to what the suite exercises.
+when = '^(skills/hermes-review/scripts/hermes-scrutinize\.sh|bin/hermes-review-pr|lib/common\.sh|tests/test_hermes_scrutinize\.py)$'
 run = "python3 tests/test_hermes_scrutinize.py"
 
 # The GPU group lock and its three contracts: serialise on one group, run

@@ -557,7 +557,7 @@ def test_second_review_against_moved_head_is_refused():
         first, wt_root = run_review_pr(repo, reuse_tmp=tmp)
         assert first.returncode == 0, f"first review failed: {first.stderr}"
         # The driver parks REVIEW_NOTES.md inside review-pr-N under the root.
-        wt = wt_root / "review-pr-1"
+        wt = wt_root / "review-pr-1-rev"
         assert (wt / "REVIEW_NOTES.md").exists(), first.stderr
         new_sha = push_new_feature_commit(repo)
         # Sanity: the local fetch actually advanced; without this the test
@@ -613,7 +613,7 @@ def test_force_pushed_ancestor_head_is_refused():
         first, wt_root = run_review_pr(repo, reuse_tmp=tmp)
         assert first.returncode == 0, f"first review failed: {first.stderr}"
         new_remote_sha = force_push_feature_to_ancestor(repo)
-        wt = wt_root / "review-pr-1"
+        wt = wt_root / "review-pr-1-rev"
         wt_head = subprocess.run(
             ["git", "-C", str(wt), "rev-parse", "HEAD"],
             check=True, capture_output=True, text=True).stdout.strip()
@@ -646,7 +646,7 @@ def test_review_after_readback_records_pr_head_not_readback_commit():
             check=True, capture_output=True, text=True).stdout.strip()
         readback, wt_root = run_review_pr(repo, reuse_tmp=tmp, phase="readback")
         assert readback.returncode == 0, f"readback failed: {readback.stderr}"
-        wt = wt_root / "review-pr-1"
+        wt = wt_root / "review-pr-1-rev"
         assert (wt / "READBACK.md").exists(), readback.stderr
         readback_msg = artifact_commit_message(wt)
         assert pr_head[:7] in readback_msg, (
@@ -672,6 +672,151 @@ def test_review_after_readback_records_pr_head_not_readback_commit():
         # sits on top of the PR head. The PR head is HEAD^^ here.
         assert pr_head[:7] != review_msg.split("\n")[0][:7], (
             "subject line should not be the PR head's short SHA")
+
+
+def test_two_profiles_review_the_same_pr_from_one_clone():
+    """Two profiles may review the same PR at the same time from one clone.
+
+    The review branch is named for the PR alone, so the second profile's
+    worktree add failed on a branch the first one already created.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, _remote, _bin = make_review_pr_repo(tmp)
+        # Two profiles, each with its own worktree root -- the setup the
+        # issue names -- sharing one clone.
+        first, _ = run_review_pr(repo, reuse_tmp=tmp, profile="muse")
+        assert first.returncode == 0, f"first review failed: {first.stderr}"
+        second, _ = run_review_pr(repo, reuse_tmp=tmp, profile="minimax")
+        assert second.returncode == 0, (
+            f"the second profile's review failed from the same clone: "
+            f"stdout={second.stdout!r} stderr={second.stderr!r}")
+        # Both branches exist in the one clone, and neither is the other's.
+        branches = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--list", "review/pr-1*",
+             "--format=%(refname:short)"],
+            check=True, capture_output=True, text=True).stdout.split()
+        assert len(branches) == 2, (
+            f"expected one review branch per profile, got {branches!r}")
+        assert any("muse" in b for b in branches), branches
+        assert any("minimax" in b for b in branches), branches
+
+
+def test_two_profiles_review_the_same_pr_with_one_worktree_root():
+    """The worktree path names the profile too.
+
+    Two profiles sharing a REVIEW_WT_ROOT would otherwise reuse the
+    first one's worktree, which holds the first reviewer's findings.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, _remote, _bin = make_review_pr_repo(tmp)
+        first, wt_root = run_review_pr(repo, reuse_tmp=tmp, profile="muse")
+        assert first.returncode == 0, f"first review failed: {first.stderr}"
+        second, _ = run_review_pr(repo, reuse_tmp=tmp, profile="minimax")
+        assert second.returncode == 0, (
+            f"the second profile's review failed: stdout={second.stdout!r} "
+            f"stderr={second.stderr!r}")
+        # Two worktrees, one per profile.
+        worktrees = sorted(p.name for p in wt_root.iterdir() if p.is_dir())
+        assert len(worktrees) == 2, (
+            f"expected one worktree per profile, got {worktrees!r}")
+        # Each holds its own reviewer's notes, not the other's.
+        notes = [p / "REVIEW_NOTES.md" for p in wt_root.iterdir() if p.is_dir()]
+        assert all(n.exists() for n in notes), notes
+
+
+def test_a_profile_name_that_is_not_one_path_component_is_refused():
+    """A profile name that cannot be one path component is refused.
+
+    A name with a slash would create a nested ref, and a space would
+    fail the worktree add with a git error that says nothing about the
+    profile.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, _remote, _bin = make_review_pr_repo(tmp)
+        odd, _ = run_review_pr(repo, reuse_tmp=tmp, profile="muse/2")
+        assert odd.returncode == 2, (
+            f"a profile name with a slash was not refused: rc={odd.returncode} "
+            f"stdout={odd.stdout!r} stderr={odd.stderr!r}")
+        assert "muse/2" in odd.stderr, (
+            f"the refusal did not name the profile: {odd.stderr!r}")
+        branches = subprocess.run(
+            ["git", "-C", str(repo), "branch", "--list", "review/pr-1*",
+             "--format=%(refname:short)"],
+            check=True, capture_output=True, text=True).stdout.split()
+        assert not branches, (
+            f"a refused profile name still made a branch: {branches}")
+
+
+def test_an_accepted_profile_name_is_always_a_ref_git_accepts():
+    """Every profile name the check accepts is a branch name git accepts.
+
+    git's rules for a ref surprise: no "..", no leading or trailing dot,
+    no space.
+    """
+    common = Path(__file__).resolve().parent.parent / "lib" / "common.sh"
+    # The helper is sourced, not executed, so the function is read out of
+    # the file and run in a shell that has it defined.
+    check = subprocess.run(
+        ["bash", "-c",
+         f'. "{common}" && for p in "muse" "Muse1m" "muse2" "m-2" "m_2" "a1"; do '
+         'profile_name_ok "$p" || { echo "REFUSED: $p"; continue; }; '
+         'b="review/pr-142-$p"; '
+         'git check-ref-format --branch "$b" >/dev/null 2>&1 || '
+         'echo "REJECTED: $p -> $b"; done'],
+        capture_output=True, text=True)
+    problems = [line for line in check.stdout.splitlines()
+                if line.startswith("REJECTED") or line.startswith("REFUSED")]
+    assert not problems, (
+        f"an accepted profile name made a branch git refuses: {problems}")
+
+
+def test_a_profile_name_outside_the_allowed_set_is_refused():
+    """A name outside the allowed set is refused, not sanitised.
+
+    Sanitising would map two different profiles onto one: `review.a` and
+    `reviewa` both become `reviewa`, and they would share a branch.
+    """
+    common = Path(__file__).resolve().parent.parent / "lib" / "common.sh"
+    check = subprocess.run(
+        ["bash", "-c",
+         f'. "{common}" && for p in "review.a" "review/a" "a..b" ".hidden" '
+         '"trailing." "!!!" "" ".." "..." "a/b/c" '
+         '"-leading" "has~tilde" "has^caret" "has:colon" "has?q" "has*star" '
+         '"has[bracket" "has\\\\backslash" "with space"; do '
+         'profile_name_ok "$p" && echo "ACCEPTED: $p"; done'],
+        capture_output=True, text=True)
+    accepted = [line for line in check.stdout.splitlines()
+                if line.startswith("ACCEPTED")]
+    assert not accepted, (
+        f"a profile name outside the allowed set was accepted: {accepted}")
+
+
+def test_two_profiles_that_sanitised_alike_are_kept_apart():
+    """The names a slug collided on reach different branches.
+
+    `review.a` sanitised onto `reviewa`, and `review/a` onto `review_a`.
+    The first of each pair is refused and the second is used as it is.
+    """
+    common = Path(__file__).resolve().parent.parent / "lib" / "common.sh"
+    check = subprocess.run(
+        ["bash", "-c",
+         f'. "{common}" && for p in "review.a" "reviewa" "review/a" "review_a"; do '
+         'if profile_name_ok "$p"; then echo "KEPT: $p"; '
+         'else echo "REFUSED: $p"; fi; done'],
+        capture_output=True, text=True)
+    outcomes = {}
+    for line in check.stdout.splitlines():
+        if ": " not in line:
+            continue
+        verdict, name = line.split(": ", 1)
+        outcomes[name] = verdict
+    assert outcomes.get("review.a") == "REFUSED", outcomes
+    assert outcomes.get("reviewa") == "KEPT", outcomes
+    assert outcomes.get("review/a") == "REFUSED", outcomes
+    assert outcomes.get("review_a") == "KEPT", outcomes
 
 
 if __name__ == "__main__":
