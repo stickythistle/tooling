@@ -231,7 +231,13 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
         FAKE_GH_LOG=str(tmp / "gh.log"),
         FAKE_GH_DATA=str(data),
         FAKE_LANE=lane,
-        FAKE_REPLIES=str(replies_src))
+        FAKE_REPLIES=str(replies_src),
+        # The verifier refuses when LANE_GIT_NAME / LANE_GIT_EMAIL are
+        # unset, so the suite configures the identity the way the
+        # operator does. The worktree's own user.name/user.email are
+        # not the expected identity.
+        LANE_GIT_NAME="Lane",
+        LANE_GIT_EMAIL="lane@example.invalid")
     return wt, origin, head, env, ledger_dir
 
 

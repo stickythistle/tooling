@@ -201,6 +201,10 @@ def make_env(stem: Path, wt: Path, **extra) -> dict:
         "TMPDIR": str(stem),
         "AGENT_STATE_DIR": str(stem / "state"),
         "HERMES_HOME": str(env_dir),
+        # The lane identity is configuration; the lane refuses
+        # without it.
+        "LANE_GIT_NAME": "Lane",
+        "LANE_GIT_EMAIL": "lane@example.invalid",
         **extra,
     }
 

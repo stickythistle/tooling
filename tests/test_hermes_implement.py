@@ -300,18 +300,23 @@ def setup_env(tmp: Path, **extra) -> dict:
     (tmp / "fake.env").write_text("")
     (tmp / "hermes_home").mkdir()
     (tmp / "tmpdir").mkdir()
-    # Strip identity-pinning env vars so the suite is robust to a
-    # parent process that has a lane identity pinned: a gate runs
-    # inside a lane, and GIT_AUTHOR_* / GIT_COMMITTER_* / LANE_GIT_*
-    # reaching the test from there would leak the parent identity
-    # into the work the tests are checking. Tests that want to pin an
-    # identity set those keys explicitly via **extra.
+    # Strip identity-pinning env vars: a gate runs inside a lane, and
+    # GIT_AUTHOR_* / GIT_COMMITTER_* / LANE_GIT_* reaching the test
+    # from there would leak the parent identity into the work the
+    # tests are checking. Tests that want a different identity set
+    # those keys explicitly via **extra.
     parent = {k: v for k, v in os.environ.items()
               if not (k.startswith("GIT_AUTHOR_")
                       or k.startswith("GIT_COMMITTER_")
                       or k.startswith("LANE_GIT_"))}
     base = {**parent,
             "PATH": f"{bin_dir}:/usr/bin:/bin",
+            # The lane identity is configuration, and hermes-implement
+            # refuses to start a lane without it. The default here is
+            # that configuration; a test that is about the refusal
+            # clears it.
+            "LANE_GIT_NAME": "Lane",
+            "LANE_GIT_EMAIL": "lane@example.invalid",
             # The fake HERMES_PYTHON script is its own python interpreter
             # (shebang), so the script's -m hermes_cli.main invocation is
             # answered by the fake rather than the real hermes package.
@@ -870,31 +875,23 @@ def test_lane_identity_refuses_with_author_override_when_setting_says_so():
 
 
 def test_lane_identity_refuses_before_agent_when_unresolvable():
-    """When neither LANE_GIT_NAME/EMAIL nor the worktree's user.name/email
-    resolves to a value, hermes-implement must refuse with a named
-    error before the agent starts. The agent is never spawned."""
+    """With LANE_GIT_NAME/LANE_GIT_EMAIL unset, hermes-implement must
+    refuse with a named error before the agent starts, even when the
+    worktree's user.name/user.email would resolve. A wrong host config
+    cannot pin the lane. The agent is never spawned."""
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
-        # setup_env clears LANE_GIT_* by default (no extra), so the
-        # helper falls back to the worktree's user.name/email. Strip
-        # both before invoking.
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
                         FAKE_HERMES_PLAN="commit_with_author")
+        env.pop("LANE_GIT_NAME", None)
+        env.pop("LANE_GIT_EMAIL", None)
         repo = make_repo(tmp)
-        subprocess.run(["git", "-C", str(repo), "config",
-                        "--unset", "user.email"], check=True)
-        subprocess.run(["git", "-C", str(repo), "config",
-                        "--unset", "user.name"], check=True)
-        # Clear any global identity inherited by the test process so
-        # `git -C <wt> config --get user.name` returns empty. We use a
-        # clean HOME and PATH that point at empty config dirs.
-        clean_home = tmp / "isolated-home"
-        clean_home.mkdir()
-        env["HOME"] = str(clean_home)
-        env["XDG_CONFIG_HOME"] = str(clean_home)
-        env["GIT_CONFIG_GLOBAL"] = str(clean_home / ".gitconfig")
-        env["GIT_CONFIG_SYSTEM"] = str(clean_home / "system-gitconfig")
+        # The worktree's own config does resolve -- make_repo sets both
+        # -- and it must not be used as the expected identity.
+        assert subprocess.run(
+            ["git", "-C", str(repo), "config", "--get", "user.name"],
+            check=True, capture_output=True, text=True).stdout.strip() != ""
 
         proc = subprocess.run(
             [str(BIN), "--issue", "999", "--worktree", str(repo),
@@ -908,6 +905,10 @@ def test_lane_identity_refuses_before_agent_when_unresolvable():
             f"stderr={proc.stderr!r}")
         assert "cannot pin lane identity" in proc.stderr, (
             f"refusal message missing: stderr={proc.stderr!r}")
+        # The refusal names both variables the operator has to set.
+        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
+            assert var in proc.stderr, (
+                f"the refusal does not name {var}: stderr={proc.stderr!r}")
         # No commit was made.
         log = subprocess.run(
             ["git", "-C", str(repo), "log", "--format=%H %s"],
@@ -945,7 +946,15 @@ def test_lane_identity_verifier_does_not_leak_pinned_env_to_caller():
         # A sentinel the caller's own code may have set, that the
         # verifier must not clobber. LANE_GIT_* and GIT_AUTHOR_* would
         # affect git's behaviour if leaked; the test sets all of them.
+        #
+        # hermes-implement sources its env file; let an empty one stand
+        # in for the operator's, so the operator's own file -- which
+        # sets the lane identity -- does not overwrite the sentinel
+        # below before the verifier ever ran.
+        fake_env = tmp / "fake.env"
+        fake_env.write_text("")
         env = {**os.environ,
+               "TOOLS_ENV": str(fake_env),
                "LANE_GIT_NAME": "Caller",
                "LANE_GIT_EMAIL": "caller@x",
                "GIT_AUTHOR_NAME": "Caller",

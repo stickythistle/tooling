@@ -302,7 +302,7 @@ EOF
 # below is the backstop for one that overrides them.
 #
 # Refusing up front names a missing setting.
-if ! export_lane_identity_env "$WORKTREE"; then
+if ! export_lane_identity_env; then
 	exit 3
 fi
 # UTC, matching how hermes stamps last_edit_at, so the stray-write check below

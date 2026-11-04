@@ -170,7 +170,11 @@ def setup_env(tmp: Path, **extra) -> dict:
             # the login the call would act as and refuses unless it is
             # one of these.
             "IMPLEMENTER_LOGINS": "test-implementer",
-            "HERMES_HOME": str(tmp / "hermes_home")}
+            "HERMES_HOME": str(tmp / "hermes_home"),
+            # The lane identity is configuration; the lane refuses
+            # without it.
+            "LANE_GIT_NAME": "Lane",
+            "LANE_GIT_EMAIL": "lane@example.invalid"}
     base.update(extra)
     # The lane refuses to start when a dispatched skill differs from the
     # repository's copy. The install is the operator's own, so the suite

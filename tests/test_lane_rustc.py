@@ -66,7 +66,11 @@ def lane_wrapper(root: Path, role: str, stub: Path, gh_dir: Path) -> str:
              "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
              "IMPLEMENTER_LOGINS": "test-implementer",
              "HERMES_IMPLEMENT_ATTEMPTS": "1",
-             "HERMES_IMPLEMENT_TIMEOUT": "30"})
+             "HERMES_IMPLEMENT_TIMEOUT": "30",
+             # The lane identity is configuration: hermes-implement
+             # refuses without LANE_GIT_NAME / LANE_GIT_EMAIL.
+             "LANE_GIT_NAME": "Lane",
+             "LANE_GIT_EMAIL": "lane@example.invalid"})
     out = proc.stdout.strip().splitlines()
     report = Path(out[-1]) / "attempt1.stdout" if out else None
     if not report or not report.exists():
@@ -604,6 +608,54 @@ def test_nightly_pipeline_verifier_paths() -> list[str]:
                 f"nightly case 3: verifier's history rewritten "
                 f"message did not surface: "
                 f"stderr={proc.stderr[-400:]!r}")
+
+    # ----- Case 4: no configured identity, the repair is skipped.
+    #
+    # With LANE_GIT_NAME / LANE_GIT_EMAIL unset the repair agent must
+    # not start, and the refusal must skip this lane rather than end
+    # the run: one lane missing its configuration must not take the
+    # whole pipeline down with it.
+    #
+    # The repair path is entered when the gate fails, so the verify
+    # command here exits non-zero.
+    with tempfile.TemporaryDirectory() as td:
+        tmp = Path(td)
+        repo, origin, wt = _setup_nightly_repo(tmp)
+        _push_target(tmp, origin)
+        env = _nightly_env(tmp, repo)
+        # The gate fails, so the resume path runs the repair.
+        failing = tmp / "fakebin" / "failing"
+        failing.write_text("#!/usr/bin/env bash\\nexit 1\\n")
+        failing.chmod(0o755)
+        env["PIPELINE_VERIFY"] = str(failing)
+        env.pop("LANE_GIT_NAME", None)
+        env.pop("LANE_GIT_EMAIL", None)
+        proc = subprocess.run(
+            [str(PIPELINE_IMPLEMENT)], env=env,
+            capture_output=True, text=True, timeout=60)
+        # The run itself did not abort: the refusal skipped the lane
+        # and the script carried on.
+        if proc.returncode != 0:
+            failures.append(
+                f"nightly case 4 (no configured identity): the run "
+                f"aborted instead of skipping the lane: "
+                f"rc={proc.returncode} stderr={proc.stderr[-400:]!r}")
+        # The refusal is named.
+        if "no lane identity configured" not in (
+                proc.stderr + "\n" + proc.stdout):
+            failures.append(
+                f"nightly case 4: neither stdout nor stderr names "
+                f"the refusal: stdout={proc.stdout!r} "
+                f"stderr={proc.stderr[-400:]!r}")
+        # Nothing was pushed: the lane had no identity to push under.
+        pushed = subprocess.run(
+            ["git", "-C", str(origin), "rev-parse",
+             "--verify", "refs/heads/issue-1"],
+            capture_output=True, text=True)
+        if pushed.returncode == 0:
+            failures.append(
+                f"nightly case 4: branch was pushed without a "
+                f"configured identity: stdout={proc.stdout!r}")
 
     return failures
 

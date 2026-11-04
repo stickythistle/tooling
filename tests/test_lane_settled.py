@@ -291,6 +291,10 @@ def run_hermes_implement(worktree: Path, extra: str,
         # a safety net.
         "HERMES_IMPLEMENT_TIMEOUT": "5",
         "HERMES_IMPLEMENT_ATTEMPTS": "3",
+        # The lane identity is configuration; the lane refuses
+        # without it.
+        "LANE_GIT_NAME": "Lane",
+        "LANE_GIT_EMAIL": "lane@example.invalid",
     }
     cmd = [
         str(HERMES_IMPLEMENT),
