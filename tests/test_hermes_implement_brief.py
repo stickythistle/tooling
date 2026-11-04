@@ -143,6 +143,22 @@ class Harness:
         """The run's private directory, from the driver's stdout."""
         return Path(self.last_run.stdout.strip().splitlines()[-1])
 
+    def stale_brief_skill(self) -> Path:
+        """Make the installed `brief` skill differ from the repository's
+        copy, the way a profile that missed a merge carries it.
+
+        The check reads the whole directory, so a word appended to the
+        installed SKILL.md is enough to make it stale.
+        """
+        installed = (self.root / "hermes_home" / "skills" /
+                     "software-development" / "brief" / "SKILL.md")
+        if not installed.is_file():
+            installed = next(self.root.glob(
+                "hermes_home/skills/*/brief/SKILL.md"))
+        installed.write_text(installed.read_text() +
+                             "\nThe OLD rules, appended.\n")
+        return installed
+
 
 BRIEF = """\
 # Goal
@@ -367,6 +383,28 @@ def case_the_retry_names_the_brief(failures):
                  "brief", resume[:300])
 
 
+def case_a_stale_brief_skill_is_refused(failures):
+    """The brief skill is dispatched, so it is version-checked too.
+
+    The check refuses a dispatched skill whose installed copy differs from
+    the repository's. A `brief` skill that reached the lane without the
+    check would run the old rules.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        h = Harness(Path(t))
+        brief = h.write_brief(BRIEF)
+        h.stale_brief_skill()
+        result = h.run(brief)
+        if result.returncode == 0:
+            fail(failures, "stale-brief: exited 0")
+            return
+        if "brief" not in result.stderr:
+            fail(failures, "stale-brief: the refusal does not name the "
+                 "brief skill", result.stderr.strip()[:400])
+        if h.agent_log().strip():
+            fail(failures, "stale-brief: the lane ran anyway")
+
+
 def main() -> int:
     if not BIN.is_file():
         print(f"FAIL driver not built: {BIN}")
@@ -387,7 +425,8 @@ def main() -> int:
           "brief over the argument cap reaches it whole; the skill is "
           "composed; no brief leaves the skills alone; the brief "
           "outranks the issue; an unreadable brief is refused; an empty "
-          "brief is refused; the retry names it")
+          "brief is refused; the retry names it; a stale brief skill is "
+          "refused")
     return 0
 
 
@@ -398,7 +437,8 @@ CASES = (case_the_brief_reaches_the_lane,
          case_the_brief_outranks_the_issue_text,
          case_an_unreadable_brief_is_refused_by_name,
          case_an_empty_brief_is_refused,
-         case_the_retry_names_the_brief)
+         case_the_retry_names_the_brief,
+         case_a_stale_brief_skill_is_refused)
 
 
 if __name__ == "__main__":
