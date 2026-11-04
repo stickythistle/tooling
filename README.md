@@ -39,6 +39,17 @@ itself whether anything had changed, the agent produced five duplicate reviews
 out of fourteen and three stray clones of the repository inside its own working
 directory.
 
+**A branch's state is a comparison, not a reading.** Whether a merge broke
+`main` is no property of the merge alone: it is red where the commit before
+it was green. A merge onto an already-red branch broke nothing.
+
+`main-watch` reads both commits' checks and says which case it is, so a red
+that was already there is reported, not blamed on the merge that
+landed on top of it.
+
+A check that has not finished is neither green nor red, and a branch whose
+checks could not be read has an unknown state -- never a green one.
+
 ## Layout
 
     bin/       the gates, and the drivers that dispatch an issue to an agent
