@@ -396,6 +396,14 @@ name = "finding-verify tests"
 when = '^(bin/finding-verify|tests/test_finding_verify\.py)$'
 run = "python3 tests/test_finding_verify.py"
 
+# The brief: a written brief reaches the lane as a file, whole, and the
+# run keeps it. The gate names the driver, because the brief is the
+# driver's own option and the run directory it lands in.
+[[gates]]
+name = "hermes-implement brief tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_brief\.py)$'
+run = "python3 tests/test_hermes_implement_brief.py"
+
 [[gates]]
 name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'
