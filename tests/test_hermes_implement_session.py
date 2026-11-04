@@ -31,6 +31,8 @@ import textwrap
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from skill_install_fixture import install as install_skills
 BIN = REPO_ROOT / "bin" / "hermes-implement"
 
 # A fake `gh` that answers the one command hermes-implement issues.
@@ -171,6 +173,10 @@ def setup_env(tmp: Path, extra: dict | None = None) -> dict:
             "TOOLS_ENV": str(tmp / "fake.env"),
             "HERMES_HOME": str(tmp / "hermes_home")}
     base.update(extra or {})
+    # The lane refuses to start when a dispatched skill differs from the
+    # repository's copy. The install is the operator's own, so the suite
+    # makes one for its temporary home rather than turning the check off.
+    install_skills(tmp / "hermes_home")
     return base
 
 
