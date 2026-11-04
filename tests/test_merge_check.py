@@ -394,16 +394,29 @@ FAKE_GH = textwrap.dedent("""\
     args = sys.argv[1:]
     with open(os.environ["FAKE_GH_LOG"], "a") as f:
         f.write(json.dumps(args) + "\\n")
+    # `gh api` sends a request with a field (`-f` or `-F`) as a POST
+    # unless the method is named, and a read sent as a POST is refused
+    # by the endpoints that answer a read. A call that carries a field
+    # without `-X GET` is refused here too, so the defect is caught in
+    # the suite and not only on a real pull request.
+    if args and args[0] == "api":
+        has_field = any(a == "-f" or a == "-F" for a in args)
+        names_get = any(a == "GET" for a in args)
+        if has_field and not names_get:
+            print("gh: a request with a field is a POST; use -X GET to "
+                  "read", file=sys.stderr)
+            sys.exit(1)
     canned = json.load(open(os.environ["FAKE_GH_DATA"]))
+    if args and args[0] == "pr":
+        # `gh pr view N --json statusCheckRollup`
+        print(json.dumps({"statusCheckRollup":
+                          canned.get("statusCheckRollup", [])}))
+        sys.exit(0)
     if args[0] != "api":
         print(json.dumps(canned.get("pr", {})))
         sys.exit(0)
     path = args[1]
-    if path.endswith("/check-runs"):
-        print(json.dumps(canned.get("check_runs", {"check_runs": []})))
-    elif path.endswith("/status"):
-        print(json.dumps(canned.get("status", {"statuses": []})))
-    elif path.endswith("/reviews"):
+    if path.endswith("/reviews"):
         print(json.dumps(canned.get("reviews", [])))
     elif path.endswith("/issues/5/comments"):
         print(json.dumps(canned.get("issue_comments", [])))
@@ -477,6 +490,52 @@ def make_repo(tmp: Path, *, feature_message: str = FEATURE_MESSAGE,
     return clone, head, main
 
 
+def make_multi_commit_repo(tmp: Path, oldest_author: dict) -> tuple[Path, str, str]:
+    """A clone whose branch carries three commits over the base.
+
+    The oldest of the three carries `oldest_author`, so a reader that
+    reads only the newest commit misses it. The other two carry the
+    lane's identity, so the branch is otherwise the lane's own work.
+
+    The base repository mirrors the pull request's head under
+    `refs/pull/5/head`, the way GitHub does.
+    """
+    origin = tmp / "origin.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    seed = tmp / "seed"
+    subprocess.run(["git", "init", "-q", "-b", "main", str(seed)], check=True)
+    git(seed, "config", "user.email", "lane@example.invalid")
+    git(seed, "config", "user.name", "Lane Bot")
+    (seed / "a.txt").write_text("one\n")
+    git(seed, "add", "a.txt")
+    git(seed, "commit", "-qm", "base")
+    git(seed, "push", "-q", str(origin), "HEAD:refs/heads/main")
+    git(seed, "checkout", "-q", "-b", "feature")
+    # The oldest commit on the branch: the one a reader that reads only
+    # the newest never sees.
+    (seed / "b.txt").write_text("new\n")
+    git(seed, "add", "b.txt")
+    git(seed, "commit", "-qm",
+        "First change\n\nSigned-off-by: %s <%s>\n"
+        % (oldest_author["name"], oldest_author["email"]),
+        author=oldest_author)
+    for n in ("two", "three"):
+        (seed / f"{n}.txt").write_text(f"{n}\n")
+        git(seed, "add", f"{n}.txt")
+        git(seed, "commit", "-qm",
+            f"Change {n}\n\nSigned-off-by: Lane Bot <lane@example.invalid>\n")
+    git(seed, "push", "-q", str(origin), "HEAD:refs/heads/feature")
+    git(seed, "push", "-q", str(origin), "HEAD:refs/pull/5/head")
+    head = git(seed, "rev-parse", "HEAD")
+    main = git(seed, "rev-parse", "main")
+
+    clone = tmp / "clone"
+    subprocess.run(["git", "clone", "-q", str(origin), str(clone)], check=True)
+    git(clone, "config", "user.email", "lane@example.invalid")
+    git(clone, "config", "user.name", "Lane Bot")
+    return clone, head, main
+
+
 def review(state: str, commit_id: str, *, id: int = 1,
            submitted_at: str = "2026-01-02T00:00:00Z",
            login: str = REVIEWER) -> dict:
@@ -493,7 +552,7 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
           contributing=None, feature_message: str = FEATURE_MESSAGE,
           feature_author: dict = FEATURE_AUTHOR,
           check_runs=None, issue_comments=None, inline_comments=None,
-          status=None):
+          status=None, rollup=None):
     """A clone, a fake gh, and the environment that runs the driver."""
     clone, head, main = make_repo(tmp, feature_message=feature_message,
                                   feature_author=feature_author)
@@ -504,10 +563,6 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
     gh.write_text(FAKE_GH)
     gh.chmod(0o755)
 
-    # The reviewer reviews the head, so the head is the reviewed commit
-    # and the file set is compared against itself -- which passes, and is
-    # the starting point every case varies from.
-
     # The reviewer's login is named in the environment: the repository's
     # owner is a temporary directory's name here, which is no login
     # anybody could type.
@@ -516,6 +571,28 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
                     "submitted_at": "2026-01-02T00:00:00Z",
                     "user": {"login": REVIEWER}}]
 
+    # The checks are the pull request's own rollup, the way
+    # `gh pr view --json statusCheckRollup` reports them. A check run
+    # carries a `status` and a `conclusion`; a commit status carries a
+    # `state`, and the two are told apart by their `__typename`.
+    if rollup is None:
+        rollup = []
+        if check_runs is None:
+            check_runs = [{
+                "__typename": "CheckRun",
+                "name": "ci/build",
+                "status": "IN_PROGRESS" if pending else "COMPLETED",
+                "conclusion": None if pending else "SUCCESS"}]
+        for run in check_runs:
+            entry = dict(run)
+            entry.setdefault("__typename", "CheckRun")
+            rollup.append(entry)
+        if status is not None:
+            for ctx in status.get("statuses", []):
+                entry = dict(ctx)
+                entry["__typename"] = "StatusContext"
+                rollup.append(entry)
+
     data = tmp / "gh.json"
     data.write_text(json.dumps({
         "pr": {
@@ -523,11 +600,7 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
             "base": {"ref": "main"},
             "labels": [{"name": n} for n in (labels or [])],
         },
-        "check_runs": {"check_runs": check_runs if check_runs is not None else [
-            {"name": "ci/build",
-             "status": "IN_PROGRESS" if pending else "COMPLETED",
-             "conclusion": None if pending else "SUCCESS"}]},
-        "status": status if status is not None else {"statuses": []},
+        "statusCheckRollup": rollup,
         "reviews": reviews,
         "issue_comments": issue_comments if issue_comments is not None else [],
         "inline_comments": inline_comments if inline_comments is not None else [],
@@ -535,6 +608,58 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
 
     if contributing is not None:
         (clone / "CONTRIBUTING.md").write_text(contributing)
+
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("LANE_GIT_", "MERGE_CHECK_", "GH_",
+                                "REVIEWER_LOGIN", "IMPLEMENTER_LOGINS"))}
+    env.update({
+        "PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
+        "FAKE_GH_DATA": str(data),
+        "FAKE_GH_LOG": str(tmp / "gh.log"),
+        "LANE_GIT_NAME": "Lane Bot",
+        "LANE_GIT_EMAIL": "lane@example.invalid",
+        "REVIEWER_LOGIN": REVIEWER,
+    })
+    return clone, head, main, env
+
+
+def setup_multi_commit(tmp: Path, oldest_author: dict, **kwargs):
+    """A clone whose branch carries three commits, and the environment
+    that runs the driver against it.
+
+    The oldest of the three carries `oldest_author`.
+    """
+    clone, head, main = make_multi_commit_repo(tmp, oldest_author)
+
+    fakebin = tmp / "fakebin"
+    fakebin.mkdir()
+    gh = fakebin / "gh"
+    gh.write_text(FAKE_GH)
+    gh.chmod(0o755)
+
+    reviews = kwargs.pop("reviews", None)
+    if reviews is None:
+        reviews = [{"state": "APPROVED", "commit_id": head, "id": 1,
+                    "submitted_at": "2026-01-02T00:00:00Z",
+                    "user": {"login": REVIEWER}}]
+
+    rollup = kwargs.pop("rollup", None)
+    if rollup is None:
+        rollup = [{"__typename": "CheckRun", "name": "ci/build",
+                   "status": "COMPLETED", "conclusion": "SUCCESS"}]
+
+    data = tmp / "gh.json"
+    data.write_text(json.dumps({
+        "pr": {
+            "head": {"sha": head},
+            "base": {"ref": "main"},
+            "labels": [{"name": n} for n in (kwargs.pop("labels", None) or [])],
+        },
+        "statusCheckRollup": rollup,
+        "reviews": reviews,
+        "issue_comments": [],
+        "inline_comments": [],
+    }))
 
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("LANE_GIT_", "MERGE_CHECK_", "GH_",
@@ -600,24 +725,25 @@ def case_the_driver_refuses_a_running_check(failures: list[str]) -> None:
             fail(failures, "driver: the refusal does not name the check", r.stderr)
 
 
-def case_the_driver_refuses_a_pending_rest_status(failures: list[str]) -> None:
-    # A status context, not a check run, is still running. The REST
-    # statuses API answers a lowercase `pending`, which the shared
-    # pending helper cannot recognize on its own.
+def case_the_driver_refuses_a_pending_commit_status(failures: list[str]) -> None:
+    # A status context, not a check run, is still running. The rollup
+    # carries a commit status as a `StatusContext` with a `state`, and
+    # the shared pending helper reads that state.
 
-    # A status left unnormalized would go uncounted and the pull
-    # request would be called ready while it runs.
+    # A status left uncounted would go unnoticed and the pull request
+    # would be called ready while it runs.
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         clone, _head, _main, env = setup(tmp)
         data = json.loads(Path(env["FAKE_GH_DATA"]).read_text())
-        data["check_runs"] = {"check_runs": []}
-        data["status"] = {"statuses": [
-            {"context": "continuous-integration/jenkins", "state": "pending"}]}
+        data["statusCheckRollup"] = [
+            {"__typename": "StatusContext",
+             "context": "continuous-integration/jenkins",
+             "state": "PENDING"}]
         Path(env["FAKE_GH_DATA"]).write_text(json.dumps(data))
         r = run(env, clone)
         if r.returncode == 0:
-            fail(failures, "driver: a pull request with a pending REST "
+            fail(failures, "driver: a pull request with a pending commit "
                            "status was accepted", r.stdout)
             return
         if "checks" not in r.stderr:
@@ -906,12 +1032,13 @@ def case_the_driver_refuses_a_failed_check(failures: list[str]) -> None:
 
 
 def case_the_driver_refuses_a_failed_status(failures: list[str]) -> None:
-    # The same for a commit status: the statuses endpoint is a second
-    # source of the same verdicts.
+    # The same for a commit status: the rollup carries the commit
+    # statuses beside the check runs, and they are a second source of
+    # the same verdicts.
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         clone, _head, _main, env = setup(tmp, status={
-            "statuses": [{"context": "ci/legacy", "state": "failure"}]})
+            "statuses": [{"context": "ci/legacy", "state": "FAILURE"}]})
         r = run(env, clone)
         if r.returncode == 0:
             fail(failures, "checks: a failed status was accepted", r.stdout)
@@ -919,6 +1046,152 @@ def case_the_driver_refuses_a_failed_status(failures: list[str]) -> None:
         if "ci/legacy" not in r.stderr:
             fail(failures, "checks: the refusal does not name the status",
                  r.stderr)
+
+
+# The rollup a real pull request reports, recorded from
+# `gh pr view 191 --json statusCheckRollup` and trimmed to the fields the
+# decision reads. A hand-made fixture invents a shape the API never
+# answers, and the suite then proves nothing about the real one.
+REAL_ROLLUP = [{
+    "__typename": "CheckRun",
+    "name": "Gates",
+    "status": "COMPLETED",
+    "conclusion": "SUCCESS",
+    "workflowName": "Gates",
+}]
+
+
+def case_the_driver_accepts_a_real_check_rollup(failures: list[str]) -> None:
+    # A rollup as GitHub reports it: one completed, successful check run
+    # and nothing else. The pull request is ready.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, head, _main, env = setup(tmp, rollup=REAL_ROLLUP)
+        r = run(env, clone)
+        if r.returncode != 0:
+            fail(failures, "checks: a pull request whose real check "
+                           "rollup is green was refused",
+                 f"rc={r.returncode} stderr={r.stderr}")
+            return
+        if "READY" not in r.stdout:
+            fail(failures, "checks: the output does not say READY", r.stdout)
+        if head not in r.stdout:
+            fail(failures, "checks: the merge command does not name the head",
+                 r.stdout)
+
+
+def case_the_driver_refuses_a_real_rollup_that_is_still_running(failures: list[str]) -> None:
+    # The same rollup with the run still going: the pull request is not
+    # ready, and the refusal names the check.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(tmp, rollup=[{
+            "__typename": "CheckRun",
+            "name": "Gates",
+            "status": "IN_PROGRESS",
+            "conclusion": None,
+            "workflowName": "Gates",
+        }])
+        r = run(env, clone)
+        if r.returncode == 0:
+            fail(failures, "checks: a pull request whose real check "
+                           "rollup is running was accepted", r.stdout)
+            return
+        if "Gates" not in r.stderr:
+            fail(failures, "checks: the refusal does not name the check",
+                 r.stderr)
+
+
+def case_the_driver_reads_every_commit(failures: list[str]) -> None:
+    # Three commits on the branch, and the oldest one carries a wrong
+    # identity. Every commit is read, so the oldest is refused and
+    # named.
+
+    # Reading only the newest commit leaves the oldest one unchecked,
+    # and a pull request with a commit by somebody else merges.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup_multi_commit(
+            tmp, {"name": "Somebody Else", "email": "other@example.invalid"})
+        r = run(env, clone)
+        if r.returncode == 0:
+            fail(failures, "commits: a pull request whose oldest commit "
+                           "carries a wrong identity was accepted", r.stdout)
+            return
+        if "identity" not in r.stderr:
+            fail(failures, "commits: the refusal does not name the identity "
+                           "check", r.stderr)
+            return
+        detail = " ".join(r.stderr.splitlines())
+        if "Somebody Else" not in detail:
+            fail(failures, "commits: the refusal does not name the author "
+                           "of the oldest commit", detail)
+
+
+def case_the_driver_counts_every_commit(failures: list[str]) -> None:
+    # Three commits on the branch, all by the lane's identity. The
+    # one-commit rule does not fire: three commits are not one, so the
+    # pull request is not held to the single commit's parent.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup_multi_commit(
+            tmp, {"name": "Lane Bot", "email": "lane@example.invalid"})
+        r = run(env, clone)
+        if r.returncode != 0:
+            fail(failures, "commits: a pull request with three commits by "
+                           "the right identity was refused",
+                 f"rc={r.returncode} stderr={r.stderr}")
+            return
+        if "READY" not in r.stdout:
+            fail(failures, "commits: the output does not say READY", r.stdout)
+
+
+def case_the_stub_refuses_a_read_sent_as_a_post(failures: list[str]) -> None:
+    # `gh api` sends a request with a field (`-f` or `-F`) as a POST
+    # unless the method is named, and the check-runs endpoint answers a
+    # POST with 404. The stub refuses such a call, so a read sent as a
+    # POST fails in the suite too.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(tmp)
+        gh = tmp / "fakebin" / "gh"
+        for args, expect_refused in (
+                (["api", "repos/O/R/commits/abc/check-runs",
+                  "-f", "per_page=100"], True),
+                (["api", "repos/O/R/commits/abc/check-runs",
+                  "-F", "per_page=100"], True),
+                (["api", "repos/O/R/commits/abc/check-runs",
+                  "-f", "per_page=100", "-X", "GET"], False),
+                (["api", "repos/O/R/commits/abc/check-runs"], False),
+        ):
+            r = subprocess.run([str(gh), *args], env=env,
+                               capture_output=True, text=True)
+            refused = r.returncode != 0
+            if refused != expect_refused:
+                fail(failures, "stub: a call carrying a field without "
+                               "-X GET was "
+                               f"{'not ' if not expect_refused else ''}"
+                               "refused",
+                     f"args={args} rc={r.returncode} stderr={r.stderr}")
+        # The driver itself never sends such a call: it reads the pull
+        # request's rollup. The driver runs first, so its calls are in
+        # the log; the probes above add theirs after, and are told
+        # apart by their endpoint.
+        run(env, clone)
+        log = Path(env["FAKE_GH_LOG"]).read_text().splitlines()
+        driver_calls = [json.loads(line) for line in log
+                        if json.loads(line)[:2] !=
+                        ["api", "repos/O/R/commits/abc/check-runs"]]
+        for args in driver_calls:
+            if args and args[0] == "api":
+                has_field = any(a in ("-f", "-F") for a in args)
+                names_get = any(a == "GET" for a in args)
+                if has_field and not names_get:
+                    fail(failures, "stub: the driver sent a read as a POST",
+                         str(args))
+        if not any(args[:2] == ["pr", "view"] for args in driver_calls):
+            fail(failures, "stub: the driver did not read the pull "
+                           "request's check rollup", "\n".join(log))
 
 
 def case_the_driver_refuses_when_the_reviewer_has_not_reviewed(failures: list[str]) -> None:
@@ -1213,9 +1486,14 @@ def main() -> int:
     case_the_driver_prints_the_merge_command(failures)
     case_the_driver_refuses_a_needs_decision_label(failures)
     case_the_driver_refuses_a_running_check(failures)
-    case_the_driver_refuses_a_pending_rest_status(failures)
+    case_the_driver_refuses_a_pending_commit_status(failures)
     case_the_driver_refuses_a_failed_check(failures)
     case_the_driver_refuses_a_failed_status(failures)
+    case_the_driver_accepts_a_real_check_rollup(failures)
+    case_the_driver_refuses_a_real_rollup_that_is_still_running(failures)
+    case_the_driver_reads_every_commit(failures)
+    case_the_driver_counts_every_commit(failures)
+    case_the_stub_refuses_a_read_sent_as_a_post(failures)
     case_the_driver_refuses_when_the_reviewer_has_not_reviewed(failures)
     case_the_driver_refuses_a_file_added_after_a_changes_requested(failures)
     case_the_driver_ignores_an_approval_by_another_login(failures)
