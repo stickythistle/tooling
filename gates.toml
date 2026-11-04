@@ -300,6 +300,15 @@ name = "fake guards tests"
 when = '^(tests/test_fake_guards\.py|tests/test_agent_fix_pr\.py|tests/test_lane_rustc\.py|tests/test_lane_settled\.py|skills/swe-updater/SKILL\.md|skills/swe-review-fix/SKILL\.md)$'
 run = "python3 tests/test_fake_guards.py"
 
+# The verification pass between finding-check and the decider. The suite
+# exercises the allow-list, the known-answer control and every way a model
+# can answer badly; a stub stands in for the model, so the gate never calls
+# one.
+[[gates]]
+name = "finding-verify tests"
+when = '^(bin/finding-verify|tests/test_finding_verify\.py)$'
+run = "python3 tests/test_finding_verify.py"
+
 [[gates]]
 name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'
