@@ -128,10 +128,26 @@ class Block:
     # read, so they travel with the block, but they are not findings
     # themselves and a count of findings ignores them.
     context: list[str] = field(default_factory=list)
+    # The block's lines as they contribute to its text: `(line, text)` for
+    # each one, with the comment marker already stripped. Under `--diff`
+    # the added lines of a block decide whether it is oversize, so the
+    # words of each line have to be countable on their own.
+    parts: list[tuple[int, str]] = field(default_factory=list)
 
     @property
     def words(self) -> int:
         return len(self.text.split())
+
+    def added_words(self, added: set[int]) -> int:
+        """The words this block contributes from the lines the diff added.
+
+        A block that grew by a paragraph is judged on that paragraph: the
+        lines it already had stay available to the other checks, but they
+        do not count toward size.
+        """
+        return sum(
+            len(text.split()) for line, text in self.parts if line in added
+        )
 
     @property
     def key(self) -> str:
@@ -150,11 +166,19 @@ def run(cmd: list[str]) -> str:
     return subprocess.run(cmd, capture_output=True, text=True, check=True).stdout
 
 
-def changed_lines(base: str, paths: list[str]) -> dict[str, set[int]]:
-    """path -> line numbers the diff touches. ``base`` may be ``BASE..HEAD``.
+def changed_lines(
+    base: str, paths: list[str]
+) -> tuple[dict[str, set[int]], dict[str, set[int]]]:
+    """``(touched, added)``: the lines the diff touches, and the lines it adds.
 
-    A single ref is rewritten to its merge base so ``git diff`` against it
-    includes uncommitted working-tree edits; an explicit ``A..B`` is left.
+    ``touched`` is every line the diff reaches: an added line, and for a
+    deletion the two lines that border the gap. ``added`` is only the lines
+    the diff puts into the file, so a caller can judge a block on what the
+    diff wrote rather than on what it inherited.
+
+    ``base`` may be ``BASE..HEAD``. A single ref is rewritten to its merge
+    base so ``git diff`` against it includes uncommitted working-tree edits;
+    an explicit ``A..B`` is left.
     """
     if ".." in base:
         revs = base.split("..")
@@ -163,7 +187,10 @@ def changed_lines(base: str, paths: list[str]) -> dict[str, set[int]]:
         revs = [merge_base]
     out = run(["git", "diff", "-U0", "--no-color", *revs, "--", *paths])
     touched: dict[str, set[int]] = defaultdict(set)
+    added: dict[str, set[int]] = defaultdict(set)
     current = None
+    # The new-side line number the next diff body line sits on.
+    new_line = 0
     for line in out.splitlines():
         if line.startswith("+++ b/"):
             current = line[6:]
@@ -181,7 +208,19 @@ def changed_lines(base: str, paths: list[str]) -> dict[str, set[int]]:
                     touched[current].update(range(start, start + count))
                 else:
                     touched[current].update({start, start + 1})
-    return touched
+                new_line = start
+        elif current and line.startswith("+") and not line.startswith("+++"):
+            # The diff body is authoritative about which lines are new: a
+            # hunk header gives the range, and this counts the lines in it
+            # that the diff actually wrote. The header's range is not
+            # enough on its own — a hunk that replaces a line carries the
+            # replacement, and only the body says which side it is on.
+            added[current].add(new_line)
+            new_line += 1
+        elif current and line.startswith(" "):
+            # A context line takes a new-side number but adds nothing.
+            new_line += 1
+    return touched, added
 
 
 def python_blocks(rel: str, src: str) -> tuple[list[Block], str]:
@@ -200,9 +239,19 @@ def python_blocks(rel: str, src: str) -> tuple[list[Block], str]:
                 doc = ast.get_docstring(node, clean=True)
                 if doc:
                     literal = node.body[0].value
-                    blocks.append(
-                        Block(rel, literal.lineno, literal.end_lineno, "docstring", doc)
+                    block = Block(
+                        rel, literal.lineno, literal.end_lineno, "docstring", doc
                     )
+                    # The docstring's own lines, so `--diff` can judge it on
+                    # the lines the diff added alone.
+                    block.parts = [
+                        (lineno, line.strip())
+                        for lineno, line in enumerate(
+                            src.splitlines()[literal.lineno - 1 : literal.end_lineno],
+                            literal.lineno,
+                        )
+                    ]
+                    blocks.append(block)
             if isinstance(node, ast.Raise):
                 raised += [
                     n.value
@@ -258,8 +307,10 @@ def comment_blocks(rel: str, src: str, lexer: str) -> list[Block]:
         if blocks and blocks[-1].end_line == lineno - 1:
             blocks[-1].end_line = lineno
             blocks[-1].text += " " + text
+            blocks[-1].parts.append((lineno, text))
         elif text:
             blocks.append(Block(rel, lineno, lineno, "comment", text))
+            blocks[-1].parts.append((lineno, text))
 
     for block in blocks:
         # A label fenced by rules is a section banner: navigation, not narration.
@@ -305,9 +356,11 @@ def _markdown_blocks(rel: str, start: int, lines: list[str]) -> list[Block]:
     for offset, line in enumerate(lines):
         if LIST_ITEM.match(line) or not items:
             items.append(Block(rel, start + offset, start + offset, "list-item", line.strip()))
+            items[-1].parts.append((start + offset, line.strip()))
         else:
             items[-1].end_line = start + offset
             items[-1].text += " " + line.strip()
+            items[-1].parts.append((start + offset, line.strip()))
     return items
 
 
@@ -320,7 +373,11 @@ def _markdown_block(rel: str, start: int, end: int, lines: list[str]) -> Block:
         kind = "table"
     # A table keeps its lines, so its rows can carry the line they sit
     # on for the `--diff` filter.
-    return Block(rel, start, end, kind, text, lines=list(lines) if kind == "table" else [])
+    block = Block(rel, start, end, kind, text, lines=list(lines) if kind == "table" else [])
+    block.parts = [
+        (start + offset, line.strip()) for offset, line in enumerate(lines)
+    ]
+    return block
 
 
 def table_rows(block: Block) -> list[tuple[int, str, list[str]]]:
@@ -431,10 +488,13 @@ def collect(
     min_words: int,
     rev: str | None = None,
     touched: dict[str, set[int]] | None = None,
+    added: dict[str, set[int]] | None = None,
 ) -> list[Block]:
     """Scan ``paths``; with ``rev`` set, read them out of that commit.
 
-    With ``touched`` set, only the lines a diff named are judged.
+    With ``touched`` set, only the lines a diff named are judged. With
+    ``added`` set as well, ``oversize`` is decided by the lines the diff
+    added: a block that grew by a paragraph is judged on that paragraph.
     """
     blocks: list[Block] = []
     for path in paths:
@@ -469,7 +529,15 @@ def collect(
             # A table's length comes from its row count, so no table is
             # oversize. The per-row checks below still apply to it.
             if block.kind != "table" and block.words > min_words:
-                block.findings.append("oversize")
+                # Under `--diff` the size is what the diff wrote: a block
+                # that grew by a paragraph is judged on that paragraph, and
+                # the lines it inherited stay available to the other
+                # checks below.
+                size = block.words
+                if added is not None:
+                    size = block.added_words(added.get(block.path, set()))
+                if size > min_words:
+                    block.findings.append("oversize")
             if PROVENANCE.search(block.text):
                 block.findings.append("provenance")
             if ROADMAP.search(block.text):
@@ -607,10 +675,11 @@ def main() -> int:
 
     root = Path.cwd()
     touched: dict[str, set[int]] = {}
+    added: dict[str, set[int]] = {}
     candidates: list[Path] = []
     rev = args.diff.split("..")[-1] if args.diff and ".." in args.diff else None
     if args.diff:
-        touched = changed_lines(args.diff, args.paths)
+        touched, added = changed_lines(args.diff, args.paths)
         candidates = [
             Path(p)
             for p in touched
@@ -636,6 +705,7 @@ def main() -> int:
         args.min_words,
         rev,
         touched if args.diff else None,
+        added if args.diff else None,
     )
     if args.diff:
         blocks = [

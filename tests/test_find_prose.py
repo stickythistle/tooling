@@ -378,6 +378,18 @@ def _distinct_oversize_rust_block(num_lines: int = 3, words_per_line: int = 65) 
     ) + "\n"
 
 
+def _long_rust_block_with_context(num_lines: int = 3, words_per_line: int = 65) -> str:
+    """A long `///` block that also carries a negative-space phrase.
+
+    The length alone would make it oversize; the phrase is what keeps it
+    in the report once the lines it inherited stop counting toward size.
+    """
+    return "\n".join(
+        "/// " + " ".join(f"C{n}w{i}" for i in range(words_per_line))
+        for n in range(num_lines)
+    ) + "\n/// This block does not explain the query.\n"
+
+
 def _setup_comment_in_repo(repo: Path, comment: str, leading: str = "") -> None:
     """Commit `leading + comment` as `lib.rs`, the base the case's diff runs against."""
     (repo / "lib.rs").write_text(leading + comment)
@@ -432,10 +444,15 @@ def case_diff_added_line_inside_comment_is_reported(failures: list[str]) -> None
 
 
 def case_diff_deleted_line_inside_comment_is_reported(failures: list[str]) -> None:
-    """A line deleted inside a comment flags it."""
+    """A line deleted inside a comment keeps that comment in scope.
+
+    The block is still the diff's business, so it is reported — but the
+    lines the diff left behind are not its own, and they do not make it
+    oversize. The finding the block carries comes from its context.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         repo = init_repo(Path(tmp))
-        comment = _oversize_rust_block(num_lines=5)
+        comment = _long_rust_block_with_context(num_lines=5)
         _setup_comment_in_repo(repo, comment,
                                leading="fn first() {}\nfn second() {}\n")
         text = (repo / "lib.rs").read_text().splitlines(keepends=True)
@@ -448,9 +465,20 @@ def case_diff_deleted_line_inside_comment_is_reported(failures: list[str]) -> No
 
         proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
         blocks = blocks_for(proc)
-        if not any(b["path"] == "lib.rs" for b in blocks):
+        mine = [b for b in blocks if b["path"] == "lib.rs"]
+        if not mine:
             fail(failures, "diff-deleted-inside-comment: comment not reported",
                  f"blocks={blocks!r}")
+            return
+        if "oversize" in mine[0]["findings"]:
+            fail(failures,
+                 "diff-deleted-inside-comment: the inherited lines made the "
+                 "block oversize though the diff added none of them",
+                 f"findings={mine[0]['findings']!r}")
+        if "negative-space" not in mine[0]["findings"]:
+            fail(failures,
+                 "diff-deleted-inside-comment: the context finding is missing",
+                 f"findings={mine[0]['findings']!r}")
 
 
 def case_diff_deleted_code_line_above_unchanged_comment_not_reported(failures: list[str]) -> None:
@@ -479,10 +507,14 @@ def case_diff_deleted_code_line_above_unchanged_comment_not_reported(failures: l
 
 
 def case_diff_deleted_first_line_of_comment_is_reported(failures: list[str]) -> None:
-    """Deleting a comment's first line flags what remains of it."""
+    """Deleting a comment's first line flags what remains of it.
+
+    What remains is not the diff's own prose, so it is not oversize; the
+    block is reported for the finding its context carries.
+    """
     with tempfile.TemporaryDirectory() as tmp:
         repo = init_repo(Path(tmp))
-        comment = _distinct_oversize_rust_block()
+        comment = _long_rust_block_with_context()
         _setup_comment_in_repo(repo, comment)
         text = (repo / "lib.rs").read_text().splitlines(keepends=True)
         # Delete line 1 (the first /// line).
@@ -493,10 +525,21 @@ def case_diff_deleted_first_line_of_comment_is_reported(failures: list[str]) -> 
 
         proc = run_find_prose("lib.rs", "--diff", "HEAD~1..HEAD", cwd=repo)
         blocks = blocks_for(proc)
-        if not any(b["path"] == "lib.rs" for b in blocks):
+        mine = [b for b in blocks if b["path"] == "lib.rs"]
+        if not mine:
             fail(failures,
                  "diff-deleted-first-of-comment: comment not reported",
                  f"blocks={blocks!r}")
+            return
+        if "oversize" in mine[0]["findings"]:
+            fail(failures,
+                 "diff-deleted-first-of-comment: the inherited lines made the "
+                 "block oversize though the diff added none of them",
+                 f"findings={mine[0]['findings']!r}")
+        if "negative-space" not in mine[0]["findings"]:
+            fail(failures,
+                 "diff-deleted-first-of-comment: the context finding is missing",
+                 f"findings={mine[0]['findings']!r}")
 
 
 def case_diff_deleted_file_does_not_touch_previous_file(failures: list[str]) -> None:
@@ -942,6 +985,145 @@ def case_echo_row_with_extra_cells_is_still_an_echo(failures: list[str]) -> None
                  f"findings={tables[0]['findings']!r}")
 
 
+# A pre-existing comment block of exactly 60 words, and a paragraph of 15
+# words. The threshold is 40, so the block alone is oversize and the
+# paragraph alone is not: a PR that adds the paragraph to the block must be
+# judged on the paragraph.
+OLD_BLOCK_WORDS = 60
+ADDED_PARAGRAPH_WORDS = 15
+
+
+def _word_line(prefix: str, count: int, tag: str) -> str:
+    """One comment line of ``count`` words, prefixed with its marker."""
+    return prefix + " " + " ".join(f"{tag}w{i}" for i in range(count)) + "\n"
+
+
+def _old_block(prefix: str, tag: str = "old") -> str:
+    """A pre-existing comment block of exactly ``OLD_BLOCK_WORDS`` words."""
+    # Three lines of 20 words each: 60 words, spread over lines so the
+    # block's shape is a paragraph and not one long line.
+    return "".join(
+        _word_line(prefix, OLD_BLOCK_WORDS // 3, f"{tag}{n}")
+        for n in range(3)
+    )
+
+
+def _added_paragraph(prefix: str, tag: str = "new") -> str:
+    """A paragraph of exactly ``ADDED_PARAGRAPH_WORDS`` words."""
+    return "".join(
+        _word_line(prefix, ADDED_PARAGRAPH_WORDS // 3, f"{tag}{n}")
+        for n in range(3)
+    )
+
+
+def _added_comment_case(failures: list[str], *, label: str, path: str,
+                         prefix: str, suffix: str = "") -> None:
+    """A pre-existing block that grew by one paragraph is judged on the
+    paragraph: the added lines alone decide oversize.
+
+    ``prefix`` is the comment marker for the language under test: ``//``,
+    ``///`` or ``--``.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(_old_block(prefix) + suffix)
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", "set up comment block")
+
+        # The branch appends a paragraph to the block. The added lines
+        # continue the block, so the finder sees one block of 75 words.
+        target.write_text(_old_block(prefix) + _added_paragraph(prefix) + suffix)
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", "add a paragraph to the block")
+
+        proc = run_find_prose(path, "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, f"{label}: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        oversize = [
+            b for b in blocks
+            if "oversize" in b["findings"] and b["path"] == path
+        ]
+        if oversize:
+            fail(failures,
+                 f"{label}: the pre-existing block was flagged oversize "
+                 f"though the added paragraph alone is under the threshold",
+                 f"findings={[b['findings'] for b in oversize]}")
+
+
+def _new_comment_case(failures: list[str], *, label: str, path: str,
+                      prefix: str, suffix: str = "") -> None:
+    """A block that is all new is judged on all of it, and is oversize."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("fn anchor() {}\n")
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", "set up the file")
+
+        # The whole block arrives with the branch: every word of it is
+        # added, so it passes the threshold on its own.
+        target.write_text("fn anchor() {}\n" + _old_block(prefix) + suffix)
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", "add the whole block")
+
+        proc = run_find_prose(path, "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, f"{label}: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return
+        blocks = blocks_for(proc)
+        oversize = [
+            b for b in blocks
+            if "oversize" in b["findings"] and b["path"] == path
+        ]
+        if not oversize:
+            fail(failures,
+                 f"{label}: the all-new block was not flagged oversize",
+                 f"blocks={[(b['path'], b['findings']) for b in blocks]}")
+
+
+def case_diff_slash_added_paragraph_is_not_oversize(failures: list[str]) -> None:
+    """A `//` block that grew by a paragraph is judged on the paragraph."""
+    _added_comment_case(failures, label="diff-slash-added",
+                        path="lib.rs", prefix="//")
+
+
+def case_diff_slash_new_block_is_oversize(failures: list[str]) -> None:
+    """A `//` block that is all new is oversize."""
+    _new_comment_case(failures, label="diff-slash-new",
+                      path="lib.rs", prefix="//")
+
+
+def case_diff_doc_added_paragraph_is_not_oversize(failures: list[str]) -> None:
+    """A `///` doc block that grew by a paragraph is judged on the paragraph."""
+    _added_comment_case(failures, label="diff-doc-added",
+                        path="lib.rs", prefix="///")
+
+
+def case_diff_doc_new_block_is_oversize(failures: list[str]) -> None:
+    """A `///` doc block that is all new is oversize."""
+    _new_comment_case(failures, label="diff-doc-new",
+                      path="lib.rs", prefix="///")
+
+
+def case_diff_sql_added_paragraph_is_not_oversize(failures: list[str]) -> None:
+    """A `--` SQL block that grew by a paragraph is judged on the paragraph."""
+    _added_comment_case(failures, label="diff-sql-added",
+                        path="migrations/0001_users.sql", prefix="--")
+
+
+def case_diff_sql_new_block_is_oversize(failures: list[str]) -> None:
+    """A `--` SQL block that is all new is oversize."""
+    _new_comment_case(failures, label="diff-sql-new",
+                      path="migrations/0001_users.sql", prefix="--")
+
+
 def main() -> int:
     failures: list[str] = []
     case_rust_extension_in_prose_set(failures)
@@ -970,6 +1152,12 @@ def main() -> int:
     case_diff_reports_touched_row_that_echoes(failures)
     case_a_row_repeating_one_sentence_of_a_long_paragraph_is_echoes_prose(failures)
     case_echo_row_with_extra_cells_is_still_an_echo(failures)
+    case_diff_slash_added_paragraph_is_not_oversize(failures)
+    case_diff_slash_new_block_is_oversize(failures)
+    case_diff_doc_added_paragraph_is_not_oversize(failures)
+    case_diff_doc_new_block_is_oversize(failures)
+    case_diff_sql_added_paragraph_is_not_oversize(failures)
+    case_diff_sql_new_block_is_oversize(failures)
 
     if failures:
         print("FAIL", file=sys.stderr)
