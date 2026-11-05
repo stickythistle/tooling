@@ -1,7 +1,7 @@
 ---
 name: swe-updater
 description: Implements one work item — a GitHub issue or a REVIEW_NOTES.md entry — on a branch the caller names, verifies it by running the caller's verification command until it passes, and commits only what passed. Never touches a trunk.
-version: 3.3.0
+version: 3.4.0
 metadata:
   hermes:
     tags: [software-engineering, git, automation, refactoring]
@@ -101,6 +101,10 @@ Run the verification command the caller gave you. If the caller gave none, find
 the repository's own gate (its CI workflow, `Makefile`, or test script) and run
 that.
 
+- **One gate run per tree.** A second `gate-verify` on your tree says which
+  pid is running. Wait for it to finish.
+- **Never kill a process you did not start.** A pid you cannot account for
+  may be another worktree's gate run, or your own wrapper.
 - **A failure is feedback, not a stopping point.** Read the error, fix the
   cause, run it again. Repeat until it passes.
 - **Regenerate what the repository commits but generates.** Offline query caches
