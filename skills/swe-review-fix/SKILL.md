@@ -1,7 +1,7 @@
 ---
 name: swe-review-fix
 description: Answers one posted code review on a pull request branch — fixes each comment, adds the test, commits, writes a reply per comment. Never pushes, rewrites history, or answers on GitHub itself.
-version: 1.1.0
+version: 1.2.0
 ---
 
 # Review round (`swe-review-fix`)
@@ -52,6 +52,10 @@ it would widen the PR.
   commit message: "Round 2" is a refusal, "round-robin" passes.
 - Run the verification command the brief gives until it passes, as in
   `swe-updater`'s Phase 4.
+- **One gate run per tree.** A second `gate-verify` on your tree says which
+  pid is running. Wait for it.
+- **Never kill a process you did not start.** A pid you cannot account for
+  may be another worktree's gate run, or your own wrapper.
 - **Experiments happen in a scratch copy, never in the worktree you are
   changing.** A fake, a helper, a destructive git command — a
   `git commit --amend`, a `git reset --hard`, a `git clean` — runs in a
