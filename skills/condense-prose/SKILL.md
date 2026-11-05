@@ -58,6 +58,12 @@ Findings, most-mechanical first:
 
 A table is never oversize: its length comes from its row count, and a row is judged on its own.
 
+Under `--diff`, `oversize` is decided by the lines the diff added. A block that
+grew by one paragraph is judged on that paragraph; the lines it already had
+stay available to the other findings, but they do not count toward size. A
+block the diff only deleted from is not oversize either: the diff wrote none of
+it.
+
 A block in a `skills/*/SKILL.md` carries the context mark `skill-file`. It is
 not a finding: the block is still scanned, and a restatement in a skill file
 is still reported. The mark says how to read a finding there.
