@@ -7,6 +7,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -47,7 +48,40 @@ FAKE_AGENT = textwrap.dedent("""\
                    f"query_sha={query_sha}")
     with open(log, "a") as f:
         f.write(f"start {profile} {time.monotonic()} {query_attrs}\\n")
-    time.sleep(1.5)
+    # The agent holds its slot open until every expected reviewer has
+    # started, so "all three ran at once" is a fact in the log rather than
+    # a race against a fixed sleep. A reviewer that arrives alone --
+    # because the profile's slot cap serialised them -- waits out the
+    # ceiling and exits. The ceiling bounds the test; it does not decide
+    # the outcome.
+    #
+    # The minimum hold is a floor, not a deadline: the agent stays at
+    # least this long however many reviewers turn up.
+    expect = int(os.environ.get("FAKE_EXPECT_STARTS", "1"))
+    ceiling = float(os.environ.get("FAKE_WAIT_CEILING", "20"))
+    min_hold = float(os.environ.get("FAKE_MIN_HOLD", "0"))
+    started_at = time.monotonic()
+    deadline = started_at + ceiling
+
+    def started_count():
+        # Only whole lines count: a reader can catch a record mid-write,
+        # and a start it counted has to be one the log shows in full --
+        # its timestamp is what the overlap assertion reads.
+        try:
+            with open(log, "r") as f:
+                text = f.read()
+        except OSError:
+            return 0
+        return sum(1 for line in text.splitlines(keepends=True)
+                   if line.startswith("start ") and line.endswith("\\n"))
+
+    while True:
+        if (started_count() >= expect
+                and time.monotonic() - started_at >= min_hold):
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.02)
     if findings is not None:
         with open(findings, "w") as f:
             f.write("no findings\\n")
@@ -79,53 +113,49 @@ def make_repo(tmp: Path) -> Path:
     return repo
 
 
-def run_pair(profiles: tuple[str, str]) -> list[tuple[str, str, float]]:
+def fake_env(agent: Path, tmp: Path, *, expect_starts: int,
+             ceiling: float = 5.0, min_hold: float = 0.0) -> dict[str, str]:
+    """The fake agent's environment.
+
+    `expect_starts` is how many reviewers the fake waits for before it
+    releases its slot. The ceiling bounds that wait, so a case whose
+    expectation is unmet fails on the assertion, not on a hang.
+    """
+    return dict(os.environ,
+                HERMES_PYTHON=str(agent),
+                TMPDIR=str(tmp),
+                FAKE_EXPECT_STARTS=str(expect_starts),
+                FAKE_WAIT_CEILING=str(ceiling),
+                FAKE_MIN_HOLD=str(min_hold))
+
+
+def read_events(tmp: Path) -> list[tuple[str, str, float]]:
+    """The fake agent's log, as (kind, profile, timestamp) triples.
+
+    A log line is `<kind> <profile> <ts>` plus optional `key=value`
+    attributes with no spaces inside. A 3-token cap keeps the trailing
+    attributes grouped; the test needs the kind and the timestamp.
+    """
+    events = []
+    for line in (tmp / "agent.log").read_text().splitlines():
+        parts = line.split(None, 3)
+        events.append((parts[0], parts[1], float(parts[2])))
+    return events
+
+
+def run_pair(profiles: tuple[str, str], *,
+             expect_starts: int = 2,
+             ceiling: float = 5.0,
+             min_hold: float = 0.0,
+             ) -> list[tuple[str, str, float]]:
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         repo = make_repo(tmp)
         agent = tmp / "agent"
         agent.write_text(FAKE_AGENT)
         agent.chmod(0o755)
-        env = dict(os.environ, HERMES_PYTHON=str(agent), TMPDIR=str(tmp))
-        procs = [subprocess.Popen([str(SCRIPT), "--profile", p], cwd=repo,
-                                  env=env, stdout=subprocess.PIPE,
-                                  stderr=subprocess.PIPE, text=True)
-                 for p in profiles]
-        for p in procs:
-            out, err = p.communicate(timeout=30)
-            assert p.returncode == 0, f"exit {p.returncode}: {err}"
-            assert Path(out.strip()).name == "FINDINGS.md", out
-        # Read the log only after every review has exited: leaving the
-        # TemporaryDirectory deletes it, and a reviewer still waiting for
-        # the slot dies with it.
-
-        # A log line is `<kind> <profile> <ts>` plus optional `key=value`
-        # attributes with no spaces inside. A 3-token cap keeps the
-        # trailing attributes grouped; the test needs the kind and the
-        # timestamp.
-        def parse_line(line):
-            parts = line.split(None, 3)
-            return parts[0], parts[1], float(parts[2])
-        events = []
-        for line in (tmp / "agent.log").read_text().splitlines():
-            kind, profile, ts = parse_line(line)
-            events.append((kind, profile, ts))
-        return events
-
-
-def run_n(profiles: tuple[str, ...],
-          slots_env: dict[str, str] | None = None
-          ) -> list[tuple[str, str, float]]:
-    """Run N reviews in parallel with optional REVIEW_SLOTS_<PROFILE> entries."""
-    with tempfile.TemporaryDirectory() as t:
-        tmp = Path(t)
-        repo = make_repo(tmp)
-        agent = tmp / "agent"
-        agent.write_text(FAKE_AGENT)
-        agent.chmod(0o755)
-        env = dict(os.environ, HERMES_PYTHON=str(agent), TMPDIR=str(tmp))
-        if slots_env:
-            env.update(slots_env)
+        env = fake_env(agent, tmp, expect_starts=expect_starts,
+                       ceiling=ceiling, min_hold=min_hold)
         procs = [subprocess.Popen([str(SCRIPT), "--profile", p], cwd=repo,
                                   env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True)
@@ -134,15 +164,49 @@ def run_n(profiles: tuple[str, ...],
             out, err = p.communicate(timeout=60)
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
-        events = []
-        # `<kind> <profile> <ts>` plus optional key=value attributes. Cap
-        # the split so trailing attributes stay grouped in a single
-        # trailing slot; only the first three fields matter.
-        for line in (tmp / "agent.log").read_text().splitlines():
-            parts = line.split(None, 3)
-            kind, profile, ts = parts[0], parts[1], float(parts[2])
-            events.append((kind, profile, ts))
-        return events
+        # Read the log only after every review has exited: leaving the
+        # TemporaryDirectory deletes it, and a reviewer still waiting for
+        # the slot dies with it.
+        return read_events(tmp)
+
+
+def run_n(profiles: tuple[str, ...],
+          slots_env: dict[str, str] | None = None,
+          *,
+          expect_starts: int | None = None,
+          ceiling: float = 5.0,
+          min_hold: float = 0.0,
+          stagger: float = 0.0,
+          ) -> list[tuple[str, str, float]]:
+    """Run N reviews in parallel with optional REVIEW_SLOTS_<PROFILE> entries.
+
+    `stagger` is the delay between starting each reviewer.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = make_repo(tmp)
+        agent = tmp / "agent"
+        agent.write_text(FAKE_AGENT)
+        agent.chmod(0o755)
+        if expect_starts is None:
+            expect_starts = len(profiles)
+        env = fake_env(agent, tmp, expect_starts=expect_starts,
+                       ceiling=ceiling, min_hold=min_hold)
+        if slots_env:
+            env.update(slots_env)
+        procs = []
+        for i, p in enumerate(profiles):
+            if i and stagger:
+                time.sleep(stagger)
+            procs.append(subprocess.Popen([str(SCRIPT), "--profile", p],
+                                          cwd=repo, env=env,
+                                          stdout=subprocess.PIPE,
+                                          stderr=subprocess.PIPE, text=True))
+        for p in procs:
+            out, err = p.communicate(timeout=120)
+            assert p.returncode == 0, f"exit {p.returncode}: {err}"
+            assert Path(out.strip()).name == "FINDINGS.md", out
+        return read_events(tmp)
 
 
 def overlapped(events) -> bool:
@@ -172,29 +236,45 @@ def all_overlap(events) -> bool:
 
 
 def test_same_profile_runs_one_at_a_time():
-    events = run_pair(("rev", "rev"))
+    # One reviewer at a time: each holds its slot for a second before it
+    # releases it, so the second can only start after the first ended.
+    events = run_pair(("rev", "rev"), expect_starts=1, min_hold=1.0)
     assert not overlapped(events), \
         f"expected no overlap on a 1-slot profile, got {events}"
 
 
 def test_different_profiles_run_together():
+    # Different profiles have separate slot pools, so the two reviewers
+    # reach the agent at the same time. Each fake waits for the other to
+    # start, so the overlap is a fact in the log and not a race.
     assert overlapped(run_pair(("rev-a", "rev-b")))
 
 
 def test_three_slot_profile_runs_three_together():
-    # All three reviews hit slot acquisition in parallel and take slots 1, 2,
-    # 3 from the per-profile lock pool. The assertion is "all starts before
-    # any end" rather than "any two overlap": the latter passes with two slots
-    # too, which would mistake a 2-slot profile for a 3-slot one.
-    assert all_overlap(run_n(("rev", "rev", "rev"),
-                             {"REVIEW_SLOTS_REV": "3"}))
+    # "All starts before any end", not "any two overlap": the latter
+    # passes with two slots too. The reviewers start three seconds apart,
+    # and each fake holds its slot until every reviewer has started, so
+    # they overlap: they ran at once.
+    events = run_n(("rev", "rev", "rev"), {"REVIEW_SLOTS_REV": "3"},
+                   expect_starts=3, ceiling=20.0, stagger=3.0)
+    assert all_overlap(events), \
+        f"expected all three reviews to overlap on a 3-slot profile, got {events}"
+
+
+def test_one_slot_profile_does_not_overlap_three():
+    # The same three reviewers on a profile whose slot cap is 1. The cap
+    # serialises them, so the first reviewer waits alone until the
+    # ceiling runs out and the three never run at once.
+    events = run_n(("rev", "rev", "rev"), expect_starts=3, ceiling=2.0)
+    assert not all_overlap(events), \
+        f"expected no three-way overlap on a 1-slot profile, got {events}"
 
 
 def test_one_slot_profile_serializes_two():
     # No REVIEW_SLOTS_REV set, so the slot count falls back to 1; the second
     # review waits the 2-second poll for slot 1 to free, which costs the test
     # that gap but proves the second did not start until the first ended.
-    events = run_n(("rev", "rev"))
+    events = run_n(("rev", "rev"), expect_starts=1, min_hold=1.0)
     assert not any_overlap(events), \
         f"expected no overlap on a 1-slot profile, got {events}"
 
@@ -217,7 +297,8 @@ def test_waiting_message_prints_once():
         # callers with different TMPDIRs contend on the same slot. Pin that
         # here too -- this test fails if the lock file's location changes.
         state_dir = tmp / "state"
-        env = dict(os.environ, HERMES_PYTHON=str(agent), AGENT_STATE_DIR=str(state_dir))
+        env = fake_env(agent, tmp, expect_starts=1, ceiling=5.0)
+        env["AGENT_STATE_DIR"] = str(state_dir)
         slot = state_dir / "hermes-review-rev-1.lock"
         slot.parent.mkdir(parents=True, exist_ok=True)
         slot.touch()
@@ -256,9 +337,9 @@ def test_lock_path_no_longer_depends_on_tmpdir():
         state_dir.mkdir()
         # Caller A: its own TMPDIR (could be a lane), the new shared state
         # directory, and a holder process keeping slot 1 taken.
-        env_a = dict(os.environ, HERMES_PYTHON=str(agent),
-                     AGENT_STATE_DIR=str(state_dir),
-                     TMPDIR=str(tmp / "tmpdir-a"))
+        env_a = fake_env(agent, tmp, expect_starts=1, ceiling=5.0)
+        env_a["AGENT_STATE_DIR"] = str(state_dir)
+        env_a["TMPDIR"] = str(tmp / "tmpdir-a")
         (tmp / "tmpdir-a").mkdir()
         slot = state_dir / "hermes-review-rev-1.lock"
         slot.touch()
@@ -268,9 +349,9 @@ def test_lock_path_no_longer_depends_on_tmpdir():
         try:
             # Caller B uses a *different* TMPDIR; without the AGENT_STATE_DIR
             # move it would have its own lock file and not contend.
-            env_b = dict(os.environ, HERMES_PYTHON=str(agent),
-                         AGENT_STATE_DIR=str(state_dir),
-                         TMPDIR=str(tmp / "tmpdir-b"))
+            env_b = fake_env(agent, tmp, expect_starts=1, ceiling=5.0)
+            env_b["AGENT_STATE_DIR"] = str(state_dir)
+            env_b["TMPDIR"] = str(tmp / "tmpdir-b")
             (tmp / "tmpdir-b").mkdir()
             # Long timeout so the holder would still be alive when B's
             # reviewer tries to run; if B finds the slot it has been a
@@ -298,7 +379,8 @@ def test_lock_path_no_longer_depends_on_tmpdir():
 
 
 def run_one(*, slots: str | None = None, timeout: str | None = None,
-            timeout_env: dict[str, str] | None = None) -> int:
+            timeout_env: dict[str, str] | None = None,
+            min_hold: float = 0.0) -> int:
     """Run one review with the given slot/timeout setup; return its exit code."""
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
@@ -306,7 +388,7 @@ def run_one(*, slots: str | None = None, timeout: str | None = None,
         agent = tmp / "agent"
         agent.write_text(FAKE_AGENT)
         agent.chmod(0o755)
-        env = dict(os.environ, HERMES_PYTHON=str(agent), TMPDIR=str(tmp))
+        env = fake_env(agent, tmp, expect_starts=1, min_hold=min_hold)
         if timeout_env:
             env.update(timeout_env)
         args = [str(SCRIPT), "--profile", "rev"]
@@ -321,16 +403,18 @@ def run_one(*, slots: str | None = None, timeout: str | None = None,
 def test_timeout_precedence_per_profile_overrides_default():
     # REVIEW_TIMEOUT_REV=1 with no --timeout: the per-profile value wins over
     # HERMES_REVIEW_TIMEOUT (which would otherwise be 900), and the agent's
-    # 1.5s sleep exceeds 1s. `timeout(1)` returns 124.
-    rc = run_one(timeout_env={"REVIEW_TIMEOUT_REV": "1"})
+    # 2-second minimum hold exceeds it. `timeout(1)` returns 124.
+    rc = run_one(timeout_env={"REVIEW_TIMEOUT_REV": "1"}, min_hold=2)
     assert rc == 124, f"expected 124 from REVIEW_TIMEOUT_REV=1, got {rc}"
 
 
 def test_timeout_precedence_explicit_overrides_per_profile():
     # Same REVIEW_TIMEOUT_REV=1, but --timeout 10 is given: the explicit
-    # value outranks the per-profile value, the agent's 1.5s sleep fits, and
-    # the script returns 0. Without the precedence this would also exit 124.
-    rc = run_one(timeout_env={"REVIEW_TIMEOUT_REV": "1"}, timeout="10")
+    # value outranks the per-profile value, the agent's 2-second minimum
+    # hold fits, and the script returns 0. Without the precedence this
+    # would also exit 124.
+    rc = run_one(timeout_env={"REVIEW_TIMEOUT_REV": "1"}, timeout="10",
+                 min_hold=2)
     assert rc == 0, f"expected 0 from --timeout 10 overriding REVIEW_TIMEOUT_REV=1, got {rc}"
 
 
@@ -348,15 +432,13 @@ def test_two_scrutinize_calls_on_same_gpu_group_serialize():
         agent.write_text(FAKE_AGENT)
         agent.chmod(0o755)
         state_dir = tmp / "state"
-        # Two profiles -- rev-a and rev-b -- both mapped to the same GPU
-        # group. The review-slot lock has them in separate pools, so they
-        # would otherwise run together.
-        env = dict(os.environ,
-                   HERMES_PYTHON=str(agent),
-                   AGENT_STATE_DIR=str(state_dir),
-                   GPU_GROUP_REV_A="logan-3099",
-                   GPU_GROUP_REV_B="logan-3099",
-                   TMPDIR=str(tmp))
+        # Two profiles on one GPU group. The review-slot lock has them in
+        # separate pools, so only the GPU lock holds them apart. Each
+        # waits for one start, then holds its slot a second.
+        env = fake_env(agent, tmp, expect_starts=1, min_hold=1.0)
+        env["AGENT_STATE_DIR"] = str(state_dir)
+        env["GPU_GROUP_REV_A"] = "logan-3099"
+        env["GPU_GROUP_REV_B"] = "logan-3099"
         profiles = ("rev-a", "rev-b")
         procs = [subprocess.Popen([str(SCRIPT), "--profile", p],
                                   cwd=repo, env=env,
@@ -367,17 +449,11 @@ def test_two_scrutinize_calls_on_same_gpu_group_serialize():
             out, err = p.communicate(timeout=60)
             assert p.returncode == 0, f"exit {p.returncode}: {err}"
             assert Path(out.strip()).name == "FINDINGS.md", out
-        events = []
-        # See run_pair for the log format.
-        for line in (tmp / "agent.log").read_text().splitlines():
-            parts = line.split(None, 3)
-            kind, profile, ts = parts[0], parts[1], float(parts[2])
-            events.append((kind, profile, ts))
+        events = read_events(tmp)
         # Two reviewers on one GPU group must not overlap: the second
         # `start` lands after the first `end`. The lock wait happens
-        # *outside* the agent's sleep, so the second's `start` is at least
-        # 2 seconds after the first's `end` -- the polling interval
-        # acquire_gpu_lock waits before retrying.
+        # *outside* the agent's hold, so the second's `start` follows
+        # the first's `end` by the GPU lock's poll interval.
         sorted_e = sorted(events, key=lambda e: e[2])
         first_end = next((ts for k, _, ts in sorted_e if k == "end"), None)
         starts_before = sum(1 for k, _, ts in sorted_e
