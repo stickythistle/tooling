@@ -190,14 +190,17 @@ fi
 # Exclude the fingerprint sentinel the same way target/ is excluded: the
 # file lives on the remote as a side-effect of this tool's own bookkeeping
 # and is not part of the source tree.
-rsync -a --delete --exclude 'target/' --exclude '.git/' --exclude 'node_modules/' \
-	--exclude '.migrations-fingerprint' \
+#
+# No `-t`, so a transferred source is newer than the warm target/ and
+# cargo rebuilds it. `--checksum`, so unchanged files are not sent and
+# keep their mtimes.
+rsync -rlpgoD --checksum --delete --exclude 'target/' --exclude '.git/' \
+	--exclude 'node_modules/' --exclude '.migrations-fingerprint' \
 	"$SRC/" "$REMOTE:$DEST/"
 
-# After the sync, not before it. `rsync -a` preserves the source's mtimes, so a
-# touch applied to the remote copy beforehand is reverted by the very transfer
-# it was meant to survive -- the file lands with its original timestamp, older
-# than the artifacts in the warm target/, and cargo rebuilds nothing.
+# After the sync, not before it. The sync no longer preserves the
+# source's mtimes, so a touch applied to the remote copy beforehand is
+# reverted by the very transfer it was meant to survive.
 if [ "$MIGRATOR_STALE" = 1 ]; then
 	touch_args=""
 	sep=""
