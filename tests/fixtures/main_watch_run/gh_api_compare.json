@@ -1,0 +1,27 @@
+{
+  "_source": "gh api 'repos/stickythistle/tooling/compare/88a04248e0d05c47936e8eeac63ae73a002f44cd...main'",
+  "status": "ahead",
+  "ahead_by": 6,
+  "behind_by": 0,
+  "total_commits": 6,
+  "commits": [
+    {
+      "sha": "74d626a598c505f8044a92064da89beb417012b6"
+    },
+    {
+      "sha": "bf4c4046fb627a43dbe9c874827fc7c71df04a24"
+    },
+    {
+      "sha": "86e9f98b98edb4f625748c649cfeb70361223ea8"
+    },
+    {
+      "sha": "a2c51ca3cc001b198894ef71c4d3870b6230f8c6"
+    },
+    {
+      "sha": "7eacdeda1302f25f6c39a9257ecc443dc5490702"
+    },
+    {
+      "sha": "946d86fa0cf91114bf1e036fc64d2096b37d5884"
+    }
+  ]
+}

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Judge every `main` commit since the last one judged, and report the breaks.
+
+    main-watch-run <owner/repo>...
+
+Run from a timer. For each repository it walks the commits on `main`
+since the commit it last judged, asks `main-watch` about each one, and
+sends a Telegram message when a commit broke `main`.
+
+The position is kept per repository, under `$XDG_STATE_HOME`, so a
+second run over the same commits judges nothing and says nothing.
+
+The bot token and the chat id come from the env file `MAIN_WATCH_ENV`
+names. The token is in the Telegram URL, so every message that leaves
+here is scrubbed of it first.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def find_main_watch() -> str:
+    """The `main-watch` to judge with.
+
+    The checkout's own copy wins: a stale `main-watch` earlier on the
+    timer's PATH would judge with rules this checkout does not have.
+    `MAIN_WATCH_BIN` names another copy when the operator wants one.
+    """
+    named = os.environ.get("MAIN_WATCH_BIN", "").strip()
+    if named:
+        return named
+    return str(REPO_ROOT / "bin" / "main-watch")
+
+# Where Telegram lives, unless the tests point somewhere else.
+TELEGRAM_API_DEFAULT = "https://api.telegram.org"
+
+# The verdicts `main-watch --json` reports. The ones this tool acts on
+# are `broke` and `already_red`; the rest move the position or hold it.
+KIND_BROKE = "broke"
+KIND_ALREADY_RED = "already_red"
+KIND_PENDING = "pending"
+
+# An `owner/repo` pair.
+REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
+
+# How long to wait for Telegram. A timer that hangs is a timer that
+# never runs again.
+TELEGRAM_TIMEOUT_S = 30
+
+
+class ConfigError(Exception):
+    """The env file is missing something the run needs."""
+
+
+class RunError(Exception):
+    """A step of the run failed. The position does not move."""
+
+
+def read_env(path: Path) -> dict:
+    """Parse an env file: last assignment wins, comments are absent.
+
+    The same shape `bin/hermes-doctor` reads a hermes `.env` with, so
+    an operator writes one file in one way.
+    """
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw in path.read_text(errors="replace").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if match:
+            values[match.group(1)] = match.group(2).strip().strip("'\"")
+    return values
+
+
+def load_config() -> tuple[str, str]:
+    """The bot token and the chat id, or a refusal naming what is missing.
+
+    The token is never part of the refusal: a refusal is printed, and a
+    printed token is a leaked token.
+    """
+    named = os.environ.get("MAIN_WATCH_ENV", "").strip()
+    if not named:
+        raise ConfigError("MAIN_WATCH_ENV is not set")
+    path = Path(named).expanduser()
+    if not path.is_file():
+        raise ConfigError(f"the env file {named} does not exist")
+    values = read_env(path)
+    token = values.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat = values.get("TELEGRAM_CHAT_ID", "").strip()
+    missing = []
+    if not token:
+        missing.append("TELEGRAM_BOT_TOKEN")
+    if not chat:
+        missing.append("TELEGRAM_CHAT_ID")
+    if missing:
+        raise ConfigError(f"{named} is missing {', '.join(missing)}")
+    return token, chat
+
+
+def state_dir() -> Path:
+    """Where the per-repository positions live."""
+    base = os.environ.get("XDG_STATE_HOME", "").strip()
+    if not base:
+        base = str(Path.home() / ".local" / "state")
+    return Path(base).expanduser() / "main-watch"
+
+
+def state_path(repo: str) -> Path:
+    """The file holding one repository's last judged commit."""
+    owner, name = repo.split("/", 1)
+    return state_dir() / f"{owner}__{name}"
+
+
+def read_state(repo: str) -> str:
+    """The last judged commit for a repository, or empty when there is none."""
+    path = state_path(repo)
+    if not path.is_file():
+        return ""
+    return path.read_text(errors="replace").strip()
+
+
+def write_state(repo: str, sha: str) -> None:
+    """Record the last judged commit."""
+    path = state_path(repo)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(sha + "\n")
+
+
+def redact(text: str, token: str) -> str:
+    """Take the bot token out of a message before it is printed.
+
+    The token is in the Telegram URL. Text the tool did not write
+    itself may carry that URL, so the token is taken out of every
+    message that leaves here.
+    """
+    return text.replace(token, "[redacted]")
+
+
+def gh(endpoint: str, *args: str) -> str:
+    """Run one `gh api` call and return its stdout."""
+    cmd = ["gh", "api", endpoint, *args]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+    except OSError as exc:
+        raise RunError(f"{endpoint}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"gh exited {proc.returncode}"
+        raise RunError(f"{endpoint}: {reason}")
+    return proc.stdout
+
+
+def gh_json(endpoint: str, *args: str):
+    """Run one `gh api` call and parse its stdout as JSON."""
+    out = gh(endpoint, *args)
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RunError(f"{endpoint}: response was not JSON: {exc}") from exc
+
+
+def fetch_head(repo: str) -> str:
+    """The commit at the head of `main`.
+
+    The endpoint answers with one commit object, not a list.
+    """
+    endpoint = f"repos/{repo}/commits/main"
+    payload = gh_json(endpoint)
+    if not isinstance(payload, dict):
+        raise RunError(f"{endpoint}: the head is not a commit")
+    sha = payload.get("sha")
+    if not isinstance(sha, str) or not sha:
+        raise RunError(f"{endpoint}: the head has no sha")
+    return sha
+
+
+def compare_main(repo: str, stored: str) -> tuple[str, list[str], int]:
+    """What the compare endpoint says about the stored commit.
+
+    The endpoint answers `ahead` with the commits between the stored
+    commit and the head of `main`, oldest first, and `identical` when
+    nothing is new. `diverged` means the branch was rewritten.
+
+    The third value is the number of commits the endpoint counted. It
+    is more than the list when the endpoint capped the list, and a
+    capped list would judge part of the gap.
+    """
+    endpoint = f"repos/{repo}/compare/{stored}...main"
+    payload = gh_json(endpoint)
+    if not isinstance(payload, dict):
+        raise RunError(f"{endpoint}: response was not an object")
+    status = payload.get("status")
+    if status not in ("ahead", "identical", "diverged"):
+        raise RunError(f"{endpoint}: unknown compare status {status!r}")
+    entries = payload.get("commits")
+    if not isinstance(entries, list):
+        raise RunError(f"{endpoint}: no commits in the response")
+    shas = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            sha = entry.get("sha")
+            if isinstance(sha, str) and sha:
+                shas.append(sha)
+    total = payload.get("total_commits")
+    if not isinstance(total, int):
+        total = len(shas)
+    return status, shas, total
+
+
+def is_not_found(exc: RunError) -> bool:
+    """Whether the failure was the endpoint saying it does not know it.
+
+    `gh` reports a 404 as `Not Found (HTTP 404)`. Any other failure is
+    a failure and not an answer: a rate limit, an auth failure or a
+    network blip must not be read as "the commit is unknown".
+    """
+    return "HTTP 404" in str(exc)
+
+
+def fetch_pulls(repo: str, sha: str) -> list[dict]:
+    """The pull requests a commit came from."""
+    payload = gh_json(f"repos/{repo}/commits/{sha}/pulls")
+    if not isinstance(payload, list):
+        raise RunError(f"repos/{repo}/commits/{sha}/pulls: not a list")
+    return [p for p in payload if isinstance(p, dict)]
+
+
+def judge(repo: str, sha: str) -> dict:
+    """The verdict on one commit, from `main-watch --json`."""
+    try:
+        proc = subprocess.run(
+            [find_main_watch(), repo, sha, "--json"],
+            capture_output=True, text=True,
+        )
+    except OSError as exc:
+        raise RunError(f"main-watch {repo} {sha}: {exc}") from exc
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip().splitlines()
+        reason = detail[0] if detail else f"main-watch exited {proc.returncode}"
+        raise RunError(f"main-watch {repo} {sha}: {reason}")
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RunError(
+            f"main-watch {repo} {sha}: response was not JSON: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise RunError(f"main-watch {repo} {sha}: not a verdict")
+    kind = payload.get("kind")
+    if not isinstance(kind, str) or not kind:
+        raise RunError(f"main-watch {repo} {sha}: no verdict kind")
+    return payload
+
+
+def telegram_api() -> str:
+    """The Telegram base URL.
+
+    `MAIN_WATCH_TELEGRAM_API` overrides it so the tests can point at a
+    local stub.
+    """
+    base = os.environ.get("MAIN_WATCH_TELEGRAM_API", "").strip()
+    if not base:
+        base = TELEGRAM_API_DEFAULT
+    return base.rstrip("/")
+
+
+def send_message(token: str, chat: str, text: str) -> None:
+    """Send one Telegram message.
+
+    The token is in the URL, so any error the request raises is
+    scrubbed of it before it is reported.
+    """
+    url = f"{telegram_api()}/bot{token}/sendMessage"
+    body = urllib.parse.urlencode({"chat_id": chat, "text": text}).encode()
+    request = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=TELEGRAM_TIMEOUT_S) as resp:
+            payload = resp.read()
+    except urllib.error.HTTPError as exc:
+        detail = f"HTTP {exc.code}"
+        raise RunError(
+            f"telegram: {detail}: {redact(str(exc), token)}") from exc
+    except (OSError, urllib.error.URLError) as exc:
+        raise RunError(f"telegram: {redact(str(exc), token)}") from exc
+    try:
+        parsed = json.loads(payload)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RunError(f"telegram: response was not JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not parsed.get("ok"):
+        raise RunError(f"telegram: sendMessage did not succeed: {parsed!r}")
+
+
+def short(sha: str) -> str:
+    """The short form of a commit sha, for the message."""
+    return sha[:7]
+
+
+def describe_pulls(pulls: list[dict]) -> str:
+    """The pull requests a commit came from, in one line."""
+    if not pulls:
+        return "no PR"
+    parts = []
+    for pull in pulls:
+        number = pull.get("number")
+        title = pull.get("title")
+        if isinstance(number, int):
+            parts.append(f"#{number} {title}".strip()
+                         if isinstance(title, str) else f"#{number}")
+        elif isinstance(title, str):
+            parts.append(title)
+    return ", ".join(parts) if parts else "no PR"
+
+
+def describe_checks(failing: list) -> str:
+    """The names of the failing checks, in one line."""
+    names = []
+    for check in failing:
+        if isinstance(check, dict):
+            name = check.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return ", ".join(names) if names else "unknown check"
+
+
+def message_for(repo: str, sha: str, kind: str, payload: dict) -> str:
+    """The message a `broke` or a started red run sends."""
+    pulls = fetch_pulls(repo, sha)
+    failing = payload.get("failing")
+    if not isinstance(failing, list):
+        failing = []
+    checks = describe_checks(failing)
+    if kind == KIND_BROKE:
+        return (f"{repo} @{short(sha)} broke main\n"
+                f"PR: {describe_pulls(pulls)}\n"
+                f"Failing checks: {checks}")
+    return (f"{repo} @{short(sha)} is red on main\n"
+            f"PR: {describe_pulls(pulls)}\n"
+            f"Failing checks: {checks}")
+
+
+def reset_message(repo: str, stored: str) -> str:
+    """The message a rewritten branch sends.
+
+    The position named a commit that is not on `main` any more, so the
+    commits it stood for are gone and the watch starts again at the
+    head. The operator hears that once, so a rewrite is not a silence.
+    """
+    return (f"{repo} was rewritten under {short(stored)}\n"
+            "The position was reset to the head of main.")
+
+
+def commits_to_judge(repo: str, stored: str) -> tuple[list[str], bool]:
+    """The commits this run is to judge, oldest first, and whether the
+    position was reset.
+
+    With no stored commit there is nothing to stop at, so only the head
+    is judged: the position starts where the run starts, not at the
+    beginning of history.
+
+    With a stored commit the compare endpoint answers with the commits
+    between it and the head, oldest first, which is the list to judge.
+    A commit the endpoint does not know, or a branch that has moved
+    apart from it, is a rewrite: only the head is judged. Any other
+    failure holds the position, so a rate limit or a network blip does
+    not read as a rewrite.
+    """
+    if not stored:
+        return [fetch_head(repo)], False
+    try:
+        status, shas, total = compare_main(repo, stored)
+    except RunError as exc:
+        if not is_not_found(exc):
+            raise
+        # The endpoint does not know the stored commit: the branch was
+        # rewritten under it.
+        return [fetch_head(repo)], True
+    if status == "diverged":
+        return [fetch_head(repo)], True
+    if total > len(shas):
+        raise RunError(
+            f"repos/{repo}/compare/{stored}...main: "
+            f"{total} commits between the position and the head, "
+            f"but only {len(shas)} were returned")
+    return shas, False
+
+
+def run_repo(repo: str, token: str, chat: str) -> int:
+    """Judge one repository's new commits. Returns the exit code."""
+    stored = read_state(repo)
+    todo, reset = commits_to_judge(repo, stored)
+    if reset:
+        # The branch was rewritten under the position, so the commits
+        # the position named are gone. The operator hears that once,
+        # and the head is judged alone.
+        send_message(token, chat, reset_message(repo, stored))
+    if not todo:
+        # The head is the commit already judged: nothing new.
+        return 0
+
+    # The position moves only after a message is sent, so a failed send
+    # leaves the commit to be judged again.
+    reported_red = False
+    for sha in todo:
+        payload = judge(repo, sha)
+        kind = payload.get("kind")
+        if kind == KIND_PENDING:
+            # The commit's checks have not finished. Judging the commit
+            # after it would judge a branch state that is still moving,
+            # and a red that arrives later would never be reported.
+            return 0
+        if kind == KIND_BROKE:
+            send_message(token, chat, message_for(repo, sha, kind, payload))
+            write_state(repo, sha)
+            reported_red = True
+            continue
+        if kind == KIND_ALREADY_RED:
+            if not reported_red:
+                # The red run starts here. One message for the run, not
+                # one per commit.
+                send_message(token, chat, message_for(repo, sha, kind, payload))
+                reported_red = True
+            write_state(repo, sha)
+            continue
+        # `green`, and the verdicts that say nothing about a break.
+        write_state(repo, sha)
+        reported_red = False
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="main-watch-run",
+        description="Judge every main commit since the last one judged, "
+                    "and report the breaks.",
+    )
+    parser.add_argument("repos", nargs="+", metavar="owner/repo",
+                        help="the repositories to watch")
+    args = parser.parse_args(argv)
+
+    for repo in args.repos:
+        if not REPO_RE.match(repo):
+            print(f"ERR repo: {repo} is not owner/repo", file=sys.stderr)
+            return 2
+
+    try:
+        token, chat = load_config()
+    except ConfigError as exc:
+        print(f"ERR config: {exc}", file=sys.stderr)
+        return 2
+
+    # Every repository is judged, even when one of them fails: a
+    # repository with an auth problem must not starve the ones after
+    # it. The failures are named, and the exit code says there were
+    # some.
+    failures = []
+    for repo in args.repos:
+        try:
+            run_repo(repo, token, chat)
+        except RunError as exc:
+            failures.append(repo)
+            print(f"ERR {repo}: {redact(str(exc), token)}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

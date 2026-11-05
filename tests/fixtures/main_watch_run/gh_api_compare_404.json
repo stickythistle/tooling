@@ -1,0 +1,6 @@
+{
+  "_source": "gh api 'repos/stickythistle/tooling/compare/0000000000000000000000000000000000000000...main'",
+  "message": "Not Found",
+  "documentation_url": "https://docs.github.com/rest/commits/commits#compare-two-commits",
+  "status": "404"
+}
