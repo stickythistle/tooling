@@ -1,0 +1,724 @@
+#!/usr/bin/env python3
+"""Meter the provider tokens a harness spends, through one local port.
+
+    bakeoff-proxy --port P --harness NAME --model M --upstream URL --record FILE
+
+A pass-through between one harness and the provider, answering with the
+provider's own `usage`.
+"""
+from __future__ import annotations
+
+import argparse
+import http.client
+import json
+import os
+import re
+import ssl
+import sys
+import threading
+import time
+from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlsplit
+
+# The endpoint styles a harness may speak, told apart by path.
+OPENAI_PATH = "/v1/chat/completions"
+RESPONSES_PATH = "/v1/responses"
+ANTHROPIC_PATH = "/v1/messages"
+
+# The name of the variable the provider key is read from, unless the
+# operator names another one with `--key-var`.
+DEFAULT_KEY_VAR = "MINIMAX_API_KEY"
+
+# How long to wait for the provider. A proxy that hangs is a proxy the
+# harness cannot finish against.
+UPSTREAM_TIMEOUT_S = 300
+
+# How much of a stream to read at a time. The read returns whatever has
+# arrived, so this is a ceiling on one read, not a minimum on the
+# stream.
+STREAM_READ_SIZE = 65536
+
+# The header each style expects the key in. The harness's own key, if it
+# sends one, is ignored: the provider sees the one key from the env file
+# and nothing else.
+AUTH_HEADERS = {
+    "openai": ("Authorization", "Bearer {key}"),
+    "responses": ("Authorization", "Bearer {key}"),
+    "anthropic": ("x-api-key", "{key}"),
+}
+
+
+class ConfigError(Exception):
+    """The env file is missing something the run needs."""
+
+
+class UpstreamError(Exception):
+    """The provider could not be reached, or answered in a way we cannot use."""
+
+
+def read_env(path: Path) -> dict:
+    """Parse an env file: last assignment wins, comments are absent.
+
+    The same shape `bin/main-watch-run` reads its own env file with, so an
+    operator writes one file in one way.
+    """
+    values: dict[str, str] = {}
+    if not path.is_file():
+        return values
+    for raw in path.read_text(errors="replace").split("\n"):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = re.match(r"^(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$", line)
+        if match:
+            values[match.group(1)] = match.group(2).strip().strip("'\"")
+    return values
+
+
+def load_key(key_var: str) -> str:
+    """The provider key, or a refusal naming what is missing.
+
+    The key is never part of the refusal: a refusal is printed, and a
+    printed key is a leaked key.
+    """
+    named = os.environ.get("BAKEOFF_PROVIDER_ENV", "").strip()
+    if not named:
+        raise ConfigError("BAKEOFF_PROVIDER_ENV is not set")
+    path = Path(named).expanduser()
+    if not path.is_file():
+        raise ConfigError(f"the env file {named} does not exist")
+    values = read_env(path)
+    key = values.get(key_var, "").strip()
+    if not key:
+        raise ConfigError(f"{named} is missing {key_var}")
+    return key
+
+
+def style_for(path: str) -> str | None:
+    """The endpoint style a path speaks, or None when it speaks neither.
+
+    The path decides the style, because the path is what a harness sets
+    its base URL to.
+    """
+    if path == OPENAI_PATH:
+        return "openai"
+    if path == RESPONSES_PATH:
+        return "responses"
+    if path == ANTHROPIC_PATH:
+        return "anthropic"
+    return None
+
+
+def error_body(style: str, message: str, kind: str) -> bytes:
+    """An error in the shape the style's client expects.
+
+    Both styles read `error.message`; the Anthropic style wraps it in a
+    `type`. A harness that handles a provider error handles this one.
+    """
+    payload = {
+        "error": {
+            "message": message,
+            "type": kind,
+            "param": None,
+            "code": kind,
+        }
+    }
+    return json.dumps(payload).encode("utf-8")
+
+
+# ----- usage ---------------------------------------------------------------
+#
+# Each style names its counts differently. The bake-off wants three
+# numbers: input, cached and output.
+#
+# Sources: the OpenAI chat completions API reference
+# (https://developers.openai.com/api/reference/resources/chat/subresources/completions/),
+# the OpenAI Responses API reference
+# (https://developers.openai.com/api/reference/resources/responses/)
+# and Anthropic's Messages API reference
+# (https://platform.claude.com/docs/en/api/messages).
+
+
+def usage_from_openai(usage: dict) -> dict:
+    """The counts an OpenAI-style usage block carries.
+
+    The block carries `prompt_tokens`, `completion_tokens` and
+    `prompt_tokens_details.cached_tokens`. The prompt count includes the
+    cached tokens, so the input is what is left of it.
+    """
+    counts: dict[str, int] = {}
+    if "prompt_tokens" in usage:
+        counts["input"] = _int_or_zero(usage.get("prompt_tokens"))
+    if "completion_tokens" in usage:
+        counts["output"] = _int_or_zero(usage.get("completion_tokens"))
+    details = usage.get("prompt_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        counts["cached"] = _int_or_zero(details.get("cached_tokens"))
+    counts["input"] = _uncached(counts.get("input"), counts.get("cached"))
+    return counts
+
+
+def usage_from_responses(usage: dict) -> dict:
+    """The counts a Responses-style usage block carries.
+
+    The block carries `input_tokens`, `output_tokens` and
+    `input_tokens_details.cached_tokens`. The input count includes the
+    cached tokens, so the input is what is left of it.
+    """
+    counts: dict[str, int] = {}
+    if "input_tokens" in usage:
+        counts["input"] = _int_or_zero(usage.get("input_tokens"))
+    if "output_tokens" in usage:
+        counts["output"] = _int_or_zero(usage.get("output_tokens"))
+    details = usage.get("input_tokens_details")
+    if isinstance(details, dict) and "cached_tokens" in details:
+        counts["cached"] = _int_or_zero(details.get("cached_tokens"))
+    counts["input"] = _uncached(counts.get("input"), counts.get("cached"))
+    return counts
+
+
+def usage_from_anthropic(usage: dict) -> dict:
+    """The counts an Anthropic-style usage block carries.
+
+    The block carries `input_tokens`, `output_tokens`,
+    `cache_read_input_tokens` and `cache_creation_input_tokens`. A cache
+    creation is input the provider had to read, so it is counted with
+    the input. The input count excludes the cache read already.
+    """
+    counts: dict[str, int] = {}
+    if "input_tokens" in usage:
+        counts["input"] = _int_or_zero(usage.get("input_tokens"))
+    if "output_tokens" in usage:
+        counts["output"] = _int_or_zero(usage.get("output_tokens"))
+    if "cache_read_input_tokens" in usage:
+        counts["cached"] = _int_or_zero(usage.get("cache_read_input_tokens"))
+    if "cache_creation_input_tokens" in usage:
+        creation = _int_or_zero(usage.get("cache_creation_input_tokens"))
+        counts["input"] = counts.get("input", 0) + creation
+    return counts
+
+
+def _int_or_zero(value: object) -> int:
+    """A token count, or zero when the field is absent or not a number."""
+    if isinstance(value, bool):
+        return 0
+    if isinstance(value, int):
+        return value
+    return 0
+
+
+def _uncached(total: int | None, cached: int | None) -> int:
+    """The input a provider did not serve from its cache.
+
+    The OpenAI and Responses styles count the cached tokens inside the
+    input, so the input every style means is what is left of it.
+    """
+    if total is None:
+        return 0
+    if cached is None:
+        return total
+    return max(0, total - cached)
+
+
+def merge_usage(base: dict, other: dict) -> dict:
+    """Fold a later usage block into an earlier one.
+
+    A count the later block carries wins; a count it omits leaves the
+    earlier one alone, so the input count from `message_start` survives
+    into the final record.
+    """
+    merged = dict(base)
+    for key, value in other.items():
+        if isinstance(value, int):
+            merged[key] = value
+    return merged
+
+
+def full_usage(counts: dict) -> dict:
+    """The three counts, with a count that was never reported as zero."""
+    return {
+        "input": counts.get("input", 0),
+        "cached": counts.get("cached", 0),
+        "output": counts.get("output", 0),
+    }
+
+
+# ----- the provider's answer ------------------------------------------------
+
+def answered_model(payload: object) -> str:
+    """The model the provider answered with, or empty.
+
+    The provider bills by context tier, so the answer may carry a larger
+    tier's name than the one that was asked for. This is what C1 prices.
+    """
+    if isinstance(payload, dict):
+        value = payload.get("model")
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+def openai_usage(payload: object) -> tuple[dict, dict]:
+    """The counts of an OpenAI-style answer, and its raw usage block."""
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return full_usage(usage_from_openai(usage)), usage
+    return {"input": 0, "cached": 0, "output": 0}, {}
+
+
+def responses_usage(payload: object) -> tuple[dict, dict]:
+    """The counts of a Responses-style answer, and its raw usage block."""
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return full_usage(usage_from_responses(usage)), usage
+    return {"input": 0, "cached": 0, "output": 0}, {}
+
+
+def anthropic_usage(payload: object) -> tuple[dict, dict]:
+    """The counts of an Anthropic-style answer, and its raw usage block."""
+    if isinstance(payload, dict):
+        usage = payload.get("usage")
+        if isinstance(usage, dict):
+            return full_usage(usage_from_anthropic(usage)), usage
+    return {"input": 0, "cached": 0, "output": 0}, {}
+
+
+# ----- streaming ------------------------------------------------------------
+#
+# A stream is forwarded as it arrives, so the parse happens on the bytes
+# that go to the harness. The usage comes from the end: the OpenAI style's
+# last chunk with a `usage`, the Responses `response.completed`, the
+# Anthropic `message_start`.
+
+def iter_sse_events(text: str) -> list[str]:
+    """The `data:` payloads of a server-sent-event block, in order.
+
+    A blank line separates the blocks, and a `data:` line carries one
+    chunk of JSON. The Anthropic style names its events in an `event:`
+    line and repeats that name in `type`.
+    """
+    events = []
+    for block in text.replace("\r\n", "\n").split("\n\n"):
+        payloads = []
+        for line in block.split("\n"):
+            if line.startswith("data:"):
+                payloads.append(line[len("data:"):].strip())
+        if payloads:
+            events.append("\n".join(payloads))
+    return events
+
+
+def usage_from_stream(style: str, text: str) -> tuple[dict, str, dict]:
+    """The usage, the answered model and the raw usage of a stream.
+
+    The OpenAI style reports the whole usage in its final chunk, the
+    Responses style in its `response.completed` event. The Anthropic
+    style splits it across `message_start` and `message_delta`.
+    """
+    usage = {"input": 0, "cached": 0, "output": 0}
+    raw_usage: dict = {}
+    model = ""
+    for event in iter_sse_events(text):
+        if event == "[DONE]":
+            continue
+        try:
+            payload = json.loads(event)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if not model:
+            model = answered_model(payload)
+        if style == "openai":
+            block = payload.get("usage")
+            if isinstance(block, dict):
+                raw_usage = dict(block)
+                usage = merge_usage(usage, usage_from_openai(block))
+            continue
+        if style == "responses":
+            # The Responses style names every event in a `type` field.
+            # The usage arrives in the terminal `response.completed`
+            # event, inside the `response` object.
+            if payload.get("type") == "response.completed":
+                response = payload.get("response")
+                if isinstance(response, dict):
+                    block = response.get("usage")
+                    if isinstance(block, dict):
+                        raw_usage = dict(block)
+                        usage = merge_usage(usage, usage_from_responses(block))
+                    name = response.get("model")
+                    if not model and isinstance(name, str):
+                        model = name
+            continue
+        # Anthropic style. `message_start` carries the input count, in
+        # a `usage` block inside the `message`; `message_delta` carries
+        # the output count, in a `usage` block of its own.
+        if payload.get("type") == "message_start":
+            message = payload.get("message")
+            if isinstance(message, dict):
+                block = message.get("usage")
+                if isinstance(block, dict):
+                    raw_usage = dict(block)
+                    usage = merge_usage(usage, usage_from_anthropic(block))
+                name = message.get("model")
+                if not model and isinstance(name, str):
+                    model = name
+        elif payload.get("type") == "message_delta":
+            block = payload.get("usage")
+            if isinstance(block, dict):
+                raw_usage = dict(block)
+                usage = merge_usage(usage, usage_from_anthropic(block))
+    return full_usage(usage), model, raw_usage
+
+
+# ----- the record file ------------------------------------------------------
+
+class Recorder:
+    """The run's record file: one JSON line per request.
+
+    Every line is appended and flushed, so a reader sees the requests as
+    they happen and a killed proxy leaves the requests it served on disk.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = threading.Lock()
+
+    def write(self, record: dict) -> None:
+        """One line, flushed."""
+        line = json.dumps(record, sort_keys=True)
+        with self._lock:
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(line + "\n")
+                handle.flush()
+
+
+# ----- the proxy ------------------------------------------------------------
+
+class Proxy:
+    """What the handler needs to answer one request."""
+
+    def __init__(self, harness: str, model: str, upstream: str, key: str,
+                 recorder: Recorder) -> None:
+        self.harness = harness
+        self.model = model
+        self.upstream = upstream.rstrip("/")
+        self.key = key
+        self.recorder = recorder
+
+    def upstream_target(self) -> tuple[str, int, str, str]:
+        """The scheme, host, port and base path of the provider."""
+        parts = urlsplit(self.upstream)
+        if parts.scheme not in ("http", "https"):
+            raise UpstreamError(
+                f"the upstream URL must be http or https, not {parts.scheme!r}")
+        if not parts.hostname:
+            raise UpstreamError("the upstream URL names no host")
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        return parts.scheme, parts.hostname, port, parts.path.rstrip("/")
+
+
+class Handler(BaseHTTPRequestHandler):
+    """One request from a harness.
+
+    The body passes through unchanged, apart from the model check. The
+    harness's own key is dropped and the env file's key is sent instead,
+    so the provider sees one credential whichever harness is talking.
+    """
+
+    protocol_version = "HTTP/1.1"
+    proxy: Proxy
+
+    # The content type the provider answered with, kept so a provider
+    # answer reaches the harness as the provider wrote it. It is reset
+    # per request: one handler serves every request on a connection.
+    _upstream_content_type: str = ""
+
+    def log_message(self, *_a: object, **_k: object) -> None:
+        return  # the proxy's own output is the record file, not stderr
+
+    def do_POST(self) -> None:  # noqa: N802 -- http.server contract
+        self._handle()
+
+    def do_GET(self) -> None:  # noqa: N802 -- http.server contract
+        self._method_not_allowed()
+
+    def do_PUT(self) -> None:  # noqa: N802 -- http.server contract
+        self._method_not_allowed()
+
+    def do_DELETE(self) -> None:  # noqa: N802 -- http.server contract
+        self._method_not_allowed()
+
+    def _method_not_allowed(self) -> None:
+        """Only a POST is a model request.
+
+        A GET arrives without a body, so a model cannot be checked.
+        Recording it would put a request the harness never made into the
+        counts.
+        """
+        self._respond(405, error_body(
+            "openai", "this proxy accepts POST only", "method_not_allowed"))
+
+    def _handle(self) -> None:
+        self._upstream_content_type = ""
+        style = style_for(self.path.split("?", 1)[0])
+        if style is None:
+            self._respond(404, error_body(
+                "openai",
+                f"this proxy serves {OPENAI_PATH}, {RESPONSES_PATH} "
+                f"and {ANTHROPIC_PATH}",
+                "not_found"))
+            return
+
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length) if length else b""
+        started = time.monotonic()
+        arrived = datetime.now(timezone.utc)
+
+        try:
+            payload = json.loads(raw.decode("utf-8")) if raw else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            payload = {}
+
+        requested = payload.get("model") if isinstance(payload, dict) else None
+        requested = requested if isinstance(requested, str) else ""
+
+        if requested != self.proxy.model:
+            self._refuse(style, requested, started, arrived)
+            return
+
+        headers = self._upstream_headers(style)
+        try:
+            status, body, stream = self._forward(headers, raw)
+        except UpstreamError as exc:
+            self._respond(502, error_body(style, str(exc), "upstream_error"))
+            # The provider was never reached, so `refused` stays false:
+            # that flag means the proxy turned the request away.
+            self._record(started, arrived, requested, 502, style,
+                         {"input": 0, "cached": 0, "output": 0}, "", {}, False)
+            return
+
+        if stream is not None:
+            # The stream was already written to the harness as it
+            # arrived. Only the usage and the answered model are read
+            # out of it now.
+            usage, answered, raw = usage_from_stream(style, stream)
+        else:
+            self._respond(status, body)
+            usage, raw = self._usage_of(style, body)
+            answered = self._model_of(style, body)
+        self._record(started, arrived, requested, status, style, usage,
+                     answered, raw, False)
+
+    def _refuse(self, style: str, requested: str, started: float,
+                arrived: datetime) -> None:
+        """Refuse a request for a model this run did not assign.
+
+        The harness sees an error it can handle, in the shape its own
+        style documents. The attempt is recorded, so G2 is prevented
+        before the release, not detected afterwards.
+        """
+        message = (f"model {requested!r} is not the model this run assigned; "
+                   f"the assigned model is {self.proxy.model!r}")
+        self._respond(400, error_body(style, message, "model_not_allowed"))
+        self._record(started, arrived, requested, 400, style,
+                     {"input": 0, "cached": 0, "output": 0}, "", {}, True)
+
+    def _upstream_headers(self, style: str) -> dict:
+        """The headers the provider is asked with.
+
+        The harness's own credential headers are dropped and the one key
+        from the env file is sent in the place the style expects it.
+        """
+        headers = {}
+        for name, value in self.headers.items():
+            if name.lower() in ("authorization", "x-api-key", "host",
+                                "content-length", "connection"):
+                continue
+            headers[name] = value
+        name, template = AUTH_HEADERS[style]
+        headers[name] = template.format(key=self.proxy.key)
+        headers["Content-Type"] = headers.get(
+            "Content-Type", "application/json")
+        return headers
+
+    def _forward(self, headers: dict, raw: bytes) -> tuple[int, bytes, str | None]:
+        """Ask the provider, and return its status, body and stream.
+
+        A streamed answer is forwarded as it arrives, and the whole
+        stream comes back as the third value, where the usage is parsed
+        from.
+        """
+        scheme, host, port, base = self.proxy.upstream_target()
+        path = base + self.path
+        headers["Content-Length"] = str(len(raw))
+        connection = self._connect(scheme, host, port)
+        try:
+            connection.request("POST", path, body=raw, headers=headers)
+            response = connection.getresponse()
+            content_type = (response.getheader("Content-Type") or "")
+            if "text/event-stream" in content_type:
+                stream = self._forward_stream(response)
+                return response.status, b"", stream
+            body = response.read()
+            self._upstream_content_type = content_type
+            return response.status, body, None
+        except (OSError, http.client.HTTPException) as exc:
+            raise UpstreamError(f"the provider could not be reached: {exc}") from exc
+        finally:
+            connection.close()
+
+    def _connect(self, scheme: str, host: str, port: int):
+        """The connection to the provider, chosen by the scheme.
+
+        An `https://` upstream is reached over TLS, with the
+        certificate verified against the system trust store.
+        """
+        if scheme == "https":
+            return http.client.HTTPSConnection(
+                host, port, timeout=UPSTREAM_TIMEOUT_S,
+                context=ssl.create_default_context())
+        return http.client.HTTPConnection(
+            host, port, timeout=UPSTREAM_TIMEOUT_S)
+
+    def _forward_stream(self, response) -> str:
+        """Pass the stream on as it arrives.
+
+        Each chunk is written to the harness and flushed before the next
+        read, so a harness rendering tokens as they arrive sees them.
+        The chunks are collected: the usage is in them.
+        """
+        collected = []
+        self.send_response(response.status)
+        self.send_header("Content-Type",
+                         response.getheader("Content-Type")
+                         or "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        while True:
+            chunk = response.read1(STREAM_READ_SIZE)
+            if not chunk:
+                break
+            collected.append(chunk)
+            self.wfile.write(chunk)
+            self.wfile.flush()
+        return b"".join(collected).decode("utf-8", "replace")
+
+    def _usage_of(self, style: str, body: bytes) -> tuple[dict, dict]:
+        """The usage of a non-streamed answer, and its raw block."""
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return {"input": 0, "cached": 0, "output": 0}, {}
+        if style == "openai":
+            return openai_usage(payload)
+        if style == "responses":
+            return responses_usage(payload)
+        return anthropic_usage(payload)
+
+    def _model_of(self, style: str, body: bytes) -> str:
+        """The model the provider answered with."""
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return ""
+        return answered_model(payload)
+
+    def _respond(self, status: int, body: bytes) -> None:
+        """Answer the harness.
+
+        A provider answer keeps the provider's own content type, so an
+        error the provider wrote reaches the harness as it was written.
+        An answer the proxy made itself is JSON.
+        """
+        self.send_response(status)
+        self.send_header("Content-Type",
+                         self._upstream_content_type or "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        if body:
+            self.wfile.write(body)
+
+    def _record(self, started: float, arrived: datetime, requested: str,
+                status: int, style: str, usage: dict, answered: str,
+                raw: dict, refused: bool) -> None:
+        """One JSON line for this request.
+
+        The key is never in the record: it is no argument of this
+        function, and nothing reaching it carries one. `usage_raw` is
+        the provider's own usage block, so the counts can be audited.
+        """
+        self.proxy.recorder.write({
+            "harness": self.proxy.harness,
+            "time": arrived.isoformat(),
+            "model": requested,
+            "answered_model": answered,
+            "style": style,
+            "path": self.path.split("?", 1)[0],
+            "status": status,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "usage": usage,
+            "usage_raw": raw,
+            "refused": refused,
+        })
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """The command line."""
+    parser = argparse.ArgumentParser(
+        prog="bakeoff-proxy",
+        description="Meter the provider tokens one harness spends.",
+    )
+    parser.add_argument("--port", type=int, required=True,
+                        help="the port to listen on")
+    parser.add_argument("--harness", required=True,
+                        help="the harness this port belongs to")
+    parser.add_argument("--model", required=True,
+                        help="the model this run assigned")
+    parser.add_argument("--upstream", required=True,
+                        help="the provider's base URL")
+    parser.add_argument("--record", required=True,
+                        help="the file the records are written to")
+    parser.add_argument("--key-var", default=DEFAULT_KEY_VAR,
+                        help=f"the variable the provider key is read from "
+                             f"(default {DEFAULT_KEY_VAR})")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+
+    try:
+        key = load_key(args.key_var)
+    except ConfigError as exc:
+        print(f"ERR config: {exc}", file=sys.stderr)
+        return 2
+
+    record_path = Path(args.record).expanduser()
+    record_path.parent.mkdir(parents=True, exist_ok=True)
+
+    proxy = Proxy(args.harness, args.model, args.upstream, key,
+                  Recorder(record_path))
+    handler = type("BoundHandler", (Handler,), {"proxy": proxy})
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), handler)
+    server.daemon_threads = True
+
+    print(f"==> bakeoff-proxy for {args.harness} on port {args.port}, "
+          f"model {args.model}, recording to {record_path}",
+          flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

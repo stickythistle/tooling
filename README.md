@@ -294,6 +294,65 @@ host must be a logged-in account with read access to the repository watched.
 in this checkout is used, so a stale `main-watch` earlier on the timer's `PATH`
 cannot decide what a commit means.
 
+## Metering a bake-off
+
+`bakeoff-proxy` is a local pass-through between one harness and the provider.
+The provider allows a single API key, so its own metering cannot separate one
+harness's tokens from another's. The proxy answers with the provider's own
+`usage`.
+
+    bakeoff-proxy --port P --harness NAME --model M --upstream URL --record FILE
+
+Each harness gets its own port and its own record file. The proxy forwards each
+request to the provider with the one key, streaming included, and records one
+JSON line per request:
+
+| | |
+|---|---|
+| `harness` | the harness this port belongs to |
+| `time` | when the request arrived |
+| `model` | the model that was requested, which is what G2 compares |
+| `answered_model` | the model the provider answered with, which is what C1 prices |
+| `style` | the endpoint style the harness spoke |
+| `path` | the path the harness posted to |
+| `status` | the status the provider answered with |
+| `latency_ms` | how long the request took |
+| `usage` | the token counts, `input` uncached |
+| `usage_raw` | the provider's block, as it came |
+| `refused` | whether the proxy refused the request |
+
+`input` is the uncached input in every style. The OpenAI and Responses styles
+count the cached tokens inside their input, so the record subtracts them; the
+Anthropic style's input already excludes the cache read.
+
+An `https://` upstream is reached over TLS, with the provider's certificate
+verified against the system trust store, so the provider's key crosses a TLS
+connection.
+
+The provider bills by context tier, so the answer may carry a larger tier's
+name than the one that was asked for. The share of requests in the larger tier
+measures how well a harness manages context.
+
+A request for any model other than the one the run assigned is refused with an
+error the harness sees, in the shape its style documents, and the attempt is
+recorded. The provider is never asked, so G2 is prevented.
+
+A stream is forwarded as it arrives, so a harness that renders as tokens arrive
+sees them arrive. The usage comes from the end of the stream, in the event
+each style ends with.
+
+A provider that cannot serve an endpoint the harness called answers with its
+own error, and the proxy relays that error as the provider wrote it.
+
+**The env file.** `BAKEOFF_PROVIDER_ENV` names a file holding the provider's
+key:
+
+    MINIMAX_API_KEY=...
+
+`--key-var` names a variable of your own instead. A missing variable, a missing
+file, or the variable missing or empty is refused by name and exits 2. The key
+never appears in a record, a log or an error.
+
 ## Setup
 
     cp hosts.env.example ~/.config/agent-tools/env    # then edit
