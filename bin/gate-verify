@@ -98,6 +98,8 @@ skipped() {
 }
 
 NAMES=() GATES=() SHOWN=()
+# Only a gate with a `when` says what it covers.
+NAMING=0
 for i in "${!GATE_NAMES[@]}"; do
 	name=${GATE_NAMES[$i]} when=${GATE_WHEN[$i]}
 	skipped "$name" && continue
@@ -112,6 +114,7 @@ for i in "${!GATE_NAMES[@]}"; do
 	# $REPO is what a manifest's `run` interpolates; exported so a gate that
 	# shells out again still sees it.
 	GATES+=("REPO=$(printf '%q' "$SRC") ; ${GATE_RUN[$i]}")
+	[ -n "$when" ] && NAMING=$((NAMING + 1))
 done
 
 if [ ${#GATES[@]} -eq 0 ] && [ "$ALL" -eq 0 ] && [ ${#CODE[@]} -eq 0 ]; then
@@ -121,7 +124,8 @@ if [ ${#GATES[@]} -eq 0 ] && [ "$ALL" -eq 0 ] && [ ${#CODE[@]} -eq 0 ]; then
 fi
 
 # Named: only the code, so a licence beside an unwired script is not blamed.
-if [ ${#GATES[@]} -eq 0 ]; then
+# An always-on gate names no path, so it cannot answer this.
+if [ "$NAMING" -eq 0 ] && [ "$ALL" -eq 0 ] && [ ${#CODE[@]} -gt 0 ]; then
 	echo "no gate matches:" >&2
 	printf '  %s\n' "${CODE[@]}" >&2
 	echo "Add one to gates.toml rather than shipping unverified." >&2
