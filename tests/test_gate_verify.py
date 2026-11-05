@@ -19,6 +19,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_VERIFY = REPO_ROOT / "bin" / "gate-verify"
+REDACTION_CHECK = REPO_ROOT / "bin" / "redaction-check"
 GATES_TOML = REPO_ROOT / "gates.toml"
 
 
@@ -494,6 +495,89 @@ def case_all_skip_still_excludes(tmp: Path) -> list[str]:
     return failures
 
 
+def case_redaction_gate_runs_on_every_branch(tmp: Path) -> list[str]:
+    """A branch that carries an agent's redaction into the source fails
+    the gate, a branch that only touches a file already holding one
+    passes, and a branch that changes only a document still runs it.
+
+    The halves are read off real git commits, not a hand-written diff.
+    """
+    failures = []
+
+    # Assembled rather than written out: a literal of it would be caught
+    # by the very tool under test, and the case would plant wrong bytes.
+    stars = "*" * 3
+    scheme = "Author" + "ization"
+    secret = scheme + ": Bearer " + stars + " this line"
+
+    def repo_with_tool(tmpdir: Path, label: str) -> Path:
+        """A repo holding the redaction tool in its base, so the diff
+        under test is only the file the branch changes."""
+        repo = make_repo(tmpdir / label)
+        (repo / "bin").mkdir(exist_ok=True)
+        shutil.copy(REDACTION_CHECK, repo / "bin" / "redaction-check")
+        git(repo, "add", "bin/redaction-check")
+        git(repo, "commit", "-q", "-m", "add the redaction tool")
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return repo
+
+    def repo_with_redaction(tmpdir: Path, label: str) -> Path:
+        """A repo whose base already holds a redaction on a line the
+        branch under test does not touch."""
+        repo = repo_with_tool(tmpdir, label)
+        (repo / "notes.md").write_text(secret + "\n")
+        git(repo, "add", "notes.md")
+        git(repo, "commit", "-q", "-m", "a note that already holds one")
+        # The base is the commit that holds the redaction, so the branch
+        # below reads it as an unchanged line.
+        git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+        return repo
+
+    # A branch that adds the redaction: the gate must fail it.
+    adds = repo_with_tool(tmp / "adds", "adds")
+    (adds / "notes.md").write_text(secret)
+    git(adds, "add", "notes.md")
+    git(adds, "commit", "-q", "-m", "add the redaction")
+    r = run_gate_verify(adds)
+    if r.returncode == 0:
+        failures.append(
+            f"a branch adding a redaction passed: rc={r.returncode} "
+            f"stdout={r.stdout.strip()!r}")
+    if "redaction check" not in r.stderr:
+        failures.append(
+            f"the redaction gate did not fail the branch: "
+            f"stderr={r.stderr.strip()!r}")
+
+    # A branch that only touches a file already holding one passes.
+    touches = repo_with_redaction(tmp, "touches")
+    git(touches, "checkout", "-q", "-b", "touch-only")
+    (touches / "notes.md").write_text(secret + "\nanother line\n")
+    git(touches, "add", "notes.md")
+    git(touches, "commit", "-q", "-m", "touch the file, keep the redaction")
+    r = run_gate_verify(touches)
+    if r.returncode != 0:
+        failures.append(
+            f"a branch that left an existing redaction alone failed: "
+            f"rc={r.returncode} stdout={r.stdout.strip()!r} "
+            f"stderr={r.stderr.strip()!r}")
+    if "FAILED" in (r.stdout + r.stderr):
+        failures.append(
+            f"the redaction gate failed a branch that only touched an "
+            f"existing redaction: stdout={r.stdout!r} stderr={r.stderr!r}")
+
+    # A branch that changes only a document still runs the gate.
+    docs = repo_with_tool(tmp / "docs", "docs")
+    (docs / "README.md").write_text("init\n" + secret)
+    git(docs, "add", "README.md")
+    git(docs, "commit", "-q", "-m", "add the redaction to a document")
+    r = run_gate_verify(docs)
+    if r.returncode == 0:
+        failures.append(
+            f"a document-only branch carrying a redaction passed: "
+            f"rc={r.returncode} stdout={r.stdout.strip()!r}")
+    return failures
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as t:
@@ -519,6 +603,8 @@ def main() -> int:
              case_all_works_with_empty_diff),
             ("--skip still excludes a gate under --all",
              case_all_skip_still_excludes),
+            ("the redaction gate runs on every branch",
+             case_redaction_gate_runs_on_every_branch),
         ]:
             try:
                 failures.extend(fn(tmp))
