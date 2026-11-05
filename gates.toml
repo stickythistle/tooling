@@ -253,9 +253,12 @@ name = "redaction check"
 run = "bin/redaction-check $REPO"
 
 [[gates]]
-name = "repo-branch-sweep syntax"
-when = '^(bin/repo-branch-sweep)$'
-run = "bash -n bin/repo-branch-sweep"
+# The sweep deletes worktrees, so the suite pins its report and its prune
+# against real git: an empty branch is empty, a landed branch with a clean
+# worktree is pruned, and a worktree with uncommitted changes is skipped.
+name = "repo-branch-sweep tests"
+when = '^(bin/repo-branch-sweep|tests/test_repo_branch_sweep\.py)$'
+run = "python3 tests/test_repo_branch_sweep.py"
 
 [[gates]]
 name = "hermes review tests"

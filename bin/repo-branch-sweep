@@ -23,7 +23,7 @@ SUBJECTS=$(mktemp)
 git log --format=%s "$TRUNK" -500 >"$SUBJECTS"
 trap 'rm -f "$SUBJECTS"' EXIT
 
-landed=() unlanded=()
+landed=() unlanded=() empty=()
 while read -r branch; do
 	[[ -z "$branch" ]] && continue
 	[[ "$branch" == "$(basename "$TRUNK")" ]] && continue
@@ -32,7 +32,9 @@ while read -r branch; do
 	# every subject is already on the trunk has landed, however it was merged.
 	mapfile -t subjects < <(git log --format=%s "$TRUNK..$branch" 2>/dev/null)
 	if [[ ${#subjects[@]} -eq 0 ]]; then
-		landed+=("$branch (no commits of its own)")
+		# A lane's branch sits here between `worktree add` and its first
+		# commit. It has landed nowhere; it has not started.
+		empty+=("$branch (no commits of its own)")
 		continue
 	fi
 
@@ -52,6 +54,11 @@ printf '%s\n' "${landed[@]:-(none)}"
 echo
 echo "== still carrying work =="
 printf '%s\n' "${unlanded[@]:-(none)}"
+echo
+# A branch with no commit of its own is not landed: it is a lane that has
+# not pushed yet, and deleting it deletes that lane's work.
+echo "== empty, no commits of its own =="
+printf '%s\n' "${empty[@]:-(none)}"
 
 # A worktree whose branch is gone leaves an administrative file behind, which is
 # what makes `git worktree add` refuse a path that looks free.
@@ -65,7 +72,19 @@ if [[ "$PRUNE" -eq 1 && ${#landed[@]} -gt 0 ]]; then
 		branch=${entry%% *}
 		wt=$(git worktree list --porcelain | awk -v b="refs/heads/$branch" '
 			/^worktree /{path=$2} /^branch /{if ($2==b) print path}')
-		[[ -n "$wt" ]] && git worktree remove --force "$wt"
+		if [[ -n "$wt" ]]; then
+			# A dirty worktree is a lane still working, so it is skipped and
+			# named rather than deleted. `git worktree remove` without
+			# --force refuses it too; the check is here to say which.
+			if [[ -n "$(git -C "$wt" status --porcelain)" ]]; then
+				echo "skipped $branch: worktree $wt has uncommitted changes"
+				continue
+			fi
+			git worktree remove "$wt" || {
+				echo "skipped $branch: worktree $wt could not be removed" >&2
+				continue
+			}
+		fi
 		git branch -D "$branch"
 		git push --quiet origin --delete "$branch" 2>/dev/null && echo "deleted origin/$branch" || true
 	done
