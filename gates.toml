@@ -126,6 +126,14 @@ name = "remote-task drift tests"
 when = '^(bin/remote-task|lib/migrator\.py|bin/task-mirror-check|lib/workflow_steps\.py|tests/test_remote_task_drift\.py)$'
 run = "python3 tests/test_remote_task_drift.py"
 
+# The sync's own suite. Named with the tool it drives, so a change to
+# the sync's flags runs the suite that pins them -- a gate naming only
+# the test file would leave the suite inert exactly when it is needed.
+[[gates]]
+name = "remote-task sync tests"
+when = '^(bin/remote-task|tests/test_remote_task_sync\.py)$'
+run = "python3 tests/test_remote_task_sync.py"
+
 [[gates]]
 name = "remote path tests"
 when = '^(bin/remote-task|bin/remote-run|lib/common\.sh|tests/test_remote_path\.py)$'
