@@ -253,6 +253,47 @@ credentials that user can reach are still on the host: the empty config
 makes an accidental call fail, it does not make them unreadable. A lane
 is told that, and must not use them.
 
+## Watching `main`
+
+`main-watch-run` runs `main-watch` over a timer and says what broke `main`.
+Merging a pull request without a rebase can turn `main` red without any one
+pull request's CI ever having run, so something has to look after the branch
+itself.
+
+    main-watch-run owner/repo [owner/repo...]
+
+It judges every `main` commit since the commit it last judged, and sends one
+Telegram message when a commit broke the branch. The position it keeps is per
+repository, under
+`${XDG_STATE_HOME:-$HOME/.local/state}/main-watch/<owner>__<repo>`, so a second
+run over the same commits judges nothing and says nothing.
+
+A branch rewritten under the position resets it to the head, and says so. A
+`gh` call that fails holds the position instead, so the next run judges the
+same commits again.
+
+**The env file.** `MAIN_WATCH_ENV` names a file with two keys in it:
+
+    TELEGRAM_BOT_TOKEN=...
+    TELEGRAM_CHAT_ID=...
+
+A missing variable, a missing file, or either key missing or empty is refused
+by name and exits 2. The token never appears in any output.
+
+**The timer.** Any timer that can run a command will do. A crontab entry on the
+host, running as the user whose state directory holds the position:
+
+    */10 * * * * MAIN_WATCH_ENV=$HOME/.config/main-watch/env \
+        $HOME/tooling/bin/main-watch-run owner/repo >/dev/null
+
+**What the host needs.** An authenticated `gh`, because the commits and the
+pull requests a commit came from are read through it. `gh auth status` on that
+host must be a logged-in account with read access to the repository watched.
+
+`MAIN_WATCH_BIN` names another `main-watch` to judge with. Without it the copy
+in this checkout is used, so a stale `main-watch` earlier on the timer's `PATH`
+cannot decide what a commit means.
+
 ## Setup
 
     cp hosts.env.example ~/.config/agent-tools/env    # then edit

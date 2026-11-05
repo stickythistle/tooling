@@ -69,6 +69,15 @@ name = "pr-loop-gate git tests"
 when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate_git\.py)$'
 run = "python3 tests/test_pr_loop_gate_git.py"
 
+# The caller that watches `main`: it judges every commit since the one
+# it judged last and reports the breaks over Telegram. The gate names
+# the driver and the suite that pins it, so a change to either runs the
+# suite.
+[[gates]]
+name = "main watch run tests"
+when = '^(bin/main-watch-run|tests/test_main_watch_run\.py|tests/fixtures/main_watch_run/.*)$'
+run = "python3 tests/test_main_watch_run.py"
+
 [[gates]]
 name = "gates workflow"
 when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'
