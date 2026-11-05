@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""Turn the bake-off's records into the table and the ranking.
+
+    bakeoff-report <record-or-directory>...
+
+#170's final table: "One row per harness, with Hermes as the baseline row.
+Columns: G1-G3 (any hit marks the harness out), then Q1, Q2 and A1 as
+worst / median, then E1 total, C1, C2, C3, and O1-O5 as passes out of 5."
+
+G4 came later, as an addendum to #170's metrics, so it is a column too.
+
+The ranking: "Any G hit in any run puts the harness out. Rank the rest by
+worst-run Q1, then Q2, then A1. Cost (C1, C2) decides only between
+harnesses within 10% on quality."
+
+A directory is read as the record files inside it, so a whole bake-off is
+one argument.
+"""
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+
+import bakeoff  # noqa: E402  -- the path is set above, on purpose.
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="bakeoff-report",
+        description="Render the bake-off's records as the table and the "
+                    "ranking.")
+    parser.add_argument("records", nargs="+",
+                        help="a record file, or a directory of them")
+    parser.add_argument("--json", action="store_true",
+                        help="print the ranking as JSON instead of a table")
+    args = parser.parse_args(argv)
+
+    paths = [Path(p) for p in args.records]
+    try:
+        records = bakeoff.load_records(paths)
+    except bakeoff.ConfigError as exc:
+        print(f"bakeoff-report: {exc}", file=sys.stderr)
+        return 2
+
+    if not records:
+        print("bakeoff-report: no records", file=sys.stderr)
+        return 2
+
+    if args.json:
+        import json
+        ranked = [
+            {
+                "harness": name,
+                "out": any(run.gates_hit() for run in runs),
+                "gates_hit": sorted({g for run in runs for g in run.gates_hit()}),
+                "runs": len(runs),
+            }
+            for name, runs in bakeoff.rank(records)
+        ]
+        print(json.dumps(ranked, indent=2))
+        return 0
+
+    print(bakeoff.render_report(records), end="")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
