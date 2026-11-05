@@ -10,11 +10,13 @@ real gates.toml is copied into each tmpdir rather than a synthetic one.
 
 Run directly: `python3 tests/test_gate_verify.py`.
 """
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -578,6 +580,373 @@ def case_redaction_gate_runs_on_every_branch(tmp: Path) -> list[str]:
     return failures
 
 
+# ---------------------------------------------------------------------------
+# One gate run per tree, and no orphaned children.
+#
+# Real processes throughout: a gate that sleeps, a gate-verify that is
+# killed with a signal, and a run that is made to crash. Each case observes
+# what the process did.
+# ---------------------------------------------------------------------------
+
+
+def sleeping_gate_repo(parent: Path, name: str, gate_body: str) -> Path:
+    """A repo whose single gate runs `gate_body` and sleeps.
+
+    The gate writes its own pid to a file, so a test can look up the
+    process it started.
+    """
+    repo = make_repo(parent / name, with_gates=False)
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'sleeper'\nwhen = '^src/thing\\.py$'\n"
+        f"run = {gate_body!r}\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "src" / "thing.py").write_text("# touch\n")
+    git(repo, "add", "src/thing.py")
+    git(repo, "commit", "-q", "-m", "change")
+    return repo
+
+
+def gate_verify_env(runtime_dir: Path) -> dict:
+    """The environment a gate-verify run needs, with its own lock directory.
+
+    XDG_RUNTIME_DIR points at a directory the test owns, so this run's lock
+    cannot collide with a real run's.
+    """
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    return {"HOME": "/tmp", "PATH": "/usr/bin:/bin",
+            "VERIFY_BASE": "origin/main",
+            "XDG_RUNTIME_DIR": str(runtime_dir)}
+
+
+def start_gate_verify(repo: Path, runtime_dir: Path) -> subprocess.Popen:
+    """Start gate-verify in the background and return the process."""
+    return subprocess.Popen(
+        [str(GATE_VERIFY), str(repo)],
+        env=gate_verify_env(runtime_dir),
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+
+
+def wait_for(predicate, timeout: float = 20.0, interval: float = 0.05):
+    """Poll until the predicate is true, or give up and return None."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = predicate()
+        if value:
+            return value
+        time.sleep(interval)
+    return None
+
+
+def pids_alive(pids: list[int]) -> list[int]:
+    """The pids that are still running."""
+    alive = []
+    for pid in pids:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            alive.append(pid)
+            continue
+        alive.append(pid)
+    return alive
+
+
+def _second_run_stderr(repo: Path, runtime_dir: Path) -> str:
+    """What a second gate-verify run on this tree says, on stderr."""
+    try:
+        r = subprocess.run(
+            [str(GATE_VERIFY), str(repo)],
+            env=gate_verify_env(runtime_dir),
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return ""
+    return r.stderr
+
+
+def case_second_run_on_same_tree_refuses(tmp: Path) -> list[str]:
+    """A second gate-verify on the same tree refuses, naming the pid that
+    holds the tree's lock.
+
+    The issue's shape: a lane finds a gate run already going and, having
+    nothing to identify it by, kills a pid that may belong to another
+    worktree's run.
+    """
+    runtime = tmp / "runtime-same-tree"
+    repo = sleeping_gate_repo(
+        tmp, "same-tree",
+        "sh -c 'echo $$ > " + str(tmp / "same-tree.pid") + "; sleep 30'")
+    first = start_gate_verify(repo, runtime)
+    failures = []
+    try:
+        got_pid = wait_for(lambda: (tmp / "same-tree.pid").exists()
+                            and (tmp / "same-tree.pid").read_text().strip())
+        if not got_pid:
+            failures.append(
+                "the first run never reached its gate: "
+                f"stdout={first.stdout.read() if first.stdout else ''!r} "
+                f"stderr={first.stderr.read() if first.stderr else ''!r}")
+            return failures
+        second = subprocess.run(
+            [str(GATE_VERIFY), str(repo)],
+            env=gate_verify_env(runtime),
+            capture_output=True, text=True, timeout=60)
+        if second.returncode == 0:
+            failures.append(
+                "a second run on the same tree was accepted: "
+                f"rc={second.returncode} stdout={second.stdout.strip()!r}")
+        if "already running" not in second.stderr:
+            failures.append(
+                "a second run on the same tree did not say it was already "
+                f"running: stderr={second.stderr.strip()!r}")
+        # The refusal names the pid of the run that holds the lock -- the
+        # gate-verify process itself, not the gate it started. That pid is
+        # the one a lane must not kill.
+        if "as pid" not in second.stderr:
+            failures.append(
+                "the refusal did not name a pid: stderr={second.stderr.strip()!r}")
+        else:
+            reported = second.stderr.split("as pid", 1)[1].strip().split()[0]
+            if not reported.isdigit():
+                failures.append(
+                    f"the refusal named a non-pid {reported!r}: "
+                    f"stderr={second.stderr.strip()!r}")
+            elif int(reported) != first.pid:
+                failures.append(
+                    f"the refusal named pid {reported!r}, not the holder's "
+                    f"pid {first.pid!r}: stderr={second.stderr.strip()!r}")
+        # A refusal starts no gate.
+        if "sleeper" in second.stdout:
+            failures.append(
+                "the refused run started a gate: stdout={second.stdout.strip()!r}")
+    finally:
+        first.terminate()
+        try:
+            first.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            first.kill()
+            first.wait(timeout=30)
+    return failures
+
+
+def case_run_on_another_tree_proceeds(tmp: Path) -> list[str]:
+    """A run on a different tree is unaffected by another tree's lock.
+
+    The lock is per tree, not per machine: a shared host must still gate
+    two branches at once.
+    """
+    runtime = tmp / "runtime-two-trees"
+    repo_a = sleeping_gate_repo(
+        tmp, "tree-a",
+        "sh -c 'echo $$ > " + str(tmp / "tree-a.pid") + "; sleep 30'")
+    repo_b = sleeping_gate_repo(
+        tmp, "tree-b",
+        "sh -c 'echo A > " + str(tmp / "tree-b.marker") + "; sleep 2'")
+    first = start_gate_verify(repo_a, runtime)
+    failures = []
+    try:
+        if not wait_for(lambda: (tmp / "tree-a.pid").exists()):
+            failures.append("the first tree's run never reached its gate")
+            return failures
+        # The other tree proceeds while the first tree is still gating.
+        second = subprocess.run(
+            [str(GATE_VERIFY), str(repo_b)],
+            env=gate_verify_env(runtime),
+            capture_output=True, text=True, timeout=60)
+        if second.returncode != 0:
+            failures.append(
+                "a run on another tree was refused by another tree's lock: "
+                f"rc={second.returncode} stderr={second.stderr.strip()!r}")
+        if "already running" in second.stderr:
+            failures.append(
+                "a run on another tree was refused as already running: "
+                f"stderr={second.stderr.strip()!r}")
+        if not (tmp / "tree-b.marker").exists():
+            failures.append(
+                "the run on the other tree did not run its gate: "
+                f"stdout={second.stdout.strip()!r}")
+    finally:
+        first.terminate()
+        try:
+            first.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            first.kill()
+            first.wait(timeout=30)
+    return failures
+
+
+def case_kill_leaves_no_orphan(tmp: Path) -> list[str]:
+    """Killing gate-verify with TERM leaves no child of the fake gate
+    running.
+
+    The gate starts a child of its own -- the shape of a gate that starts
+    a remote-task. An orphan keeps running against a tree nobody is
+    watching, and keeps holding the builder lock.
+    """
+    runtime = tmp / "runtime-orphan"
+    marker = tmp / "orphan.marker"
+    # The gate writes its own pid, then starts a child that outlives a
+    # plain kill of the gate alone.
+    repo = sleeping_gate_repo(
+        tmp, "orphan",
+        "sh -c 'sleep 300 & echo $! > " + str(marker) +
+        "; echo $$ > " + str(tmp / "orphan.pid") + "; wait'")
+    proc = start_gate_verify(repo, runtime)
+    failures = []
+    try:
+        if not wait_for(lambda: marker.exists() and marker.read_text().strip()):
+            failures.append("the gate never started its child")
+            return failures
+        child = int(marker.read_text().strip())
+        # The gate's own pid, for the record.
+        if not wait_for(lambda: (tmp / "orphan.pid").exists()):
+            failures.append("the gate never reported its pid")
+            return failures
+        proc.terminate()
+        try:
+            proc.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            failures.append("gate-verify ignored the TERM")
+            proc.kill()
+            proc.wait(timeout=30)
+            return failures
+        # The child must be gone. Give it a moment: the trap runs as the
+        # script exits, and the kill is a signal, not a wait.
+        still = wait_for(lambda: not pids_alive([child]), timeout=15)
+        if still is None:
+            failures.append(
+                f"the gate's child {child} survived gate-verify's death: "
+                f"still alive: {pids_alive([child])!r}")
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=30)
+    return failures
+
+
+def case_crashed_run_lock_is_free(tmp: Path) -> list[str]:
+    """A crashed run's lock is free for the next run.
+
+    A pidfile without a lock goes stale after a crash, and someone deletes
+    it by hand. A flock is released by the kernel when the descriptor
+    closes.
+    """
+    runtime = tmp / "runtime-crash"
+    repo = make_repo(tmp / "crash", with_gates=False)
+    # A helper the gate runs. It walks up its own parent chain until it
+    # finds the gate-verify script and kills it with SIGKILL, so no trap
+    # runs and nothing is cleaned up.
+    #
+    # Walking the chain rather than counting levels off it: the number of
+    # levels between the gate and the script depends on how the script
+    # starts its gates, and a fixture that hard-codes the count kills the
+    # wrong process the moment that changes.
+    #
+    # The helper announces itself and then waits to be told to crash, so
+    # the test can look at the lock while the run is provably alive.
+    ready = tmp / "crash.ready"
+    go = tmp / "crash.go"
+    helper = tmp / "crasher.sh"
+    helper.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'ready\\n' > {str(ready)!r}\n"
+        f"while [ ! -e {str(go)!r} ]; do sleep 0.05; done\n"
+        "pid=$PPID\n"
+        "for _ in 1 2 3 4 5 6 7 8; do\n"
+        "  [ -n \"$pid\" ] || break\n"
+        "  if tr '\\0' ' ' < /proc/$pid/cmdline 2>/dev/null"
+        " | grep -q gate-verify; then\n"
+        "    kill -9 \"$pid\" 2>/dev/null || true\n"
+        "    break\n"
+        "  fi\n"
+        "  pid=$(ps -o ppid= -p \"$pid\" 2>/dev/null | tr -d ' ')\n"
+        "done\n"
+        "sleep 30\n")
+    helper.chmod(0o755)
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'crasher'\nwhen = '^src/thing\\.py$'\n"
+        f"run = {str(helper)!r}\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "manifest")
+    git(repo, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (repo / "src").mkdir(exist_ok=True)
+    (repo / "src" / "thing.py").write_text("# touch\n")
+    git(repo, "add", "src/thing.py")
+    git(repo, "commit", "-q", "-m", "change")
+    failures = []
+    # The first run dies hard: the gate SIGKILLs the script, so no trap
+    # runs and nothing is cleaned up by the script.
+    #
+    # It is started in the background rather than run to completion, so
+    # the case can look at the lock while the run is still alive.
+    first = start_gate_verify(repo, runtime)
+    try:
+        # Wait for the gate to start, so the lock is held before the
+        # script is killed.
+        if wait_for(lambda: ready.exists(), timeout=30) is None:
+            failures.append("the crashing gate never started")
+            first.kill()
+            first.wait(timeout=30)
+            return failures
+        # The lock is held while the run lives: a second run is refused.
+        refused = wait_for(
+            lambda: "already running" in _second_run_stderr(repo, runtime),
+            timeout=30)
+        if refused is None:
+            failures.append(
+                "the running gate did not hold the tree's lock: a second "
+                "run was not refused")
+        # Now crash it. The gate kills the script with SIGKILL.
+        go.write_text("go\n")
+        first.wait(timeout=60)
+    except subprocess.TimeoutExpired:
+        failures.append("the crashing run hung instead of dying")
+        first.kill()
+        first.wait(timeout=30)
+        return failures
+    if first.returncode == 0:
+        failures.append(
+            "the crashing run reported success: "
+            f"rc={first.returncode}")
+    # The lock must be free now: a second run proceeds. Its gate also
+    # crashes, so the point of the case is the lock, not the verdict.
+    try:
+        second = subprocess.run(
+            [str(GATE_VERIFY), str(repo)],
+            env=gate_verify_env(runtime),
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        failures.append("the second run hung instead of dying")
+        return failures
+    if "already running" in second.stderr:
+        failures.append(
+            "a crashed run left its lock held: "
+            f"stderr={second.stderr.strip()!r}")
+    # A third run, with a gate that does not crash, must reach its gate.
+    (repo / "gates.toml").write_text(
+        "[[gates]]\nname = 'quiet'\nwhen = '^src/thing\\.py$'\n"
+        "run = 'sh -c \"echo QUIET-RAN\"'\n")
+    git(repo, "add", "gates.toml")
+    git(repo, "commit", "-q", "-m", "quiet manifest")
+    try:
+        third = subprocess.run(
+            [str(GATE_VERIFY), str(repo)],
+            env=gate_verify_env(runtime),
+            capture_output=True, text=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        failures.append("the third run hung")
+        return failures
+    if third.returncode != 0 or "QUIET-RAN" not in third.stdout:
+        failures.append(
+            "the lock was still held after the crashing run: "
+            f"rc={third.returncode} stdout={third.stdout.strip()!r} "
+            f"stderr={third.stderr.strip()!r}")
+    return failures
+
+
 def main() -> int:
     failures = []
     with tempfile.TemporaryDirectory() as t:
@@ -605,6 +974,14 @@ def main() -> int:
              case_all_skip_still_excludes),
             ("the redaction gate runs on every branch",
              case_redaction_gate_runs_on_every_branch),
+            ("a second run on the same tree refuses and names the pid",
+             case_second_run_on_same_tree_refuses),
+            ("a run on another tree proceeds",
+             case_run_on_another_tree_proceeds),
+            ("killing gate-verify leaves no orphan",
+             case_kill_leaves_no_orphan),
+            ("a crashed run's lock is free for the next run",
+             case_crashed_run_lock_is_free),
         ]:
             try:
                 failures.extend(fn(tmp))

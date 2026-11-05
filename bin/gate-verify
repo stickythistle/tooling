@@ -43,6 +43,65 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
+# One gate run per tree.
+#
+# A lane that finds a `gate-verify` already running used to kill it by pid,
+# without checking who started it -- and the pid it killed belonged to
+# another worktree's run, or to the lane's own wrapper. Matching processes by
+# name is the bug itself, so a run is identified by its tree.
+#
+# The lock is the tree's realpath, hashed. A flock rather than a pidfile:
+# a pidfile goes stale after a crash and someone deletes it by hand, while
+# the kernel releases a flock when the descriptor closes.
+LOCK_DIR=${XDG_RUNTIME_DIR:-/tmp}/gate-verify
+mkdir -p "$LOCK_DIR" || { echo "gate-verify: cannot create $LOCK_DIR" >&2; exit 2; }
+# The tree's realpath, not the path the caller typed: two names for one tree
+# are one tree, and a lock keyed on the name would let a second run start
+# against the tree the first run is already gating.
+TREE=$(readlink -f "$SRC")
+TREE_KEY=$(printf '%s' "$TREE" | sha1sum | cut -d' ' -f1)
+LOCK_FILE="$LOCK_DIR/$TREE_KEY.lock"
+# Append, not truncate: `>` empties the file on open, and the open happens
+# before the flock, so a losing run would erase the holder's pid before it
+# could read it.
+exec {lockfd}>>"$LOCK_FILE" || { echo "gate-verify: cannot open $LOCK_FILE" >&2; exit 2; }
+if ! flock -n "$lockfd"; then
+	# The holder's pid is in the lock file, so the refusal names the run to
+	# wait for instead of leaving the caller to guess at a pid to kill.
+	#
+	# The holder writes its pid just after taking the lock, so there is a
+	# moment where the lock is held and the file still holds the previous
+	# run's pid. A short re-read settles it.
+	holder=""
+	for _ in 1 2 3 4 5 6 7 8 9 10; do
+		holder=$(head -1 "$LOCK_FILE" 2>/dev/null | tr -dc '0-9')
+		[ -n "$holder" ] && break
+		sleep 0.05
+	done
+	echo "gate-verify is already running for $SRC as pid ${holder:-unknown}" >&2
+	exit 3
+fi
+# Written after the lock is held, so the pid in the file always belongs to
+# the process that owns the lock and never to one that lost the race.
+printf '%s\n' "$$" >"$LOCK_FILE"
+
+# The gates' children, in one process group this script can signal.
+#
+# Killing gate-verify must take its children with it. A gate that starts a
+# remote-task leaves that child holding the builder lock when the gate run
+# dies.
+#
+# `set -m` puts each background job in its own process group, so the group is
+# the job's pid. The trap below signals that group -- the negative pid -- so
+# the whole subtree goes.
+set -m
+GATE_PGID=""
+kill_gate_group() {
+	[ -n "$GATE_PGID" ] || return 0
+	kill -TERM -"$GATE_PGID" 2>/dev/null || true
+}
+trap kill_gate_group EXIT TERM INT HUP
+
 cd "$SRC"
 mapfile -t CHANGED < <(git diff --name-only "$BASE"...HEAD)
 if [ "$ALL" -eq 0 ] && [ ${#CHANGED[@]} -eq 0 ]; then
@@ -150,8 +209,18 @@ failed=() unprovable=()
 for i in "${!GATES[@]}"; do
 	echo "########## ${NAMES[$i]} ##########"
 	set +e
-	eval "${GATES[$i]}"
+	# Each gate runs in its own process group, so the trap can take the
+	# gate's whole subtree down with it. With `set -m` the group id is the
+	# job's pid, and `kill -TERM -<pgid>` reaches every descendant.
+	#
+	# `{lockfd}>&-` closes the lock descriptor in the gate. A gate that
+	# inherited it would hold the flock for as long as it lived, so a
+	# crashed run would leave the tree locked by its own orphan.
+	eval "${GATES[$i]}" {lockfd}>&- &
+	GATE_PGID=$!
+	wait "$GATE_PGID"
 	rc=$?
+	GATE_PGID=""
 	set -e
 	# 3 is a gate saying it could not answer, which is neither a pass nor a
 	# failure. Reported on its own line so it cannot be read as either: a gate
