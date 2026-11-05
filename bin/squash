@@ -5,7 +5,7 @@
 # fetch in a sibling worktree can move it between fork and squash. `merge-base`
 # is fixed, so the squash commit's parent stays at the fork point.
 #
-# Usage: squash [--base REF] (-m MSG | -F FILE)
+# Usage: squash [--base REF] [-m MSG | -F FILE]
 set -euo pipefail
 
 # readlink -f, not `cd -P`: bin/ is reached through a symlink on PATH, and
@@ -16,7 +16,7 @@ LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 
 usage() {
 	cat >&2 <<'EOF'
-usage: squash [--base REF] (-m MSG | -F FILE)
+usage: squash [--base REF] [-m MSG | -F FILE]
 
   --base REF   ref to compute the fork point against (default: origin/main)
   -m MSG       commit message
@@ -38,14 +38,10 @@ while [ $# -gt 0 ]; do
 	esac
 done
 
-# A lane cannot answer an editor. Both message forms are required so the
+# A lane cannot answer an editor. Both message forms are supported so the
 # tool never has to guess and never has to launch a prompt.
 if [ -n "$MSG_TEXT" ] && [ -n "$MSG_FILE" ]; then
 	echo "squash: -m and -F are mutually exclusive" >&2
-	exit 2
-fi
-if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
-	echo "squash: a commit message is required (-m MSG or -F FILE)" >&2
 	exit 2
 fi
 
@@ -76,16 +72,75 @@ fi
 
 PRE=$(git rev-parse HEAD)
 MERGE_BASE=$(git merge-base "$BASE" HEAD)
+COUNT=$(git rev-list --count "$MERGE_BASE"..HEAD)
 
-# Already squashed: HEAD equals the fork, or sits one commit on top of it.
-# Exit 0 so a re-run after a successful squash reads as success.
-if [ "$PRE" = "$MERGE_BASE" ]; then
+# The message the caller wants on the commit, in the form git stores it.
+# `git stripspace` is the same cleanup git applies to a commit message, so
+# the comparison below is against the message git would actually write.
+desired_message() {
+	if [ -n "$MSG_FILE" ]; then
+		git stripspace <"$MSG_FILE"
+	else
+		printf '%s\n' "$MSG_TEXT" | git stripspace
+	fi
+}
+
+# The message HEAD carries now, in the same form.
+current_message() {
+	git cat-file commit HEAD | sed '1,/^$/d'
+}
+
+# Nothing to squash: HEAD is at the fork point, or one commit on top of it.
+# A message needs a commit to sit on, so the fork point refuses one.
+if [ "$COUNT" -eq 0 ]; then
+	if [ -n "$MSG_TEXT" ] || [ -n "$MSG_FILE" ]; then
+		echo "squash: HEAD is at the fork point ($PRE); there is no commit to put the message on" >&2
+		exit 1
+	fi
 	echo "squash: HEAD is already at the fork point ($PRE); nothing to squash" >&2
 	exit 0
 fi
-if [ "$(git rev-list --count "$MERGE_BASE"..HEAD)" = "1" ]; then
-	echo "squash: HEAD is already one commit on top of the fork ($PRE); nothing to squash" >&2
+
+if [ "$COUNT" -eq 1 ]; then
+	if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
+		echo "squash: HEAD is already one commit on top of the fork ($PRE); nothing to squash" >&2
+		exit 0
+	fi
+
+	if [ "$(current_message)" = "$(desired_message)" ]; then
+		echo "squash: HEAD is already one commit on top of the fork ($PRE) and carries that message; nothing to squash" >&2
+		exit 0
+	fi
+
+	# Only the message moves. `--amend` keeps the author, so a squashed
+	# commit still credits the lane that wrote it.
+	trap 'git reset --soft "$PRE" >/dev/null; exit 1' ERR
+	if [ -n "$MSG_FILE" ]; then
+		git commit --quiet --amend -F "$MSG_FILE"
+	else
+		git commit --quiet --amend -m "$MSG_TEXT"
+	fi
+	trap - ERR
+
+	if ! git diff --quiet "$PRE" HEAD; then
+		POST=$(git rev-parse HEAD)
+		git reset --soft "$PRE" >/dev/null
+		echo "squash: tree changed by the amend (refusing)" >&2
+		echo "  before:  $PRE" >&2
+		echo "  after:   $POST" >&2
+		echo "  undo with: git reset --hard $PRE" >&2
+		exit 1
+	fi
+
+	echo "squash: amended the message on $PRE -> $(git rev-parse HEAD)"
+	echo "  undo with: git reset --hard $PRE"
 	exit 0
+fi
+
+# There is work to squash, so a message is needed to squash it into.
+if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
+	echo "squash: a commit message is required (-m MSG or -F FILE)" >&2
+	exit 2
 fi
 
 git reset --soft "$MERGE_BASE"

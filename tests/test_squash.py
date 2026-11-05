@@ -242,12 +242,30 @@ def case_absolute_F_used_verbatim(failures):
                   "absolute path message\n\n", msg, failures)
 
 
-def case_head_at_fork_exits_zero(failures):
+def case_head_at_fork_refuses_a_message(failures):
+    # A message needs a commit to sit on, so the fork point refuses one
+    # instead of claiming a success it cannot deliver. See issue #175.
     with tempfile.TemporaryDirectory() as tmpdir:
         repo = init_repo(tmpdir)
         pre = head(repo)
 
-        r = run_squash(repo, "--base", "main", "-m", "should be a no-op")
+        msg = Path(tmpdir) / "msg.txt"
+        msg.write_text("a message for nothing\n")
+
+        r = run_squash(repo, "--base", "main", "-F", str(msg))
+
+        assert_rc("head-at-fork exit code", 1, r, failures)
+        assert_in("head-at-fork named", "no commit to put the message on", r.stderr, failures)
+
+        assert_eq("HEAD unchanged at fork", pre, head(repo), failures)
+
+
+def case_head_at_fork_without_message_exits_zero(failures):
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        pre = head(repo)
+
+        r = run_squash(repo, "--base", "main")
 
         assert_rc("head-at-fork exit code", 0, r, failures)
         assert_in("head-at-fork named", "nothing to squash", r.stderr, failures)
@@ -255,18 +273,107 @@ def case_head_at_fork_exits_zero(failures):
         assert_eq("HEAD unchanged at fork", pre, head(repo), failures)
 
 
-def case_single_commit_exits_zero(failures):
+def case_single_commit_amends_the_message(failures):
+    # A finishing run squashes with the coordinator's subject and body. A
+    # branch already one commit on the fork still has to carry that message,
+    # or the exit status says the job is done while the commit disagrees.
+    # See issue #175.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        shas = make_branch_with_commits(repo, n=1)
+        pre = shas[0]
+        pre_tree = git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+
+        msg = Path(tmpdir) / "msg.txt"
+        msg.write_text("the coordinator's subject\n\nand its body\n")
+
+        r = run_squash(repo, "--base", "main", "-F", str(msg))
+
+        assert_rc("single-commit amend exit code", 0, r, failures)
+        assert_in("single-commit amend says what it did", "amended", r.stdout + r.stderr, failures)
+
+        new_head = head(repo)
+        if new_head == pre:
+            fail(failures, "single-commit amend left HEAD on the old commit")
+            return
+
+        got = git(repo, "log", "-1", "--format=%B").stdout
+        assert_eq("single-commit amend carries the new message",
+                  "the coordinator's subject\n\nand its body\n\n", got, failures)
+
+        post_tree = git(repo, "rev-parse", "HEAD^{tree}").stdout.strip()
+        assert_eq("single-commit amend leaves the tree alone", pre_tree, post_tree, failures)
+
+        on_top = git(repo, "rev-list", "--count", f"{pre}..HEAD").stdout.strip()
+        assert_eq("single-commit amend adds no commit", "1", on_top, failures)
+
+
+def case_single_commit_keeps_the_author(failures):
+    # The amend replaces the message, not the credit: the lane that wrote
+    # the commit stays its author.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=1)
+
+        pre_author = git(repo, "log", "-1", "--format=%an <%ae>").stdout.strip()
+
+        msg = Path(tmpdir) / "msg.txt"
+        msg.write_text("a new subject\n")
+
+        r = run_squash(repo, "--base", "main", "-F", str(msg))
+
+        assert_rc("single-commit amend exit code", 0, r, failures)
+
+        post_author = git(repo, "log", "-1", "--format=%an <%ae>").stdout.strip()
+        assert_eq("amend keeps the author", pre_author, post_author, failures)
+
+
+def case_single_commit_with_same_message_is_a_noop(failures):
+    # A re-run after a successful squash reads as success: the commit
+    # already carries the message, so nothing moves.
     with tempfile.TemporaryDirectory() as tmpdir:
         repo = init_repo(tmpdir)
         shas = make_branch_with_commits(repo, n=1)
         pre = shas[0]
 
-        r = run_squash(repo, "--base", "main", "-m", "should be a no-op")
+        msg = Path(tmpdir) / "msg.txt"
+        msg.write_text("the coordinator's subject\n")
 
-        assert_rc("single-commit exit code", 0, r, failures)
-        assert_in("single-commit named", "nothing to squash", r.stderr, failures)
+        first = run_squash(repo, "--base", "main", "-F", str(msg))
+        assert_rc("first amend exit code", 0, first, failures)
+        after_first = head(repo)
+
+        second = run_squash(repo, "--base", "main", "-F", str(msg))
+
+        assert_rc("re-run exit code", 0, second, failures)
+        assert_in("re-run says nothing to squash", "nothing to squash",
+                  second.stdout + second.stderr, failures)
+
+        assert_eq("re-run leaves HEAD alone", after_first, head(repo), failures)
+
+        got = git(repo, "log", "-1", "--format=%B").stdout
+        assert_eq("re-run keeps the message",
+                  "the coordinator's subject\n\n", got, failures)
+
+
+def case_single_commit_without_message_exits_zero(failures):
+    # Nothing to squash and nothing to say: the tool leaves the commit
+    # alone and says so.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        shas = make_branch_with_commits(repo, n=1)
+        pre = shas[0]
+        pre_msg = git(repo, "log", "-1", "--format=%B").stdout
+
+        r = run_squash(repo, "--base", "main")
+
+        assert_rc("single-commit no-message exit code", 0, r, failures)
+        assert_in("single-commit no-message named", "nothing to squash",
+                  r.stdout + r.stderr, failures)
 
         assert_eq("HEAD unchanged on already-squashed branch", pre, head(repo), failures)
+        assert_eq("message unchanged on already-squashed branch", pre_msg,
+                  git(repo, "log", "-1", "--format=%B").stdout, failures)
 
 
 def case_commit_failure_restores_head(failures):
@@ -299,8 +406,11 @@ def main():
             print(f"FAIL {f}")
         return 1
     print("PASS squash: moving-base -> 1 commit + tree unchanged; "
-          "dirty index/tracked/no-message/missing-F refuse; "
-          "head-at-fork/one-commit exit 0; commit failure restores HEAD; "
+          "dirty index/tracked/missing-F refuse; "
+          "head-at-fork refuses a message, no-message exits 0; "
+          "one-commit amends the message, keeps the author, "
+          "same message is a no-op (issue #175); "
+          "commit failure restores HEAD; "
           "relative -F resolves from caller's CWD (issue #86)")
     return 0
 
@@ -309,7 +419,12 @@ CASES = (case_moving_base_preserves_tree, case_dirty_index_refuses,
          case_dirty_working_tree_refuses, case_no_message_refuses,
          case_missing_F_file_refuses, case_relative_F_from_subdir_uses_subdir_file,
          case_relative_F_missing_at_caller_refuses, case_absolute_F_used_verbatim,
-         case_head_at_fork_exits_zero, case_single_commit_exits_zero,
+         case_head_at_fork_refuses_a_message,
+         case_head_at_fork_without_message_exits_zero,
+         case_single_commit_amends_the_message,
+         case_single_commit_keeps_the_author,
+         case_single_commit_with_same_message_is_a_noop,
+         case_single_commit_without_message_exits_zero,
          case_commit_failure_restores_head)
 
 if __name__ == "__main__":
