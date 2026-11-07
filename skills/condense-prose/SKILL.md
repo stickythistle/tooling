@@ -68,6 +68,10 @@ A block in a `skills/*/SKILL.md` carries the context mark `skill-file`. It is
 not a finding: the block is still scanned, and a restatement in a skill file
 is still reported. The mark says how to read a finding there.
 
+A block in a `tests/` file is never `oversize`: a test docstring states its
+setup and the response shape it pins, and the limit cuts the fact the test
+exists for. Other findings still apply there.
+
 ## Cut beyond what the finder sees
 
 - **Same rule stated three ways.** Keep one. "Verification accumulates … a requirement is verified by the set of tests that mark it … so a partial test still marks it" is one sentence, not three.
