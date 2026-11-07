@@ -1124,6 +1124,141 @@ def case_diff_sql_new_block_is_oversize(failures: list[str]) -> None:
                       path="migrations/0001_users.sql", prefix="--")
 
 
+def _docstring_source(words: int, tail: str = "") -> str:
+    """A Python file whose module docstring runs to ``words`` words.
+
+    The words carry no meaning of their own, so what the finder says
+    about the block comes from its length and from the path it sits at.
+    """
+    body = " ".join(f"w{i}" for i in range(words))
+    return f'"""{body}{tail}"""\n'
+
+
+def _added_file_findings(failures: list[str], *, label: str, path: str,
+                         source: str) -> list[dict]:
+    """Add ``source`` at ``path`` in a throwaway repo, then read the
+    findings the finder reports for the diff that added it."""
+    with tempfile.TemporaryDirectory() as tmp:
+        repo = init_repo(Path(tmp))
+        target = repo / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+        git(repo, "add", path)
+        git(repo, "commit", "-q", "-m", f"add {path}")
+        proc = run_find_prose(path, "--diff", "HEAD~1..HEAD", cwd=repo)
+        if proc.returncode != 0:
+            fail(failures, f"{label}: scanner returned non-zero",
+                 f"rc={proc.returncode} stderr={proc.stderr!r}")
+            return []
+        return blocks_for(proc)
+
+
+def case_test_file_docstring_is_not_oversize(failures: list[str]) -> None:
+    """A new file under `tests/` whose docstring runs to 80 words carries no
+    `oversize` finding.
+
+    A test docstring states the case's setup and the response shape it
+    pins, and the 40-word limit cuts the fact the test exists for.
+    """
+    blocks = _added_file_findings(failures, label="test-file",
+                                  path="tests/test_widget.py",
+                                  source=_docstring_source(80))
+    oversize = [b for b in blocks if "oversize" in b["findings"]]
+    if oversize:
+        fail(failures, "test-file: the test docstring was flagged oversize",
+             f"findings={[b['findings'] for b in oversize]}")
+
+    # The control: the same docstring outside a test directory is
+    # oversize, so the fixture really is over the threshold.
+    control = _added_file_findings(failures, label="test-file-control",
+                                   path="pkg/widget.py",
+                                   source=_docstring_source(80))
+    if not [b for b in control if "oversize" in b["findings"]]:
+        fail(failures, "test-file: the control file was not flagged oversize",
+             f"findings={[(b['path'], b['findings']) for b in control]}")
+
+
+def case_nested_test_file_docstring_is_not_oversize(failures: list[str]) -> None:
+    """The rule reaches a test directory at any depth: a file under
+    `pkg/tests/` carries no `oversize` finding either."""
+    blocks = _added_file_findings(failures, label="nested-test-file",
+                                  path="pkg/tests/test_widget.py",
+                                  source=_docstring_source(80))
+    oversize = [b for b in blocks if "oversize" in b["findings"]]
+    if oversize:
+        fail(failures,
+             "nested-test-file: the test docstring was flagged oversize",
+             f"findings={[b['findings'] for b in oversize]}")
+
+
+def case_bin_script_docstring_is_still_oversize(failures: list[str]) -> None:
+    """A 60-word docstring in a `bin/` script is still `oversize`, with and
+    without `--diff`: the exemption follows the path, and `bin/` sits
+    outside it."""
+    source = "#!/usr/bin/env python3\n" + _docstring_source(60)
+
+    # Without a diff: the whole block is judged.
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        target = cwd / "bin" / "widget"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+        proc = run_find_prose("bin/widget", cwd=cwd)
+        blocks = blocks_for(proc)
+        if not [b for b in blocks if "oversize" in b["findings"]]:
+            fail(failures, "bin-script: the docstring was not flagged oversize",
+                 f"findings={[(b['path'], b['findings']) for b in blocks]}")
+
+    # With a diff: the whole file is new, so every word of it is added.
+    blocks = _added_file_findings(failures, label="bin-script",
+                                  path="bin/widget", source=source)
+    if not [b for b in blocks if "oversize" in b["findings"]]:
+        fail(failures,
+             "bin-script: the docstring was not flagged oversize under --diff",
+             f"findings={[(b['path'], b['findings']) for b in blocks]}")
+
+
+def case_test_file_negative_space_is_still_flagged(failures: list[str]) -> None:
+    """A test file's blocks are still scanned: a negative-space sentence in
+    a test docstring is flagged, so the exemption covers size alone."""
+    source = _docstring_source(60, tail=" This case does not check the file.")
+    with tempfile.TemporaryDirectory() as tmp:
+        cwd = Path(tmp)
+        target = cwd / "tests" / "test_widget.py"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(source)
+        proc = run_find_prose("tests/test_widget.py", cwd=cwd)
+        blocks = blocks_for(proc)
+        mine = [b for b in blocks if b["path"] == "tests/test_widget.py"]
+        if not mine:
+            fail(failures,
+                 "test-file-negative-space: the docstring was not reported",
+                 f"blocks={blocks!r}")
+            return
+        if "negative-space" not in mine[0]["findings"]:
+            fail(failures,
+                 "test-file-negative-space: the sentence was not flagged",
+                 f"findings={mine[0]['findings']!r}")
+        if "oversize" in mine[0]["findings"]:
+            fail(failures,
+                 "test-file-negative-space: the docstring was flagged oversize",
+                 f"findings={mine[0]['findings']!r}")
+
+
+def case_tests_like_path_is_still_oversize(failures: list[str]) -> None:
+    """The rule anchors on a whole `tests` path segment, so a directory
+    whose name merely starts with `tests` stays outside it."""
+    for path in ("contests/a.py", "bin/tests-helper"):
+        source = _docstring_source(60)
+        if path.startswith("bin/"):
+            source = "#!/usr/bin/env python3\n" + source
+        blocks = _added_file_findings(failures, label="tests-like",
+                                      path=path, source=source)
+        if not [b for b in blocks if "oversize" in b["findings"]]:
+            fail(failures, f"tests-like: {path} was not flagged oversize",
+                 f"findings={[(b['path'], b['findings']) for b in blocks]}")
+
+
 def main() -> int:
     failures: list[str] = []
     case_rust_extension_in_prose_set(failures)
@@ -1158,6 +1293,11 @@ def main() -> int:
     case_diff_doc_new_block_is_oversize(failures)
     case_diff_sql_added_paragraph_is_not_oversize(failures)
     case_diff_sql_new_block_is_oversize(failures)
+    case_test_file_docstring_is_not_oversize(failures)
+    case_nested_test_file_docstring_is_not_oversize(failures)
+    case_bin_script_docstring_is_still_oversize(failures)
+    case_test_file_negative_space_is_still_flagged(failures)
+    case_tests_like_path_is_still_oversize(failures)
 
     if failures:
         print("FAIL", file=sys.stderr)

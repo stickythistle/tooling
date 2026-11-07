@@ -103,6 +103,11 @@ WORD = re.compile(r"[A-Za-z][A-Za-z0-9_]+")
 # finding.
 SKILL_FILE = re.compile(r"(^|/)skills/[^/]+/SKILL\.md$")
 
+# A test file's prose states the case: what it sets up and the response
+# shape it pins. Cutting it to 40 words cuts the fact the test exists for.
+# Every other finding still applies there.
+TEST_FILE = re.compile(r"(^|/)tests/")
+
 STOPWORDS = frozenset(
     "a an the and or but if is are was were be been being to of in on for with "
     "that this it its as at by from so no not can will each every one two per "
@@ -523,12 +528,14 @@ def collect(
         # A skill file's blocks are marked, not protected: the mark says
         # how to read a finding there, it does not stand in for one.
         in_skill = bool(SKILL_FILE.search(rel))
+        in_test = bool(TEST_FILE.search(rel))
         for block in found:
             if in_skill:
                 block.context.append("skill-file")
             # A table's length comes from its row count, so no table is
             # oversize. The per-row checks below still apply to it.
-            if block.kind != "table" and block.words > min_words:
+            if (block.kind != "table" and not in_test
+                    and block.words > min_words):
                 # Under `--diff` the size is what the diff wrote: a block
                 # that grew by a paragraph is judged on that paragraph, and
                 # the lines it inherited stay available to the other
