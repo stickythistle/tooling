@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Post one owner-written review at the named head, or post nothing.
+set -euo pipefail
+
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+exec python3 "$LIB/review_post.py" "$@"
