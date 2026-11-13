@@ -72,6 +72,7 @@ def good_facts(**over):
         "pending_names": [],
         "failing_names": [],
         "third_party": [],
+        "threads": [],
         "labels": [],
     }
     facts.update(over)
@@ -442,6 +443,75 @@ def case_a_third_party_comment_is_refused(failures: list[str]) -> None:
                        "was made", detail)
 
 
+def case_an_unanswered_thread_by_the_implementers_login_is_refused(failures: list[str]) -> None:
+    # A thread's author never decides whether it needs an answer: the
+    # reviewer posting as the implementer's login merged its findings
+    # unanswered.
+    verdict = mc.decide(**good_facts(threads=[thread_node(author=IMPLEMENTER)]))
+    if verdict.ok:
+        fail(failures, "threads: an unanswered thread by the implementer's "
+                       "login was not refused")
+        return
+    if not any(f.check == "threads" for f in verdict.failures):
+        fail(failures, "threads: the refusal does not name the threads check",
+             str(verdict.failures))
+        return
+    detail = " ".join(f.detail for f in verdict.failures)
+    if "a.txt:3" not in detail:
+        fail(failures, "threads: the refusal does not say where the thread "
+                       "is", detail)
+    if IMPLEMENTER not in detail:
+        fail(failures, "threads: the refusal does not name who started the "
+                       "thread", detail)
+
+
+def case_an_unanswered_thread_by_the_reviewer_is_refused(failures: list[str]) -> None:
+    # The rule is author-blind: the reviewer's own finding waits for an
+    # answer as much as anybody else's.
+    verdict = mc.decide(**good_facts(threads=[thread_node(author=REVIEWER)]))
+    if verdict.ok:
+        fail(failures, "threads: an unanswered thread by the reviewer was "
+                       "not refused")
+
+
+def case_a_replied_thread_passes(failures: list[str]) -> None:
+    # Two comments: the finding and a reply to it. The thread is still
+    # open, and an open thread somebody answered asks nothing of the merge.
+    verdict = mc.decide(**good_facts(threads=[thread_node(comments=2)]))
+    if not verdict.ok:
+        fail(failures, "threads: an answered thread stopped the merge",
+             str(verdict.failures))
+
+
+def case_a_resolved_thread_passes(failures: list[str]) -> None:
+    # Resolved with no reply: whoever read it decided it needed none.
+    verdict = mc.decide(**good_facts(threads=[thread_node(resolved=True)]))
+    if not verdict.ok:
+        fail(failures, "threads: a resolved thread stopped the merge",
+             str(verdict.failures))
+
+
+def case_an_outdated_unanswered_thread_names_where_it_was(failures: list[str]) -> None:
+    # The code moved out from under the comment, so `line` is null.
+    # Moving is no answer; the refusal names where it was written.
+    verdict = mc.decide(**good_facts(
+        threads=[thread_node("b.txt", 9, outdated=True, original_line=12)]))
+    if verdict.ok:
+        fail(failures, "threads: an unanswered outdated thread was not refused")
+        return
+    detail = " ".join(f.detail for f in verdict.failures)
+    if "b.txt:12" not in detail:
+        fail(failures, "threads: the refusal does not name the line the "
+                       "thread was written against", detail)
+
+
+def case_no_review_threads_pass(failures: list[str]) -> None:
+    verdict = mc.decide(**good_facts(threads=[]))
+    if not verdict.ok:
+        fail(failures, "threads: a pull request with no threads was refused",
+             str(verdict.failures))
+
+
 def case_a_needs_decision_label_is_refused(failures: list[str]) -> None:
     verdict = mc.decide(**good_facts(labels=["needs-decision"]))
     if verdict.ok:
@@ -497,7 +567,7 @@ FAKE_GH = textwrap.dedent("""\
     # by the endpoints that answer a read. A call that carries a field
     # without `-X GET` is refused here too, so the defect is caught in
     # the suite and not only on a real pull request.
-    if args and args[0] == "api":
+    if args and args[0] == "api" and args[1:2] != ["graphql"]:
         has_field = any(a == "-f" or a == "-F" for a in args)
         names_get = any(a == "GET" for a in args)
         if has_field and not names_get:
@@ -505,6 +575,38 @@ FAKE_GH = textwrap.dedent("""\
                   "read", file=sys.stderr)
             sys.exit(1)
     canned = json.load(open(os.environ["FAKE_GH_DATA"]))
+    if args[:2] == ["api", "graphql"]:
+        # GraphQL reads travel as POSTs by design, so the guard above
+        # does not reach them. Pages come back in the order a driver
+        # asks for them, and any page after the first has to be asked
+        # for with the cursor the page before handed out; a driver that
+        # never follows the cursor gets an error rather than the page it
+        # already had.
+        pages = canned.get("graphql_threads") or []
+        plog = os.environ["FAKE_GH_LOG"] + ".graphql"
+        seen = (len(open(plog).read().splitlines())
+                if os.path.exists(plog) else 0)
+        after = next((a.split("=", 1)[1] for a in args
+                      if a.startswith("after=")), None)
+        if seen:
+            want = (pages[min(seen - 1, len(pages) - 1)]["pageInfo"].get("endCursor")
+                    if pages else None)
+            if after != want:
+                print("graphql: page %d asked for with cursor %r, not %r"
+                      % (seen + 1, after, want), file=sys.stderr)
+                sys.exit(1)
+        with open(plog, "a") as f:
+            f.write(json.dumps(args) + "\\n")
+        if canned.get("graphql_fail"):
+            print("graphql: Could not resolve to a PullRequest",
+                  file=sys.stderr)
+            sys.exit(1)
+        page = (pages[seen] if seen < len(pages) else pages[-1] if pages
+                else {"nodes": [],
+                      "pageInfo": {"hasNextPage": False, "endCursor": None}})
+        print(json.dumps({"data": {"repository": {"pullRequest": {
+            "reviewThreads": page}}}}))
+        sys.exit(0)
     if args and args[0] == "pr":
         # `gh pr view N --json statusCheckRollup`
         print(json.dumps({"statusCheckRollup":
@@ -634,6 +736,34 @@ def make_multi_commit_repo(tmp: Path, oldest_author: dict) -> tuple[Path, str, s
     return clone, head, main
 
 
+def thread_node(path: str = "a.txt", line: int = 3, *, resolved: bool = False,
+                outdated: bool = False, original_line: int | None = None,
+                comments: int = 1, author: str = IMPLEMENTER) -> dict:
+    """A `reviewThreads` node, as GraphQL reports it.
+
+    `comments` is `comments.totalCount`: one is the finding alone, more is
+    a finding with a reply. An outdated thread's `line` is null; its
+    `originalLine` is where it was written.
+    """
+    nodes = [{"author": {"login": author}, "createdAt": "2026-01-02T00:00:00Z"}]
+    if comments > 1:
+        nodes.append({"author": {"login": REVIEWER},
+                      "createdAt": "2026-01-03T00:00:00Z"})
+    if outdated and original_line is None:
+        original_line = line
+    return {"isResolved": resolved, "isOutdated": outdated, "path": path,
+            "line": None if outdated else line,
+            "originalLine": original_line,
+            "comments": {"totalCount": comments, "nodes": nodes}}
+
+
+def thread_page(nodes: list, *, next_cursor: str | None = None) -> dict:
+    """One `reviewThreads` page: its nodes and the cursor to the next one."""
+    return {"nodes": nodes,
+            "pageInfo": {"hasNextPage": next_cursor is not None,
+                         "endCursor": next_cursor}}
+
+
 def review(state: str, commit_id: str, *, id: int = 1,
            submitted_at: str = "2026-01-02T00:00:00Z",
            login: str = REVIEWER) -> dict:
@@ -650,7 +780,7 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
           contributing=None, feature_message: str = FEATURE_MESSAGE,
           feature_author: dict = FEATURE_AUTHOR,
           check_runs=None, issue_comments=None, inline_comments=None,
-          status=None, rollup=None):
+          status=None, rollup=None, threads=None, thread_pages=None):
     """A clone, a fake gh, and the environment that runs the driver."""
     clone, head, main = make_repo(tmp, feature_message=feature_message,
                                   feature_author=feature_author)
@@ -702,6 +832,10 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
         "reviews": reviews,
         "issue_comments": issue_comments if issue_comments is not None else [],
         "inline_comments": inline_comments if inline_comments is not None else [],
+        # The review threads GraphQL answers. No threads is the ordinary
+        # case: a pull request nobody annotated inline.
+        "graphql_threads": (thread_pages if thread_pages is not None
+                            else [thread_page(threads or [])]),
     }))
 
     if contributing is not None:
@@ -1306,7 +1440,9 @@ def case_the_stub_refuses_a_read_sent_as_a_post(failures: list[str]) -> None:
                         if json.loads(line)[:2] !=
                         ["api", "repos/O/R/commits/abc/check-runs"]]
         for args in driver_calls:
-            if args and args[0] == "api":
+            # GraphQL reads are POSTs by design, so only the REST reads
+            # are held to the guard.
+            if args and args[0] == "api" and args[1:2] != ["graphql"]:
                 has_field = any(a in ("-f", "-F") for a in args)
                 names_get = any(a == "GET" for a in args)
                 if has_field and not names_get:
@@ -1531,6 +1667,90 @@ def case_the_driver_refuses_a_head_that_moved_during_the_check(failures: list[st
                  r.stderr)
 
 
+def case_the_driver_refuses_an_unanswered_thread(failures: list[str]) -> None:
+    # The thread is read through GraphQL and refused end to end, and the
+    # refusal lands beside the label's: every check runs whatever else
+    # refused.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(
+            tmp, labels=["needs-decision"],
+            threads=[thread_node("src/a.py", 42, author=IMPLEMENTER)])
+        # The thread's author is declared the loop's own: it still
+        # blocks, because an author is no say about whether a finding is
+        # answered.
+        env["IMPLEMENTER_LOGINS"] = IMPLEMENTER
+        r = run(env, clone)
+        if r.returncode == 0:
+            fail(failures, "threads: an unanswered thread was accepted",
+                 r.stdout)
+            return
+        if "src/a.py:42" not in r.stderr:
+            fail(failures, "threads: the refusal does not say where the "
+                           "thread is", r.stderr)
+        if IMPLEMENTER not in r.stderr:
+            fail(failures, "threads: the refusal does not name who started "
+                           "the thread", r.stderr)
+        if "needs-decision" not in r.stderr:
+            fail(failures, "threads: the thread refusal hid the label "
+                           "refusal", r.stderr)
+
+
+def case_the_driver_follows_the_thread_cursor_to_the_last_page(failures: list[str]) -> None:
+    # A long review round passes 100 threads and GraphQL answers a
+    # hundred a page. Reading only the first page calls the pull request
+    # ready over a finding on the second.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        answered = [thread_node(f"f{n}.txt", n + 1, comments=2)
+                    for n in range(100)]
+        clone, _head, _main, env = setup(tmp, thread_pages=[
+            thread_page(answered, next_cursor="cur-2"),
+            thread_page([thread_node("late.txt", 7, author=IMPLEMENTER)])])
+        r = run(env, clone)
+        if r.returncode == 0:
+            fail(failures, "threads: an unanswered thread on the second page "
+                           "was accepted", r.stdout)
+            return
+        if "late.txt:7" not in r.stderr:
+            fail(failures, "threads: the refusal does not name the thread on "
+                           "the second page", r.stderr)
+
+
+def case_the_driver_fails_when_review_threads_cannot_be_read(failures: list[str]) -> None:
+    # "Could not check" is never "nothing to answer": the run ends the
+    # way any failed fetch does, naming what could not be read.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(tmp)
+        data = json.loads(Path(env["FAKE_GH_DATA"]).read_text())
+        data["graphql_fail"] = True
+        Path(env["FAKE_GH_DATA"]).write_text(json.dumps(data))
+        r = run(env, clone)
+        if r.returncode != 1:
+            fail(failures, "threads: a failed thread fetch did not exit 1",
+                 f"rc={r.returncode} stdout={r.stdout}")
+            return
+        if not r.stderr.startswith("ERR "):
+            fail(failures, "threads: the failure is not reported as a fetch "
+                           "error", r.stderr)
+        if "review threads" not in r.stderr:
+            fail(failures, "threads: the failure does not name what could "
+                           "not be read", r.stderr)
+
+
+def case_the_driver_passes_a_pull_request_with_no_threads(failures: list[str]) -> None:
+    # An empty thread list is nothing to answer, not a fetch failure.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(tmp, threads=[])
+        r = run(env, clone)
+        if r.returncode != 0:
+            fail(failures, "threads: a pull request with no review threads "
+                           "was refused",
+                 f"rc={r.returncode} stderr={r.stderr}")
+
+
 def case_the_driver_runs_in_a_named_worktree(failures: list[str]) -> None:
     # The worktree is the lane's checkout, not the caller's directory.
     # Run from a different directory, naming the checkout as the
@@ -1605,6 +1825,12 @@ def main() -> int:
     case_a_superseded_run_of_another_check_is_not_dropped(failures)
     case_a_wrong_committer_is_refused(failures)
     case_a_third_party_comment_is_refused(failures)
+    case_an_unanswered_thread_by_the_implementers_login_is_refused(failures)
+    case_an_unanswered_thread_by_the_reviewer_is_refused(failures)
+    case_a_replied_thread_passes(failures)
+    case_a_resolved_thread_passes(failures)
+    case_an_outdated_unanswered_thread_names_where_it_was(failures)
+    case_no_review_threads_pass(failures)
     case_a_needs_decision_label_is_refused(failures)
     case_every_check_runs_after_one_fails(failures)
     case_the_trailer_needs_its_own_line(failures)
@@ -1641,6 +1867,10 @@ def main() -> int:
     case_the_driver_reads_the_latest_approval_when_api_order_lies(failures)
     case_a_later_push_after_the_last_approval_is_refused(failures)
     case_the_driver_refuses_a_head_that_moved_during_the_check(failures)
+    case_the_driver_refuses_an_unanswered_thread(failures)
+    case_the_driver_follows_the_thread_cursor_to_the_last_page(failures)
+    case_the_driver_fails_when_review_threads_cannot_be_read(failures)
+    case_the_driver_passes_a_pull_request_with_no_threads(failures)
     case_the_driver_runs_in_a_named_worktree(failures)
     case_a_usage_error_exits_2(failures)
     case_an_unreadable_pull_request_exits_1(failures)
