@@ -10,5 +10,5 @@
 
 [[gates]]
 name = "merge-check tests"
-when = '^(bin/merge-check|lib/merge_check\.py|lib/pr_gate\.py|lib/roles\.py|tests/test_merge_check\.py)$'
+when = '^(bin/merge-check|lib/merge_check\.py|lib/pr_gate\.py|lib/roles\.py|lib/review_threads\.py|tests/test_merge_check\.py)$'
 run = "python3 tests/test_merge_check.py"
