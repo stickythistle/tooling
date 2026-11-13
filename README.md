@@ -275,8 +275,9 @@ itself.
     main-watch-run owner/repo [owner/repo...]
 
 It judges every `main` commit since the commit it last judged, and sends one
-Telegram message when a commit broke the branch. The position it keeps is per
-repository, under
+message when a commit broke the branch. The message goes to a notify relay
+when the env file names one, and to Telegram otherwise. The position it keeps
+is per repository, under
 `${XDG_STATE_HOME:-$HOME/.local/state}/main-watch/<owner>__<repo>`, so a second
 run over the same commits judges nothing and says nothing.
 
@@ -291,6 +292,33 @@ same commits again.
 
 A missing variable, a missing file, or either key missing or empty is refused
 by name and exits 2. The token never appears in any output.
+
+**Or a relay.** Where a notify relay holds the bot token, the host holds a
+client token of its own instead, and that token can be cut off without
+touching the other hosts. Two keys select that path:
+
+    NOTIFY_RELAY_URLS=https://relay-one https://relay-two
+    NOTIFY_RELAY_TOKEN=...
+
+`NOTIFY_RELAY_URLS` is a space-separated, ordered list. The relay is used
+when the list is not empty; without it, the Telegram path is used.
+
+With the list set, `NOTIFY_RELAY_TOKEN` is required and the Telegram keys are
+not; its absence is refused by name and exits 2. The relay token never appears
+in any output.
+
+The message is posted to `<url>/send`, with the token in an
+`Authorization: Bearer` header and the text as a JSON `{"text": ...}` body.
+The relay is reached over TLS, with its certificate verified against the
+host's trust store.
+
+- A `202` means the relay took the message and delivers it itself; any other
+  2xx is taken as accepted too.
+- A `4xx` means the relay refused this client: the run fails, naming the
+  relay and its status. No other relay is tried: a working fallback would
+  hide a revoked token behind it.
+- A `5xx` or an unreachable relay falls through to the next URL.
+- When every URL has failed, the run fails naming each one.
 
 **The timer.** Any timer that can run a command will do. A crontab entry on the
 host, running as the user whose state directory holds the position:
