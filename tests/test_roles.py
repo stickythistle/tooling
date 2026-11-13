@@ -351,6 +351,13 @@ FAKE_GH = textwrap.dedent("""\
         print(json.dumps({"statusCheckRollup":
                           canned.get("statusCheckRollup", [])}))
         sys.exit(0)
+    if args[:2] == ["api", "graphql"]:
+        # The review-threads query: one page, no threads.
+        print(json.dumps({"data": {"repository": {"pullRequest": {
+            "reviewThreads": {"nodes": [],
+                              "pageInfo": {"hasNextPage": False,
+                                           "endCursor": None}}}}}}))
+        sys.exit(0)
     canned = json.load(open(os.environ["FAKE_GH_DATA"]))
     path = args[1] if len(args) > 1 else ""
     if path.endswith("/reviews"):
