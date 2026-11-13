@@ -1,25 +1,54 @@
 #!/usr/bin/env python3
-"""Pin bin/push-guard: a push that deletes files main added after the branch's
-last push is refused, and ordinary pushes are not.
+"""Pin bin/push-guard: a push that carries a secret is refused, a push that
+deletes files main added after the branch's last push is refused, and
+ordinary pushes pass.
 
-A bare repository in a temp dir stands in for the remote; no network.
+A bare repository in a temp dir stands in for the remote; no network. The
+secret cases run the real gitleaks.
 """
+import hashlib
 import os
 import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PUSH_GUARD = REPO_ROOT / "bin" / "push-guard"
 HOOK = REPO_ROOT / "hooks" / "pre-push"
+GITLEAKS_PIN = REPO_ROOT / "install" / "gitleaks" / "pin"
+INSTALLER = REPO_ROOT / "install" / "gitleaks" / "install.sh"
+
+# The scanner the guard runs, the same way an operator names it:
+# PUSH_GUARD_GITLEAKS if it is set, else gitleaks on PATH.
+GITLEAKS = os.environ.get("PUSH_GUARD_GITLEAKS") or shutil.which("gitleaks")
+
+# The token the secret cases plant, assembled at run time. Written out in
+# full it would put a secret-shaped string in this repository's own
+# history, and this repository's own pushes are scanned by the same guard.
+PAT_PREFIX = "gh" + "p_"
+PAT_BODY = "aB3xK9pQ7zM2" * 3
 
 IDENTITY = {"GIT_AUTHOR_NAME": "push-guard-test",
             "GIT_AUTHOR_EMAIL": "push-guard-test@example.com",
             "GIT_COMMITTER_NAME": "push-guard-test",
             "GIT_COMMITTER_EMAIL": "push-guard-test@example.com"}
+
+
+def pat():
+    """The planted token, built at run time."""
+    return PAT_PREFIX + PAT_BODY
+
+
+def pinned_version():
+    """The version install/gitleaks/pin pins."""
+    for line in GITLEAKS_PIN.read_text().splitlines():
+        if line.startswith("version="):
+            return line.split("=", 1)[1].strip()
+    return ""
 
 
 def git(cwd, *args, env=None, check=True):
@@ -30,9 +59,13 @@ def git(cwd, *args, env=None, check=True):
 
 def env_with_identity(extra=None):
     e = {"PATH": "/usr/bin:/bin", "HOME": str(Path.home()), **IDENTITY}
+    if GITLEAKS:
+        e["PUSH_GUARD_GITLEAKS"] = GITLEAKS
     if extra:
         e.update(extra)
-    return e
+    # A None value drops the name, so a case can leave the guard to
+    # find the scanner itself.
+    return {k: v for k, v in e.items() if v is not None}
 
 
 def init_repo(parent):
@@ -1109,12 +1142,683 @@ def case_duplicate_patch_recovery_pushes_cleanly(failures):
                       failures)
 
 
+# ---------------------------------------------------------------------------
+# The secret scan: the commits a push carries are scanned, and a secret in
+# them refuses the push.
+# ---------------------------------------------------------------------------
+
+
+def scenario_with_secret_on_branch(tmp, secret_path="config/credentials.txt"):
+    """A branch already on the remote, with a new commit that adds a token.
+
+    Returns (repo, pushed_sha, tip): pushed_sha is what the remote holds,
+    tip is the commit the push would carry.
+    """
+    repo = init_repo(tmp)
+    setup_remote(repo)
+
+    git(repo, "checkout", "-q", "-b", "feat")
+    (repo / "feat.txt").write_text("feat\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feat on top")
+    pushed_sha = head_of(repo)
+    git(repo, "push", "-q", "-u", "origin", "feat")
+    git(repo, "update-ref", "refs/remotes/origin/feat", pushed_sha)
+
+    (repo / secret_path).parent.mkdir(parents=True, exist_ok=True)
+    (repo / secret_path).write_text(f"value = {pat()}\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "add credentials")
+    tip = head_of(repo)
+
+    return repo, pushed_sha, tip
+
+
+def write_stub(path, body):
+    """A fake gitleaks: a script that answers what the guard asks."""
+    path.write_text("#!/usr/bin/env bash\n" + body)
+    path.chmod(0o755)
+    return str(path)
+
+
+def case_secret_in_pushed_commit_refused(failures):
+    """A push whose new commit carries a token is refused. The refusal
+    names the rule, the file, the line and the commit -- and never the
+    token itself, because the lane's output is logged."""
+    with tempfile.TemporaryDirectory() as t:
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(Path(t))
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("secret refused", 1, r, failures)
+        assert_in("secret names the rule", "github-pat", r.stderr, failures)
+        assert_in("secret names the file",
+                  "config/credentials.txt", r.stderr, failures)
+        assert_in("secret names the line", ":1", r.stderr, failures)
+        assert_in("secret names the commit", tip[:12], r.stderr, failures)
+        # The token never reaches the output.
+        assert_not_in("secret keeps the token out of stdout",
+                      pat(), r.stdout, failures)
+        assert_not_in("secret keeps the token out of stderr",
+                      pat(), r.stderr, failures)
+
+
+def case_secret_survives_no_ack(failures):
+    """PUSH_GUARD_ACK=1 acknowledges the three shape checks and stops at
+    the secret check: a false positive is fixed in the repository's
+    .gitleaks.toml, where review sees it."""
+    with tempfile.TemporaryDirectory() as t:
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(Path(t))
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo, env_extra={"PUSH_GUARD_ACK": "1"})
+
+        assert_rc("secret is refused under ack", 1, r, failures)
+        assert_in("secret names the rule under ack",
+                  "github-pat", r.stderr, failures)
+        assert_not_in("secret keeps the token out of stderr under ack",
+                      pat(), r.stderr, failures)
+
+
+def case_secret_on_a_new_branch_refused(failures):
+    """A branch the remote has never seen is scanned too: the range is every
+    commit the remote is missing."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "fresh")
+        (repo / "credentials.txt").write_text(f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/fresh", tip,
+                         "refs/heads/fresh", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("new branch with a secret refused", 1, r, failures)
+        assert_in("new branch names the rule", "github-pat", r.stderr, failures)
+        assert_in("new branch names the file",
+                  "credentials.txt", r.stderr, failures)
+        assert_in("new branch names the commit", tip[:12], r.stderr, failures)
+
+
+def case_secret_on_the_base_branch_refused(failures):
+    """The base branch is scanned too. The shape checks skip it, but a
+    secret pushed straight to main leaks the same way."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+        base_sha = git(repo, "rev-parse",
+                       "refs/remotes/origin/main").stdout.strip()
+
+        (repo / "credentials.txt").write_text(f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/main", tip,
+                         "refs/heads/main", base_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("base branch with a secret refused", 1, r, failures)
+        assert_in("base branch names the rule",
+                  "github-pat", r.stderr, failures)
+        assert_in("base branch names the commit", tip[:12], r.stderr, failures)
+
+
+def case_secret_removed_in_a_later_commit_refused(failures):
+    """A secret added in one commit and removed in the next is still in
+    the history the push carries."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat on top")
+        pushed_sha = head_of(repo)
+        git(repo, "push", "-q", "-u", "origin", "feat")
+        git(repo, "update-ref", "refs/remotes/origin/feat", pushed_sha)
+
+        (repo / "credentials.txt").write_text(f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        secret_sha = head_of(repo)
+
+        git(repo, "rm", "-q", "credentials.txt")
+        git(repo, "commit", "-q", "-m", "remove credentials")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("removed secret refused", 1, r, failures)
+        assert_in("removed secret names the rule",
+                  "github-pat", r.stderr, failures)
+        assert_in("removed secret names the commit",
+                  secret_sha[:12], r.stderr, failures)
+
+
+def case_secret_already_on_the_remote_does_not_refuse(failures):
+    """The range is the remote's gap. A secret in a commit the remote
+    already holds stays out of this push, and refusing every later push
+    of that branch would wedge the lane."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "credentials.txt").write_text(f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        pushed_sha = head_of(repo)
+        git(repo, "push", "-q", "-u", "origin", "feat")
+        git(repo, "update-ref", "refs/remotes/origin/feat", pushed_sha)
+
+        (repo / "clean.txt").write_text("clean\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "clean work")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("a secret the remote already has does not refuse",
+                  0, r, failures)
+
+
+def allowlist_config(paths):
+    """A .gitleaks.toml that extends the default rules and allowlists the
+    given paths."""
+    listed = ", ".join("'''%s'''" % path for path in paths)
+    return ("[extend]\nuseDefault = true\n\n"
+            "[[allowlists]]\n"
+            "description = \"allowlisted paths\"\n"
+            "paths = [%s]\n" % listed)
+
+
+def case_allowlisted_secret_passes(failures):
+    """A secret the repository's .gitleaks.toml allowlists passes: the
+    push proceeds."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        # useDefault extends the default rules; without it they are gone.
+        (repo / ".gitleaks.toml").write_text(allowlist_config(["fixtures/"]))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "allowlist the fixtures")
+        allowlist_sha = head_of(repo)
+        git(repo, "push", "-q", "origin", "main:main")
+        git(repo, "update-ref", "refs/remotes/origin/main", allowlist_sha)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "fixtures").mkdir()
+        (repo / "fixtures" / "credentials.txt").write_text(
+            f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add a fixture")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("allowlisted secret passes", 0, r, failures)
+        assert_not_in("allowlisted secret is not named",
+                      "github-pat", r.stderr, failures)
+
+
+def case_untracked_allowlist_does_not_silence(failures):
+    """An allowlist nobody committed silences nothing. The config the
+    scan reads is the one in the pushed commit, so a file in the working
+    tree that never reaches the remote cannot silence it."""
+    with tempfile.TemporaryDirectory() as t:
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(Path(t))
+
+        # Untracked: nobody on the remote sees this file.
+        (repo / ".gitleaks.toml").write_text(
+            allowlist_config(["config/credentials.txt"]))
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("untracked allowlist refused", 1, r, failures)
+        assert_in("untracked allowlist names the rule",
+                  "github-pat", r.stderr, failures)
+
+
+def case_uncommitted_allowlist_edit_does_not_silence(failures):
+    """An uncommitted edit to .gitleaks.toml changes nothing: the
+    committed config is the one, and the secret is outside its
+    allowlist."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        # Committed, with an allowlist for another path.
+        (repo / ".gitleaks.toml").write_text(allowlist_config(["fixtures/"]))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "allowlist the fixtures")
+
+        # Edited in the working tree, never committed.
+        (repo / ".gitleaks.toml").write_text(
+            allowlist_config(["config/credentials.txt"]))
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "config").mkdir()
+        (repo / "config" / "credentials.txt").write_text(f"value = {pat()}\n")
+        # Staged on its own: the edited config stays uncommitted.
+        git(repo, "add", "config/credentials.txt")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("uncommitted allowlist edit refused", 1, r, failures)
+        assert_in("uncommitted allowlist edit names the rule",
+                  "github-pat", r.stderr, failures)
+
+
+def case_config_in_the_environment_does_not_silence(failures):
+    """A config in the environment silences nothing: gitleaks reads the
+    one in the pushed commit."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(tmp)
+
+        outside = tmp / "outside.toml"
+        outside.write_text(allowlist_config(["config/credentials.txt"]))
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo,
+                      env_extra={"GITLEAKS_CONFIG": str(outside)})
+
+        assert_rc("GITLEAKS_CONFIG refused", 1, r, failures)
+        assert_in("GITLEAKS_CONFIG names the rule",
+                  "github-pat", r.stderr, failures)
+
+        r = run_guard(line, cwd=repo,
+                      env_extra={"GITLEAKS_CONFIG_TOML":
+                                 allowlist_config(["config/credentials.txt"])})
+
+        assert_rc("GITLEAKS_CONFIG_TOML refused", 1, r, failures)
+        assert_in("GITLEAKS_CONFIG_TOML names the rule",
+                  "github-pat", r.stderr, failures)
+
+
+def case_committed_allowlist_silences(failures):
+    """A .gitleaks.toml committed with the secret is the config the scan
+    reads, so the push proceeds."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "config").mkdir()
+        (repo / "config" / "credentials.txt").write_text(f"value = {pat()}\n")
+        (repo / ".gitleaks.toml").write_text(
+            allowlist_config(["config/credentials.txt"]))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add a config and a secret")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("committed allowlist passes", 0, r, failures)
+        assert_not_in("committed allowlist is not named",
+                      "github-pat", r.stderr, failures)
+
+
+def scanner_stub(path, version, marker=None, scan_exit=0):
+    """A stand-in for gitleaks: it reports a version, and a scan leaves a
+    marker behind so a test can see which binary ran."""
+    lines = ["#!/usr/bin/env bash",
+             'if [ "$1" = "version" ]; then echo %s; exit 0; fi' % version]
+    if marker:
+        lines.append('touch "%s"' % marker)
+    lines.append("exit %d" % scan_exit)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+    path.chmod(0o755)
+    return str(path)
+
+
+def pinned_prefix():
+    """The prefix the pin names, with $HOME left for the caller."""
+    for line in GITLEAKS_PIN.read_text().splitlines():
+        if line.startswith("prefix="):
+            return line.split("=", 1)[1].strip()
+    return ""
+
+
+def pinned_scanner_path(home):
+    """Where the pin says the scanner lives, under this HOME."""
+    prefix = pinned_prefix().replace("$HOME", "").strip("/")
+    return Path(home) / prefix / "gitleaks"
+
+
+def clean_branch_push(tmp):
+    """A branch with one clean commit, and the push line for it."""
+    repo = init_repo(tmp)
+    setup_remote(repo)
+    git(repo, "checkout", "-q", "-b", "feat")
+    (repo / "feat.txt").write_text("feat\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "-q", "-m", "feat on top")
+    line = push_line("refs/heads/feat", head_of(repo),
+                     "refs/heads/feat", "0" * 40)
+    return repo, line
+
+
+def case_scanner_on_path_is_used(failures):
+    """A scanner on PATH is the one that runs, whatever sits under the
+    pinned prefix."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, line = clean_branch_push(tmp)
+
+        marker = tmp / "path-marker"
+        path_bin = tmp / "path-bin"
+        scanner_stub(path_bin / "gitleaks", pinned_version(), marker)
+
+        # The one under HOME reports another version, so a guard that
+        # reached for it would refuse the push.
+        home = tmp / "home"
+        scanner_stub(pinned_scanner_path(home), "8.0.0")
+
+        r = run_guard(line, cwd=repo, env_extra={
+            "PATH": f"{path_bin}:/usr/bin:/bin",
+            "HOME": str(home),
+            "PUSH_GUARD_GITLEAKS": None})
+
+        assert_rc("scanner on PATH passes", 0, r, failures)
+        assert_eq("the scanner on PATH ran", True, marker.exists(), failures)
+
+
+def case_scanner_in_the_pinned_prefix_is_used(failures):
+    """A lane's PATH may lack ~/.local/bin, so the pinned installer's
+    prefix under $HOME is the second place the scanner is looked
+    for."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, line = clean_branch_push(tmp)
+
+        home = tmp / "home"
+        marker = tmp / "home-marker"
+        scanner_stub(pinned_scanner_path(home), pinned_version(), marker)
+
+        r = run_guard(line, cwd=repo, env_extra={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "PUSH_GUARD_GITLEAKS": None})
+
+        assert_rc("scanner in the pinned prefix passes", 0, r, failures)
+        assert_eq("the scanner in the pinned prefix ran",
+                  True, marker.exists(), failures)
+
+
+def case_no_scanner_anywhere_is_refused(failures):
+    """With no scanner on PATH and none under the pinned prefix, the push
+    is refused and the installer is named."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, line = clean_branch_push(tmp)
+
+        home = tmp / "home"
+        home.mkdir()
+
+        r = run_guard(line, cwd=repo, env_extra={
+            "PATH": "/usr/bin:/bin",
+            "HOME": str(home),
+            "PUSH_GUARD_GITLEAKS": None})
+
+        assert_rc("no scanner refused", 1, r, failures)
+        assert_in("no scanner names the installer",
+                  "install/gitleaks/install.sh", r.stderr, failures)
+
+
+def case_named_scanner_is_used(failures):
+    """PUSH_GUARD_GITLEAKS names the scanner, whatever is on PATH and
+    whatever sits under the pinned prefix."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo, line = clean_branch_push(tmp)
+
+        marker = tmp / "named-marker"
+        named = tmp / "named" / "gitleaks"
+        scanner_stub(named, pinned_version(), marker)
+
+        # Both other places report another version: a guard that reached
+        # for one of them would refuse the push.
+        path_bin = tmp / "path-bin"
+        scanner_stub(path_bin / "gitleaks", "8.0.0")
+        home = tmp / "home"
+        scanner_stub(pinned_scanner_path(home), "8.0.0")
+
+        r = run_guard(line, cwd=repo, env_extra={
+            "PATH": f"{path_bin}:/usr/bin:/bin",
+            "HOME": str(home),
+            "PUSH_GUARD_GITLEAKS": named})
+
+        assert_rc("named scanner passes", 0, r, failures)
+        assert_eq("the named scanner ran", True, marker.exists(), failures)
+
+
+def case_clean_push_passes(failures):
+    """A push with no secret in it proceeds, and the shape checks still
+    run: the bad squash is still refused."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat on top")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("clean push passes", 0, r, failures)
+        assert_not_in("clean push names no rule",
+                      "github-pat", r.stderr, failures)
+
+        # The shape checks still run under the scan.
+        (tmp / "second").mkdir()
+        repo2, p_sha, bad_sha = scenario_with_branch_and_lost_main_files(
+            tmp / "second")
+        line2 = push_line("refs/heads/feat", bad_sha,
+                          "refs/heads/feat", p_sha)
+        r2 = run_guard(line2, cwd=repo2)
+        assert_rc("shape checks still refuse", 1, r2, failures)
+        assert_in("shape checks still name the file", "x.txt", r2.stderr,
+                  failures)
+
+
+def case_missing_scanner_refused(failures):
+    """Without the scanner the guard refuses: a missing binary would
+    otherwise turn the check off without anyone noticing."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat on top")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo,
+                      env_extra={"PUSH_GUARD_GITLEAKS": "/nonexistent/gitleaks"})
+
+        assert_rc("missing scanner refused", 1, r, failures)
+        assert_in("missing scanner names the installer",
+                  "install/gitleaks/install.sh", r.stderr, failures)
+
+
+def case_wrong_scanner_version_refused(failures):
+    """A scanner of another version is refused, naming both versions."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat on top")
+        tip = head_of(repo)
+
+        stub = write_stub(tmp / "gitleaks",
+                          'if [ "$1" = "version" ]; then echo 8.0.0; exit 0; fi\n'
+                          "exit 0\n")
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo,
+                      env_extra={"PUSH_GUARD_GITLEAKS": stub})
+
+        assert_rc("wrong scanner version refused", 1, r, failures)
+        assert_in("wrong version names the version found",
+                  "8.0.0", r.stderr, failures)
+        assert_in("wrong version names the pinned version",
+                  pinned_version(), r.stderr, failures)
+        assert_in("wrong version names the installer",
+                  "install/gitleaks/install.sh", r.stderr, failures)
+
+
+def case_failing_scanner_refused(failures):
+    """A scanner that fails refuses the push: a scan that did not run
+    leaves the push unscanned."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "feat on top")
+        tip = head_of(repo)
+
+        stub = write_stub(
+            tmp / "gitleaks",
+            'if [ "$1" = "version" ]; then echo %s; exit 0; fi\nexit 1\n'
+            % pinned_version())
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo,
+                      env_extra={"PUSH_GUARD_GITLEAKS": stub})
+
+        assert_rc("failing scanner refused", 1, r, failures)
+        assert_in("failing scanner says gitleaks failed",
+                  "gitleaks failed", r.stderr, failures)
+
+
+def installer_fixtures(tmp):
+    """A tarball holding a fake gitleaks, and its sha256."""
+    payload = tmp / "payload"
+    payload.mkdir()
+    (payload / "gitleaks").write_text("#!/bin/sh\necho 8.30.1\n")
+    tarball = tmp / "gitleaks.tar.gz"
+    with tarfile.open(tarball, "w:gz") as tar:
+        tar.add(payload / "gitleaks", arcname="gitleaks")
+    digest = hashlib.sha256(tarball.read_bytes()).hexdigest()
+    return tarball, digest
+
+
+def case_installer_refuses_a_bad_checksum(failures):
+    """The installer checks the sha256 before it installs anything: a
+    mismatch installs nothing."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        tarball, _ = installer_fixtures(tmp)
+
+        pin = tmp / "pin"
+        pin.write_text(f"version=8.30.1\nsha256={'0' * 64}\n")
+        prefix = tmp / "bin"
+
+        r = subprocess.run([str(INSTALLER), str(prefix)],
+                           capture_output=True, text=True,
+                           env={**os.environ,
+                                "GITLEAKS_URL": f"file://{tarball}",
+                                "GITLEAKS_PIN": str(pin)})
+
+        assert_not_eq("installer refuses a bad checksum",
+                      0, r.returncode, failures)
+        assert_not_eq("installer installs nothing on a bad checksum",
+                      True, (prefix / "gitleaks").exists(), failures)
+        assert_in("installer names the checksum", "sha256",
+                  r.stdout + r.stderr, failures)
+
+
+def case_installer_installs_the_pinned_asset(failures):
+    """The installer installs the asset when the checksum matches."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        tarball, digest = installer_fixtures(tmp)
+
+        pin = tmp / "pin"
+        pin.write_text(f"version=8.30.1\nsha256={digest}\n")
+        prefix = tmp / "bin"
+
+        r = subprocess.run([str(INSTALLER), str(prefix)],
+                           capture_output=True, text=True,
+                           env={**os.environ,
+                                "GITLEAKS_URL": f"file://{tarball}",
+                                "GITLEAKS_PIN": str(pin)})
+
+        assert_rc("installer succeeds on a good checksum", 0, r, failures)
+        assert_eq("installer puts the binary in place",
+                  True, (prefix / "gitleaks").exists(), failures)
+        installed = subprocess.run([str(prefix / "gitleaks"), "version"],
+                                   capture_output=True, text=True)
+        assert_rc("the installed binary runs", 0, installed, failures)
+
+
 def main():
     failures: list = []
     if not PUSH_GUARD.is_file():
         failures.append(f"missing tool: {PUSH_GUARD}")
     if not HOOK.is_file():
         failures.append(f"missing hook: {HOOK}")
+    if not GITLEAKS:
+        failures.append("gitleaks is not installed; run install/gitleaks/install.sh")
+    if not GITLEAKS_PIN.is_file():
+        failures.append(f"missing pin: {GITLEAKS_PIN}")
+    if GITLEAKS_PIN.is_file() and not pinned_prefix():
+        failures.append(f"the pin names no prefix: {GITLEAKS_PIN}")
+    if not INSTALLER.is_file():
+        failures.append(f"missing installer: {INSTALLER}")
     if failures:
         for f in failures:
             print(f"FAIL {f}")
@@ -1142,6 +1846,33 @@ def main():
     # The recovery the refusal prints has to be the one that works.
     case_base_regression_recovery_pushes_cleanly(failures)
     case_duplicate_patch_recovery_pushes_cleanly(failures)
+    # The secret scan: what the push carries, and what happens when the
+    # scanner is missing, is another version, or fails.
+    case_secret_in_pushed_commit_refused(failures)
+    case_secret_survives_no_ack(failures)
+    case_secret_on_a_new_branch_refused(failures)
+    case_secret_on_the_base_branch_refused(failures)
+    case_secret_removed_in_a_later_commit_refused(failures)
+    case_secret_already_on_the_remote_does_not_refuse(failures)
+    case_allowlisted_secret_passes(failures)
+    # The config the scan reads is the one in the pushed commit.
+    case_untracked_allowlist_does_not_silence(failures)
+    case_uncommitted_allowlist_edit_does_not_silence(failures)
+    case_config_in_the_environment_does_not_silence(failures)
+    case_committed_allowlist_silences(failures)
+    case_clean_push_passes(failures)
+    case_missing_scanner_refused(failures)
+    case_wrong_scanner_version_refused(failures)
+    case_failing_scanner_refused(failures)
+    # Where the scanner is looked for: named, on PATH, or under the
+    # pinned installer's prefix.
+    case_scanner_on_path_is_used(failures)
+    case_scanner_in_the_pinned_prefix_is_used(failures)
+    case_no_scanner_anywhere_is_refused(failures)
+    case_named_scanner_is_used(failures)
+    # The installer the guard names when the scanner is missing.
+    case_installer_refuses_a_bad_checksum(failures)
+    case_installer_installs_the_pinned_asset(failures)
     # Mutation tests last so the on-disk push-guard is restored before
     # main returns. They re-run earlier cases with the mutated tool and
     # expect the opposite verdict.
@@ -1153,7 +1884,8 @@ def main():
     print("PASS push-guard: deleted/gained intersection refused; "
           "ack overrides; rebase passes; intended-deletion passes; "
           "harmless refs pass; e2e push refused; "
-          "base regression refused; duplicate patch refused")
+          "base regression refused; duplicate patch refused; "
+          "a secret in the pushed commits refused on every ref")
     return 0
 
 

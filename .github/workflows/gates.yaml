@@ -38,6 +38,13 @@ jobs:
       # task-mirror-check expands `just <recipe>` through `just --show`.
       - run: sudo apt-get update -qq && sudo apt-get install -y -qq just
 
+      # The push-guard tests scan with the pinned gitleaks. The install
+      # step puts it on PATH for the gates below.
+      - name: install gitleaks
+        run: |
+          install/gitleaks/install.sh "$RUNNER_TEMP/bin"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+
       - name: gate the diff
         if: github.event_name == 'pull_request'
         run: bin/gate-verify .

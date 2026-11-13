@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Refuse three pushes that would land on the remote in a shape nobody
+# Refuse four pushes that would land on the remote in a shape nobody
 # intended:
 #
 #   1. a push that deletes files main added after the branch's previous
@@ -9,12 +9,24 @@
 #      an older main than the push it replaces;
 #   3. a push whose range carries a copy of a commit main already has
 #      -- same patch, new sha.
-#
+#   4. a push whose commits carry a secret -- the secret leaves the
+#      host, and a PR head stays reachable after a force-push;
+
 # A PR created ready never meets pr-ready, so this check has to run on
 # every push: install with
 #   git config core.hooksPath /path/to/agent-tools/hooks
 # PUSH_GUARD_BASE picks the branch to check against (default main);
-# PUSH_GUARD_ACK=1 turns the refusal into a warning.
+# PUSH_GUARD_ACK=1 turns the three shape refusals into warnings;
+# PUSH_GUARD_GITLEAKS names the scanner, else gitleaks on PATH, else
+# the pinned installer's prefix under $HOME. A missing scanner refuses
+# the push: the commits go unscanned.
+
+# The secret check runs on every ref the push carries, the base branch
+# and tags included. PUSH_GUARD_ACK stops at it: a false positive is
+# fixed in the repository's .gitleaks.toml, where review sees it.
+
+# The scan reads the allowlist from the pushed commit, so an untracked
+# .gitleaks.toml, or one in the environment, cannot silence the scan.
 set -euo pipefail
 
 REMOTE=${1:-}
@@ -35,14 +47,205 @@ fi
 
 BASE=refs/remotes/$REMOTE/$BASE_BRANCH
 
-if ! git rev-parse --verify --quiet "$BASE" >/dev/null; then
-	note "no local tracking ref for $BASE; skipping"
-	exit 0
+# The three shape checks judge a branch against the base and need a
+# tracking ref; the secret scan judges the commits the push carries and
+# needs none.
+HAVE_BASE=0
+if git rev-parse --verify --quiet "$BASE" >/dev/null; then
+	HAVE_BASE=1
+else
+	note "no local tracking ref for $BASE; skipping the shape checks"
 fi
 
 ZERO=0000000000000000000000000000000000000000
 FAIL=0
 ANY_REF=0
+
+# ---- The secret scan ------------------------------------------------------
+#
+# The pin is the one place the gitleaks version is written down: the
+# installer reads it and this guard reads it, so a binary of another
+# version is refused.
+GUARD_DIR=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)
+PIN_FILE="$GUARD_DIR/../install/gitleaks/pin"
+GITLEAKS_BIN=""
+GITLEAKS_STATE=unknown
+REPORT=$(mktemp "${TMPDIR:-/tmp}/push-guard-gitleaks.XXXXXX") || {
+	note "could not create a report file; the push would go unscanned."
+	exit 1
+}
+# The config gitleaks reads is written here, out of the pushed commit.
+CONFIG_FILE=$(mktemp "${TMPDIR:-/tmp}/push-guard-gitleaks-config.XXXXXX") || {
+	note "could not create a config file; the push would go unscanned."
+	exit 1
+}
+trap 'rm -f "$REPORT" "$CONFIG_FILE"' EXIT
+
+# The pinned version, read from the pin file.
+pinned_version() {
+	[ -f "$PIN_FILE" ] || return 1
+	sed -n 's/^version=//p' "$PIN_FILE" | head -1
+}
+
+# The pinned installer's prefix, read from the pin file.
+pinned_prefix() {
+	[ -f "$PIN_FILE" ] || return 1
+	sed -n 's/^prefix=//p' "$PIN_FILE" | head -1
+}
+
+# Where the pinned installer puts the scanner, under this HOME.
+pinned_scanner() {
+	local prefix
+	prefix=$(pinned_prefix) || return 1
+	[ -n "$prefix" ] || return 1
+	printf '%s\n' "${prefix//\$HOME/${HOME:-}}/gitleaks"
+}
+
+# The scanner to run: the one named, else gitleaks on PATH, else the
+# pinned installer's prefix under $HOME. A lane's PATH may lack
+# ~/.local/bin.
+gitleaks_binary() {
+	if [ -n "${PUSH_GUARD_GITLEAKS:-}" ]; then
+		printf '%s\n' "$PUSH_GUARD_GITLEAKS"
+		return 0
+	fi
+	if command -v gitleaks >/dev/null 2>&1; then
+		printf '%s\n' gitleaks
+		return 0
+	fi
+	local fallback
+	fallback=$(pinned_scanner) || return 1
+	[ -x "$fallback" ] || return 1
+	printf '%s\n' "$fallback"
+}
+
+# Whether the scanner is the pinned one. Memoised: a push with several
+# refs says the problem once.
+gitleaks_ready() {
+	[ "$GITLEAKS_STATE" = ready ] && return 0
+	[ "$GITLEAKS_STATE" = broken ] && return 1
+	GITLEAKS_STATE=broken
+
+	if [ -z "$GITLEAKS_BIN" ]; then
+		GITLEAKS_BIN=$(gitleaks_binary || true)
+	fi
+	if [ -z "$GITLEAKS_BIN" ]; then
+		fallback=$(pinned_scanner || true)
+		[ -n "$fallback" ] || fallback="the prefix in $PIN_FILE"
+		note "gitleaks is not installed: not on PATH, and not at $fallback; a push scanned without it would carry secrets off this host."
+		note "install the pinned version with install/gitleaks/install.sh, or point PUSH_GUARD_GITLEAKS at it."
+		return 1
+	fi
+
+	if ! command -v "$GITLEAKS_BIN" >/dev/null 2>&1; then
+		note "gitleaks is not installed ($GITLEAKS_BIN not found); a push scanned without it would carry secrets off this host."
+		note "install the pinned version with install/gitleaks/install.sh, or point PUSH_GUARD_GITLEAKS at it."
+		return 1
+	fi
+
+	pinned=$(pinned_version || true)
+	if [ -z "$pinned" ]; then
+		note "no pinned gitleaks version in $PIN_FILE; install/gitleaks/install.sh reads it from there."
+		return 1
+	fi
+
+	found=$("$GITLEAKS_BIN" version 2>/dev/null || true)
+	found=$(printf '%s' "$found" | tr -d '[:space:]')
+	if [ -z "$found" ]; then
+		note "gitleaks did not report a version; the pinned version is $pinned."
+		note "install the pinned version with install/gitleaks/install.sh."
+		return 1
+	fi
+	if [ "$found" != "$pinned" ]; then
+		note "gitleaks is $found, but the pinned version is $pinned."
+		note "install the pinned version with install/gitleaks/install.sh."
+		return 1
+	fi
+
+	GITLEAKS_STATE=ready
+	return 0
+}
+
+# One line per finding: <rule> <file>:<line> <commit>. The value that
+# matched is never printed: the lane's output is logged.
+gitleaks_findings() {
+	python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8", errors="replace") as report:
+        findings = json.load(report)
+except Exception:
+    sys.exit(1)
+for finding in findings:
+    print("%s %s:%s %s" % (finding.get("RuleID", "?"),
+                           finding.get("File", "?"),
+                           finding.get("StartLine", "?"),
+                           str(finding.get("Commit", ""))[:12]))
+PY
+}
+
+# The pushed range: the commits the remote is missing, so a secret
+# added in one commit and removed in the next is still in it.
+scan_commits_for_secrets() {
+	local local_sha=$1 remote_sha=$2 remote_ref=$3
+	local log_opts resolved findings rc=0 parse_rc=0
+
+	gitleaks_ready || return 1
+
+	if ! resolved=$(git rev-parse --verify --quiet "$local_sha^{commit}"); then
+		note "$remote_ref: commit $local_sha is not in the local object store; cannot scan what it carries."
+		return 1
+	fi
+
+	# The allowlist is the one in the pushed commit. A file in the
+	# working tree, or in the environment, silences a scan nobody
+	# reviewed, so the config is written here and the environment's
+	# own config names are cleared.
+	if git show "$resolved:.gitleaks.toml" >"$CONFIG_FILE" 2>/dev/null; then
+		:
+	else
+		printf '[extend]\nuseDefault = true\n' >"$CONFIG_FILE"
+	fi
+
+	if [ "$remote_sha" = "$ZERO" ]; then
+		log_opts="$resolved --not --remotes=$REMOTE"
+	elif git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null; then
+		log_opts="$remote_sha..$resolved"
+	else
+		note "$remote_ref: the remote's sha $remote_sha is not in the local object store; scanning every commit not on $REMOTE instead."
+		log_opts="$resolved --not --remotes=$REMOTE"
+	fi
+
+	env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML \
+		"$GITLEAKS_BIN" git --log-opts="$log_opts" --redact --no-banner \
+		--exit-code 3 --report-format json --report-path "$REPORT" \
+		--config "$CONFIG_FILE" . >/dev/null 2>&1 || rc=$?
+
+	case "$rc" in
+	0)
+		return 0
+		;;
+	3)
+		findings=$(gitleaks_findings "$REPORT") || parse_rc=$?
+		if [ "$parse_rc" -ne 0 ] || [ -z "$findings" ]; then
+			note "$remote_ref: gitleaks reported a secret but the report could not be read."
+			return 1
+		fi
+		note "$remote_ref carries a secret:"
+		while IFS= read -r finding; do
+			printf '  %s\n' "$finding" >&2
+		done <<<"$findings"
+		note "the push would carry it off this host; remove it from the commit, or allowlist the file in the repository's .gitleaks.toml."
+		return 1
+		;;
+	*)
+		note "gitleaks failed (exit $rc) scanning the commits $remote_ref carries; refusing the push rather than letting it through unscanned."
+		return 1
+		;;
+	esac
+}
 
 # Each line on stdin: <local_ref> <local_sha> <remote_ref> <remote_sha>
 while read -r local_ref local_sha remote_ref remote_sha; do
@@ -52,6 +255,20 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
 	# Skip ref deletions: local sha is all zeros.
 	if [ "$local_sha" = "$ZERO" ]; then
+		continue
+	fi
+
+	# ---- Check: the commits this push carries hold no secret ---------
+	#
+	# Before the shape checks, and on every ref the push carries: the
+	# base branch and tags included, because a secret on main leaks
+	# the same way.
+	if ! scan_commits_for_secrets "$local_sha" "$remote_sha" "$remote_ref"; then
+		FAIL=1
+	fi
+
+	# The shape checks below judge a branch against the base.
+	if [ "$HAVE_BASE" -eq 0 ]; then
 		continue
 	fi
 
