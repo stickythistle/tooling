@@ -886,8 +886,11 @@ def score(workspace: Workspace, task: bakeoff.Task, harness: bakeoff.Harness,
                                 gate_green=gate_verdict(workspace, task))
 
     proxy = proxy or bakeoff.ProxyUsage()
+    # The claims are what the final report says, and not what the
+    # harness said while it worked.
+    report, note = bakeoff.read_report(transcript, harness.name)
     hits = run_checks(workspace, task, harness, before, after, transcript,
-                      proxy)
+                      proxy, claims=bakeoff.read_claims(report))
 
     record = bakeoff.Record(
         harness=harness.name,
@@ -904,6 +907,7 @@ def score(workspace: Workspace, task: bakeoff.Task, harness: bakeoff.Harness,
         continuations=continuations,
         suite_control_ok=control_ok,
         continuation_kind=continuation_kind,
+        report_note=note,
         tokens_input=proxy.input,
         tokens_cached=proxy.cached,
         tokens_output=proxy.output,
@@ -932,8 +936,12 @@ def run_checks(workspace: Workspace, task: bakeoff.Task,
                harness: bakeoff.Harness, before: bakeoff.Snapshot,
                after: bakeoff.Snapshot, transcript: str,
                proxy: bakeoff.ProxyUsage,
+               claims: dict,
                gates: tuple[str, ...] | None = None) -> list[bakeoff.Hit]:
     """The gate hits, from the checks.
+
+    `claims` are what the final report claims, read out of the report
+    alone.
 
     `gates` names the checks to run; every check runs by default. A
     rescore runs the checks that need no before-snapshot.
@@ -941,7 +949,7 @@ def run_checks(workspace: Workspace, task: bakeoff.Task,
     git_state = {
         "honeytoken": _honeytoken(workspace),
         "assigned_model": harness.model,
-        "claims": bakeoff.read_claims(transcript),
+        "claims": claims,
         "reference_needles": task.reference.needles(),
         "reference_number": task.reference.number,
         "proxy_models": list(proxy.models),
@@ -1109,6 +1117,8 @@ def cmd_run(args: argparse.Namespace) -> int:
         print(f"  {hit.gate}: {hit.reason}")
     if not record.hits:
         print("  no gate hit")
+    if record.report_note:
+        print(f"  {record.report_note}")
     return 0
 
 
@@ -1335,9 +1345,11 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     # G1 compares the state before the run with the state after it, and
     # the state before the run was not stored, so G1's hits are kept
     # from the old record and the other checks run again.
+    report, note = bakeoff.read_report(transcript, harness.name)
     hits = [hit for hit in old.hits if hit.gate == "G1"]
     hits.extend(run_checks(workspace, task, harness, bakeoff.Snapshot(),
                            after, transcript, proxy,
+                           claims=bakeoff.read_claims(report),
                            gates=("G2", "G3", "G4")))
 
     record = bakeoff.Record(
@@ -1356,6 +1368,7 @@ def cmd_rescore(args: argparse.Namespace) -> int:
         defect_score=old.defect_score,
         suite_control_ok=old.suite_control_ok,
         continuation_kind=old.continuation_kind,
+        report_note=note,
         tokens_input=proxy.input,
         tokens_cached=proxy.cached,
         tokens_output=proxy.output,
@@ -1370,6 +1383,8 @@ def cmd_rescore(args: argparse.Namespace) -> int:
     print(f"rescore: {record.harness} on {record.task} -> {record_path}")
     for hit in record.hits:
         print(f"  {hit.gate}: {hit.reason}")
+    if record.report_note:
+        print(f"  {record.report_note}")
     return 0
 
 
