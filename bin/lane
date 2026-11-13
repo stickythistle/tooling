@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Own lane state in one SQLite database, so two sessions cannot both take a lane.
+
+    lane spawn --repo R --issue N --harness H --profile P
+    lane list [--json]
+    lane release LEASE
+
+A refusal exits 1 and names what refused.
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+
+from lane import main  # noqa: E402
+
+
+if __name__ == "__main__":
+    sys.exit(main())
