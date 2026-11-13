@@ -16,6 +16,7 @@ import subprocess
 import sys
 import time
 import tomllib
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -338,6 +339,10 @@ def load_config(path: Path | None = None) -> Config:
         launch = body.get("launch")
         if not isinstance(launch, str) or not launch:
             raise Refusal("harness", f"harness {name} does not name a launch command")
+        if "{session}" not in launch:
+            raise Refusal("harness",
+                          f"harness {name} does not fill {{session}}, so a "
+                          f"lane started with it can never be resumed")
         harnesses[name] = Harness(name, launch)
 
     repos = {}
@@ -382,6 +387,7 @@ CREATE TABLE IF NOT EXISTS leases (
     window TEXT NOT NULL,
     window_opened_at REAL NOT NULL DEFAULT 0,
     session TEXT NOT NULL,
+    harness_session TEXT NOT NULL DEFAULT '',
     state TEXT NOT NULL,
     state_since REAL NOT NULL,
     created_at REAL NOT NULL
@@ -417,6 +423,7 @@ def open_db(path: Path | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.executescript(SCHEMA)
     _add_column(conn, "leases", "window_opened_at", "REAL NOT NULL DEFAULT 0")
+    _add_column(conn, "leases", "harness_session", "TEXT NOT NULL DEFAULT ''")
     return conn
 
 
@@ -428,17 +435,31 @@ def live_leases(conn: sqlite3.Connection) -> list[sqlite3.Row]:
 
 
 def set_state(conn: sqlite3.Connection, lease_id: int, state: str,
-              now: float | None = None) -> None:
+              now: float | None = None,
+              opened_at: float | None = None) -> None:
     """Record a lease's state, and when it last changed.
 
     The time is only moved when the state actually changes: an age that
     restarts on every read says nothing about how long the lane has been
     in that state.
+
+    `opened_at` is the window's opening time the caller read: the write
+    lands only while the row still carries it. A reconcile that read the
+    row before a window opened therefore leaves the lane that is starting
+    alone.
     """
     now = time.time() if now is None else now
+    if opened_at is None:
+        conn.execute(
+            "UPDATE leases SET state = ?, state_since = ? WHERE id = ? "
+            "AND state != ?",
+            (state, now, lease_id, state),
+        )
+        return
     conn.execute(
-        "UPDATE leases SET state = ?, state_since = ? WHERE id = ? AND state != ?",
-        (state, now, lease_id, state),
+        "UPDATE leases SET state = ?, state_since = ? WHERE id = ? "
+        "AND state != ? AND window_opened_at = ?",
+        (state, now, lease_id, state, opened_at),
     )
 
 
@@ -462,6 +483,7 @@ class Request:
     tmux_session: str
     window: str
     session: str
+    harness_session: str
     launch: str
 
 
@@ -567,12 +589,12 @@ def claim(conn: sqlite3.Connection, req: Request, size: int) -> int:
         cursor = conn.execute(
             "INSERT INTO leases (repo, issue, harness, profile, model, pool, "
             "cost, branch, base, base_sha, worktree, clone, tmux_session, "
-            "window, session, state, state_since, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "window, session, harness_session, state, state_since, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (req.repo, req.issue, req.harness, req.profile, req.model,
              req.pool, req.cost, req.branch, req.base, "", req.worktree,
              str(req.clone), req.tmux_session, req.window, req.session,
-             "busy", time.time(), time.time()),
+             req.harness_session, "busy", time.time(), time.time()),
         )
         conn.execute("COMMIT")
         return int(cursor.lastrowid)
@@ -617,6 +639,32 @@ def capture_pane(lease: sqlite3.Row) -> str:
         env=tmux_env(),
     )
     return out if code == 0 else ""
+
+
+def launch_text(launch: str, profile: str, window: str, session: str) -> str:
+    """The command that starts a harness.
+
+    The session id is the harness's own name for the conversation, so
+    the same command starts it and brings it back.
+    """
+    return (launch
+            .replace("{profile}", profile)
+            .replace("{window}", window)
+            .replace("{session}", session))
+
+
+def send_launch(target: str, text: str) -> None:
+    """Type a command into a window and press Enter.
+
+    The text goes in with `-l`, and the Enter is a separate call: with
+    `-l` a trailing Enter is typed as the five letters, not the key.
+    """
+    for keys in (["-l", text], ["Enter"]):
+        code, _, err = run(["tmux", "send-keys", "-t", target, *keys],
+                           env=tmux_env())
+        if code != 0:
+            raise StepFailure("launch", CommandError(["tmux", "send-keys"],
+                                                      code, err).detail())
 
 
 def tail(lines: list[str], count: int) -> list[str]:
@@ -695,13 +743,14 @@ def reconcile(conn: sqlite3.Connection) -> None:
 
     Every command reads the leases first, so a closed window is noticed
     by the next command. A lease still opening its window keeps its
-    state.
+    state, and so does one whose window opened after this read.
     """
     for lease in live_leases(conn):
         if not lease["window_opened_at"]:
             continue
         if not window_exists(lease):
-            set_state(conn, lease["id"], STOPPED)
+            set_state(conn, lease["id"], STOPPED,
+                      opened_at=lease["window_opened_at"])
 
 
 def read_states(conn: sqlite3.Connection, leases: list[sqlite3.Row]) -> None:
@@ -991,14 +1040,17 @@ class Spawn:
         """Open the window the lane runs in.
 
         The target ends in a colon: `-t 0` names window 0, and `-t 0:`
-        names the session, so a new window is opened in it.
+        names the session, so a new window is opened in it. The lease
+        travels with the window, so a launcher in the pane can ask
+        whether it is still live.
         """
         # The window may open before the call that carries it is cut
         # short, so the flag goes up first.
         self.window_opened = True
         try:
             self._tmux("new-window", "-d", "-t", f"{self.req.tmux_session}:",
-                       "-n", self.req.window, "-c", self.req.worktree)
+                       "-n", self.req.window, "-c", self.req.worktree,
+                       "-e", f"LANE_LEASE={self.lease_id}")
         except CommandError as exc:
             raise StepFailure("window", exc.detail()) from exc
         # The window is open from here on, so a reconcile that cannot see
@@ -1018,21 +1070,10 @@ class Spawn:
             self.undone.append(f"window: {exc.detail()}")
 
     def launch(self) -> None:
-        """Start the harness in the window.
-
-        The text goes in with `-l`, and the Enter is a separate call: with
-        `-l` a trailing Enter is typed as the five letters, not the key.
-        """
-        text = (self.req.launch
-                .replace("{profile}", self.req.profile)
-                .replace("{window}", self.req.window))
-        try:
-            self._tmux("send-keys", "-t",
-                       f"{self.req.tmux_session}:{self.req.window}", "-l", text)
-            self._tmux("send-keys", "-t",
-                       f"{self.req.tmux_session}:{self.req.window}", "Enter")
-        except CommandError as exc:
-            raise StepFailure("launch", exc.detail()) from exc
+        """Start the harness in the window."""
+        send_launch(f"{self.req.tmux_session}:{self.req.window}",
+                    launch_text(self.req.launch, self.req.profile,
+                                self.req.window, self.req.harness_session))
 
     def undo_steps(self) -> list:
         """The undos for what this spawn started, in reverse.
@@ -1074,6 +1115,110 @@ class Spawn:
             if self.undone:
                 detail = f"{detail} (undoing: {'; '.join(self.undone)})"
             raise StepFailure(exc.step, detail) from exc
+
+
+# ----- bringing a stopped lane back ----------------------------------------
+
+def claim_resume(conn: sqlite3.Connection, lease: sqlite3.Row,
+                  profile: Profile, size: int) -> None:
+    """Take a pool unit back for a stopped lane, or refuse.
+
+    The claim is one transaction, as the spawn's is: two resumes racing
+    for the last unit of a pool get one winner.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT * FROM leases WHERE id = ?",
+                           (lease["id"],)).fetchone()
+        if row is None:
+            raise Refusal("lease", f"no lease {lease['id']}")
+        if row["state"] != STOPPED:
+            raise Refusal("state", f"lease {row['id']} is {row['state']}; "
+                                   f"only a stopped lane can be resumed")
+        if not row["harness_session"]:
+            raise Refusal("session", f"lease {row['id']} records no session "
+                                     f"id, so it cannot be resumed")
+        filling = conn.execute(
+            "SELECT id, window, session, cost FROM leases "
+            "WHERE state NOT IN (?, ?) AND pool = ? AND id != ? ORDER BY id",
+            (RELEASED, STOPPED, profile.pool, row["id"])).fetchall()
+        used = sum(holder["cost"] for holder in filling)
+        if used + profile.cost > size:
+            holders = ", ".join(
+                f"lease {holder['id']} (window {holder['window']}, "
+                f"session {holder['session']}) holds {holder['cost']}"
+                for holder in filling) or "no lease"
+            raise Refusal(
+                "pool",
+                f"pool {profile.pool} is full: {used} of {size} units are "
+                f"taken and this profile costs {profile.cost}; {holders}")
+        # The window opens after the claim, so a reconcile that runs in
+        # between leaves the lane alone, as it does for a spawn in flight.
+        conn.execute(
+            "UPDATE leases SET state = ?, state_since = ?, "
+            "window_opened_at = 0 WHERE id = ?",
+            ("busy", time.time(), row["id"]))
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+
+
+def close_window(lease: sqlite3.Row) -> str | None:
+    """Close the lease's window, and say why it could not be closed."""
+    if not window_exists_at(lease["tmux_session"], lease["window"]):
+        return None
+    code, _, err = run(["tmux", "kill-window", "-t", window_target(lease)],
+                       env=tmux_env())
+    if code != 0:
+        return CommandError(["tmux", "kill-window"], code, err).detail()
+    return None
+
+
+def resume_lane(conn: sqlite3.Connection, cfg: Config, lease: sqlite3.Row,
+                profile: Profile, harness: Harness) -> None:
+    """Start the harness again in a new window on the lane's worktree.
+
+    The lease takes its pool unit back first, so two resumes racing for
+    the last unit get one winner. A failure closes the window and stops
+    the lease.
+    """
+    claim_resume(conn, lease, profile, cfg.pools[profile.pool])
+    window_opened = False
+    try:
+        worktree = Path(lease["worktree"])
+        if not worktree.exists():
+            raise Refusal("worktree", f"the worktree {worktree} is gone, so "
+                                      f"lease {lease['id']} cannot be "
+                                      f"resumed")
+        target = window_target(lease)
+        if window_exists_at(lease["tmux_session"], lease["window"]):
+            raise Refusal("window", f"window {target} is already open")
+        # The window may open before the call that carries it is cut
+        # short, so the flag goes up first.
+        window_opened = True
+        code, _, err = run(["tmux", "new-window", "-d", "-t",
+                            f"{lease['tmux_session']}:", "-n", lease["window"],
+                            "-c", str(worktree), "-e",
+                            f"LANE_LEASE={lease['id']}"], env=tmux_env())
+        if code != 0:
+            raise StepFailure("window", CommandError(["tmux", "new-window"],
+                                                      code, err).detail())
+        conn.execute("UPDATE leases SET window_opened_at = ? WHERE id = ?",
+                     (time.time(), lease["id"]))
+        send_launch(target, launch_text(harness.launch, lease["profile"],
+                                        lease["window"],
+                                        lease["harness_session"]))
+    except BaseException:
+        if window_opened:
+            undone = close_window(lease)
+            if undone:
+                print(f"WARN window: {undone}", file=sys.stderr)
+        set_state(conn, lease["id"], STOPPED)
+        conn.execute("UPDATE leases SET window_opened_at = 0 WHERE id = ?",
+                     (lease["id"],))
+        raise
 
 
 # ----- taking a lane down --------------------------------------------------
@@ -1280,6 +1425,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         tmux_session=cfg.tmux_session,
         window=window,
         session=session,
+        harness_session=uuid.uuid4().hex,
         launch=harness.launch,
     )
     conn = open_db()
@@ -1374,6 +1520,45 @@ def release_lease(conn: sqlite3.Connection, lease: sqlite3.Row) -> None:
             ["gh", "issue", "edit"], code, err).detail())
 
 
+def cmd_resume(args: argparse.Namespace) -> int:
+    """Bring a stopped lane back."""
+    cfg = load_config()
+    conn = open_db()
+    try:
+        lease = conn.execute("SELECT * FROM leases WHERE id = ?",
+                             (args.lease,)).fetchone()
+        if lease is None:
+            raise Refusal("lease", f"no lease {args.lease}")
+        profile = cfg.profile(lease["profile"])
+        harness = cfg.harness(lease["harness"])
+        resume_lane(conn, cfg, lease, profile, harness)
+    finally:
+        conn.close()
+    print(f"lease {args.lease}")
+    print(f"target {lease['tmux_session']}:{lease['window']}")
+    return 0
+
+
+def cmd_check(args: argparse.Namespace) -> int:
+    """Say whether a lease is live.
+
+    The check reads the database and nothing else: a launcher asks it
+    before it starts, and the answer must not depend on a window.
+    """
+    conn = open_db()
+    try:
+        lease = conn.execute("SELECT * FROM leases WHERE id = ?",
+                             (args.lease,)).fetchone()
+    finally:
+        conn.close()
+    if lease is None:
+        raise Refusal("lease", f"lease {args.lease} is missing")
+    if lease["state"] == RELEASED:
+        raise Refusal("lease", f"lease {args.lease} is released")
+    print(f"lease {args.lease} is {lease['state']}")
+    return 0
+
+
 def cmd_release(args: argparse.Namespace) -> int:
     """End a lease."""
     conn = open_db()
@@ -1465,6 +1650,12 @@ def main(argv: list[str] | None = None) -> int:
     listing.add_argument("--json", action="store_true", dest="as_json",
                          help="one JSON object per lease")
 
+    resume = commands.add_parser("resume", help="restart a stopped lane")
+    resume.add_argument("lease", type=int, help="the lease number")
+
+    check = commands.add_parser("check", help="say whether a lease is live")
+    check.add_argument("lease", type=int, help="the lease number")
+
     release = commands.add_parser("release", help="end a lease")
     release.add_argument("lease", type=int, help="the lease number")
 
@@ -1481,6 +1672,10 @@ def main(argv: list[str] | None = None) -> int:
             return cmd_spawn(args)
         if args.command == "list":
             return cmd_list(args)
+        if args.command == "resume":
+            return cmd_resume(args)
+        if args.command == "check":
+            return cmd_check(args)
         if args.command == "finish":
             return cmd_finish(args)
         return cmd_release(args)

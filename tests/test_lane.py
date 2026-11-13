@@ -128,12 +128,24 @@ send-keys)
     done
     if [ "$literal" = 1 ]; then
         printf 'launch %s\n' "$text" >> "$STUB_DATA/steps.log"
+        if [ -f "$STUB_DATA/kill_on_launch" ]; then
+            kill -TERM $PPID
+            exit 143
+        fi
         sh -c "$text" >> "$STUB_DATA/pane.log" 2>&1 || true
     else
         printf 'enter %s\n' "$text" >> "$STUB_DATA/steps.log"
     fi
     ;;
 list-windows)
+    if [ -f "$STUB_DATA/hold_list_windows" ]; then
+        # A test holds the read: the answer is the list the file held
+        # when the read started, and the call waits for the release.
+        if [ -f "$STUB_DATA/windows" ]; then cat "$STUB_DATA/windows"; fi
+        rm -f "$STUB_DATA/hold_list_windows"
+        while [ ! -f "$STUB_DATA/release_list_windows" ]; do sleep 0.05; done
+        exit 0
+    fi
     if [ -f "$STUB_DATA/windows" ]; then cat "$STUB_DATA/windows"; fi
     ;;
 capture-pane)
@@ -374,8 +386,10 @@ class Env:
                                  "model": "flash-next-512k"},
             },
             "harnesses": {
-                "hermes": {"launch": "hermes-stub -p {profile}"},
-                "pi": {"launch": "pi-stub {window} {profile}"},
+                "hermes": {"launch": "hermes-stub -p {profile} "
+                                     "--session {session}"},
+                "pi": {"launch": "pi-stub {window} {profile} "
+                                 "--session {session}"},
             },
             "repos": {REPO: {"clone": str(self.clone)}},
         }
@@ -468,6 +482,49 @@ def set_pr(env: Env, branch: str, number: int, state: str, head: str) -> None:
 def lane_worktree(env: Env, issue: int) -> Path:
     """The worktree a lane for the issue works in."""
     return env.worktree_root / f"tooling-{issue}"
+
+
+def table_columns(db: Path, table: str) -> list[sqlite3.Row]:
+    """The columns a table carries, read without the tool."""
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        return conn.execute(f"PRAGMA table_info({table})").fetchall()
+    finally:
+        conn.close()
+
+
+def lease_row(env: Env, lease_id: int) -> dict:
+    """One lease, read from the database without the tool.
+
+    The tool reconciles when it reads, so a test that wants the state
+    the tool wrote reads the row itself.
+    """
+    conn = sqlite3.connect(f"file:{env.db}?mode=ro", uri=True, timeout=30)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT * FROM leases WHERE id = ?",
+                           (lease_id,)).fetchone()
+        return dict(row) if row is not None else {}
+    finally:
+        conn.close()
+
+
+def stop_lane(env: Env, issue: int) -> None:
+    """A lane whose window closed: its lease reads stopped."""
+    env.remove_window(f"tooling-{issue}")
+    env.leases()
+
+
+def launch_lines(env: Env) -> list[str]:
+    """The commands the tool typed into a window, in order."""
+    return [line for line in env.steps() if line.startswith("launch ")]
+
+
+def window_lines(env: Env) -> list[str]:
+    """The windows the tool opened, in order."""
+    return [line for line in env.log("tmux.log").splitlines()
+            if "new-window" in line]
 
 
 def spawn_merged(env: Env, issue: int, number: int = 12) -> str:
@@ -1708,6 +1765,399 @@ def test_list_pr(env: Env) -> list[str]:
     return failures
 
 
+def test_spawn_session(env: Env) -> list[str]:
+    """A spawn gives the lane a session id, and its window the lease.
+
+    The session id is the harness's own name for the conversation: the
+    same id resumes the lane, and the lease is what the launcher in the
+    window checks.
+    """
+    failures = []
+    result = env.spawn(5)
+    if result.returncode != 0:
+        return [f"spawn session: the spawn failed: {result.stderr.strip()!r}"]
+    lease = env.leases()[0]
+    session = lease.get("harness_session") or ""
+    if not session:
+        failures.append("spawn session: the lease records no session id")
+    launches = launch_lines(env)
+    if len(launches) != 1 or session not in launches[0]:
+        failures.append(f"spawn session: the launch does not carry the "
+                        f"session id: {launches}")
+    windows = window_lines(env)
+    if len(windows) != 1 or f"-e LANE_LEASE={lease['id']}" not in windows[0]:
+        failures.append(f"spawn session: the window does not carry the "
+                        f"lease: {windows}")
+    return failures
+
+
+def test_harness_without_session(env: Env) -> list[str]:
+    """A harness that cannot resume is refused when the settings are read.
+
+    A lane started without a session id can never be brought back, so
+    the settings are refused before a lane is ever started.
+    """
+    cfg = env.default_config()
+    cfg["harnesses"]["pi"]["launch"] = "pi-stub {window} {profile}"
+    env.write_config(cfg)
+    failures = []
+    result = env.spawn(5, harness="pi")
+    if result.returncode == 0:
+        failures.append("harness without session: the spawn was allowed")
+    elif "pi" not in result.stderr:
+        failures.append(f"harness without session: the refusal did not name "
+                        f"the harness: {result.stderr.strip()!r}")
+    if env.log("tmux.log"):
+        failures.append("harness without session: the refused spawn reached "
+                        "tmux")
+    if env.log("gh.log"):
+        failures.append("harness without session: the refused spawn reached "
+                        "gh")
+    return failures
+
+
+def test_old_database_session(env: Env) -> list[str]:
+    """A database from an earlier version is brought up to date.
+
+    The lease of a lane from that database records no session id, so it
+    cannot be resumed: the column is added, and the refusal says so.
+    """
+    failures = []
+    first = env.spawn(5)
+    if first.returncode != 0:
+        return [f"old database session: the spawn failed: "
+                f"{first.stderr.strip()!r}"]
+    older = sqlite3.connect(env.db, isolation_level=None, timeout=30)
+    older.row_factory = sqlite3.Row
+    columns = {row["name"] for row in
+               older.execute("PRAGMA table_info(leases)")}
+    if "harness_session" in columns:
+        older.execute("ALTER TABLE leases DROP COLUMN harness_session")
+    older.close()
+    listing = env.run("list", "--json")
+    if listing.returncode != 0:
+        failures.append(f"old database session: the read failed: "
+                        f"{listing.stderr.strip()!r}")
+    columns = {row["name"] for row in
+               table_columns(env.db, "leases")}
+    if "harness_session" not in columns:
+        failures.append(f"old database session: the column was not added "
+                        f"back: {columns}")
+    stop_lane(env, 5)
+    resumed = env.run("resume", "1")
+    if resumed.returncode == 0:
+        failures.append("old database session: a lane with no session id was "
+                        "resumed")
+    elif "session" not in resumed.stderr:
+        failures.append(f"old database session: the refusal did not name the "
+                        f"session: {resumed.stderr.strip()!r}")
+    return failures
+
+
+def test_resume(env: Env) -> list[str]:
+    """A stopped lane comes back in a new window, in its own conversation."""
+    failures = []
+    result = env.spawn(5)
+    if result.returncode != 0:
+        return [f"resume: the spawn failed: {result.stderr.strip()!r}"]
+    lease = env.leases()[0]
+    session = lease.get("harness_session") or ""
+    stop_lane(env, 5)
+    resumed = env.run("resume", str(lease["id"]))
+    if resumed.returncode != 0:
+        return [f"resume: the resume failed: {resumed.stderr.strip()!r}"]
+    launches = launch_lines(env)
+    if len(launches) != 2:
+        failures.append(f"resume: the harness was not started again: "
+                        f"{launches}")
+    elif session not in launches[1]:
+        failures.append(f"resume: the resume started another conversation: "
+                        f"{launches}")
+    windows = window_lines(env)
+    if len(windows) != 2:
+        failures.append(f"resume: no new window was opened: {windows}")
+    else:
+        if f"-e LANE_LEASE={lease['id']}" not in windows[1]:
+            failures.append(f"resume: the window does not carry the lease: "
+                            f"{windows[1]}")
+        worktree = os.path.realpath(str(lane_worktree(env, 5)))
+        if f"-c {worktree}" not in windows[1]:
+            failures.append(f"resume: the window is not in the lane's "
+                            f"worktree: {windows[1]}")
+    row = lease_row(env, lease["id"])
+    if row.get("state") != "busy":
+        failures.append(f"resume: the lease reads {row.get('state')!r} rather "
+                        f"than 'busy'")
+    if f"target 0:tooling-5" not in resumed.stdout:
+        failures.append(f"resume: the resume did not report the target: "
+                        f"{resumed.stdout!r}")
+    return failures
+
+
+def test_resume_refuses(env: Env) -> list[str]:
+    """A busy, idle or released lane is refused before anything opens."""
+    failures = []
+    result = env.spawn(5)
+    if result.returncode != 0:
+        return [f"resume refuses: the spawn failed: {result.stderr.strip()!r}"]
+    before = env.log("tmux.log")
+    busy = env.run("resume", "1")
+    if busy.returncode == 0:
+        failures.append("resume refuses: a busy lane was resumed")
+    elif "busy" not in busy.stderr:
+        failures.append(f"resume refuses: the refusal did not name the "
+                        f"state: {busy.stderr.strip()!r}")
+    if env.log("tmux.log") != before:
+        failures.append("resume refuses: the refused resume reached tmux")
+
+    env.set_pane("tooling-5", HERMES_IDLE)
+    env.leases()
+    before = env.log("tmux.log")
+    idle = env.run("resume", "1")
+    if idle.returncode == 0:
+        failures.append("resume refuses: an idle lane was resumed")
+    elif "idle" not in idle.stderr:
+        failures.append(f"resume refuses: the refusal did not name the "
+                        f"state: {idle.stderr.strip()!r}")
+    if env.log("tmux.log") != before:
+        failures.append("resume refuses: the refused resume reached tmux")
+
+    env.run("release", "1")
+    released = env.run("resume", "1")
+    if released.returncode == 0:
+        failures.append("resume refuses: a released lane was resumed")
+    elif "released" not in released.stderr:
+        failures.append(f"resume refuses: the refusal did not name the "
+                        f"release: {released.stderr.strip()!r}")
+    return failures
+
+
+def test_resume_pool(env: Env) -> list[str]:
+    """A resume that cannot take a pool unit is refused, and stops nothing."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    first = env.spawn(1)
+    if first.returncode != 0:
+        return [f"resume pool: the first spawn failed: "
+                f"{first.stderr.strip()!r}"]
+    stop_lane(env, 1)
+    second = env.spawn(2)
+    if second.returncode != 0:
+        return [f"resume pool: the second spawn failed: "
+                f"{second.stderr.strip()!r}"]
+    result = env.run("resume", "1")
+    if result.returncode == 0:
+        failures.append("resume pool: the resume took a unit the pool did "
+                        "not have")
+    elif "minimax" not in result.stderr:
+        failures.append(f"resume pool: the refusal did not name the pool: "
+                        f"{result.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"resume pool: the lease reads {row.get('state')!r} "
+                        f"rather than 'stopped'")
+    return failures
+
+
+def test_resume_without_worktree(env: Env) -> list[str]:
+    """A lane whose worktree is gone cannot be resumed."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["resume without worktree: the spawn failed"]
+    stop_lane(env, 5)
+    subprocess.run(["git", "-C", str(env.clone), "worktree", "remove",
+                    "--force", str(lane_worktree(env, 5))], check=True,
+                   capture_output=True)
+    result = env.run("resume", "1")
+    if result.returncode == 0:
+        failures.append("resume without worktree: the lane was resumed "
+                        "without a worktree")
+    elif str(lane_worktree(env, 5)) not in result.stderr:
+        failures.append(f"resume without worktree: the refusal did not name "
+                        f"the worktree: {result.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"resume without worktree: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    return failures
+
+
+def test_resume_open_window(env: Env) -> list[str]:
+    """A lane whose window name is taken is refused, and that window stays."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["resume open window: the spawn failed"]
+    stop_lane(env, 5)
+    (env.data / "windows").write_text("tooling-5\n")
+    result = env.run("resume", "1")
+    if result.returncode == 0:
+        failures.append("resume open window: the lane was resumed into a "
+                        "window name that was taken")
+    elif "tooling-5" not in result.stderr:
+        failures.append(f"resume open window: the refusal did not name the "
+                        f"window: {result.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"resume open window: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    if "tooling-5" not in (env.data / "windows").read_text():
+        failures.append("resume open window: the window was closed")
+    if "kill-window" in env.log("tmux.log"):
+        failures.append("resume open window: the resume closed a window it "
+                        "did not open")
+    return failures
+
+
+def test_resume_window_fails(env: Env) -> list[str]:
+    """A window that cannot be opened puts the lease back to stopped."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["resume window fails: the spawn failed"]
+    stop_lane(env, 5)
+    (env.data / "fail_new_window").write_text("")
+    result = env.run("resume", "1")
+    if result.returncode == 0:
+        failures.append("resume window fails: the resume reported success")
+    elif "ERR window" not in result.stderr:
+        failures.append(f"resume window fails: the failure did not name the "
+                        f"step: {result.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"resume window fails: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    return failures
+
+
+def test_resume_interrupted(env: Env) -> list[str]:
+    """A resume that is interrupted closes its window and stops the lease."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["resume interrupted: the spawn failed"]
+    stop_lane(env, 5)
+    (env.data / "kill_on_launch").write_text("")
+    result = env.run("resume", "1")
+    if result.returncode != 143:
+        failures.append(f"resume interrupted: the exit status was "
+                        f"{result.returncode}, not 143")
+    if "tooling-5" in (env.data / "windows").read_text():
+        failures.append("resume interrupted: the window was left open")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"resume interrupted: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    return failures
+
+
+def test_resume_race(env: Env) -> list[str]:
+    """Two resumes for the last pool unit: one wins, one is refused."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    for issue in (1, 2):
+        if env.spawn(issue).returncode != 0:
+            return [f"resume race: the spawn for {issue} failed"]
+        stop_lane(env, issue)
+    procs = []
+    for lease_id in (1, 2):
+        procs.append(subprocess.Popen([str(env.lane), "resume", str(lease_id)],
+                                      stdout=subprocess.PIPE,
+                                      stderr=subprocess.PIPE, text=True,
+                                      env=env.env()))
+    results = [proc.communicate() for proc in procs]
+    codes = [proc.returncode for proc in procs]
+    if sorted(codes) != [0, 1]:
+        failures.append(f"resume race: expected one resume to win and the "
+                        f"other to be refused, got {codes} "
+                        f"{[r[1].strip() for r in results]}")
+    for stderr, code in zip([r[1] for r in results], codes):
+        if code == 0:
+            continue
+        if "pool" not in stderr or "minimax" not in stderr:
+            failures.append(f"resume race: the refusal did not name the "
+                            f"pool: {stderr.strip()!r}")
+    return failures
+
+
+def test_check(env: Env) -> list[str]:
+    """The lease check reads the database, and nothing else."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["check: the spawn failed"]
+    tmux_before = env.log("tmux.log")
+    gh_before = env.log("gh.log")
+    live = env.run("check", "1")
+    if live.returncode != 0:
+        failures.append(f"check: a live lease did not check out: "
+                        f"{live.stderr.strip()!r}")
+    if env.log("tmux.log") != tmux_before or env.log("gh.log") != gh_before:
+        failures.append("check: the check reached tmux or gh")
+    env.run("release", "1")
+    released = env.run("check", "1")
+    if released.returncode != 1:
+        failures.append(f"check: a released lease checked out: "
+                        f"{released.stdout!r}")
+    elif "released" not in released.stderr:
+        failures.append(f"check: the refusal did not name the release: "
+                        f"{released.stderr.strip()!r}")
+    missing = env.run("check", "99")
+    if missing.returncode != 1:
+        failures.append(f"check: a missing lease checked out: "
+                        f"{missing.stdout!r}")
+    elif "missing" not in missing.stderr:
+        failures.append(f"check: the refusal did not name the missing lease: "
+                        f"{missing.stderr.strip()!r}")
+    return failures
+
+
+def test_reconcile_leaves_a_resumed_lane(env: Env) -> list[str]:
+    """A reconcile that read a lane before it started leaves it alone.
+
+    The reconcile reads the leases and then asks tmux about each window,
+    and a resume can claim the lease in between. The write the reconcile
+    makes is conditional on the window it asked about, so a lane that is
+    starting keeps its pool unit.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(1).returncode != 0:
+        return ["reconcile leaves a resumed lane: the spawn failed"]
+    stop_lane(env, 1)
+    # The spawn reads the leases and then holds the read of the windows,
+    # so the resume claims the lease while the reconcile is still asking
+    # tmux about a window that is already gone.
+    (env.data / "hold_list_windows").write_text("")
+    spawner = subprocess.Popen(
+        [str(env.lane), "spawn", "--repo", REPO, "--issue", "2", "--harness",
+         "hermes", "--profile", "minimax", "--session", "coord-a"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env.env())
+    deadline = time.time() + 30
+    while time.time() < deadline and (env.data / "hold_list_windows").exists():
+        time.sleep(0.05)
+    resumed = env.run("resume", "1")
+    (env.data / "release_list_windows").write_text("")
+    _, err = spawner.communicate()
+    if resumed.returncode != 0:
+        return [f"reconcile leaves a resumed lane: the resume failed: "
+                f"{resumed.stderr.strip()!r}"]
+    if spawner.returncode == 0:
+        failures.append("reconcile leaves a resumed lane: the spawn took a "
+                        "pool unit the resumed lane holds")
+    elif "minimax" not in err:
+        failures.append(f"reconcile leaves a resumed lane: the refusal did "
+                        f"not name the pool: {err.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "busy":
+        failures.append(f"reconcile leaves a resumed lane: the lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    return failures
+
+
 CASES = [
     ("race", test_race),
     ("read-under-a-write-lock", test_read_under_a_write_lock),
@@ -1745,6 +2195,19 @@ CASES = [
     ("finish-prune-fails", test_finish_prune_fails),
     ("finish-merged-lanes", test_finish_merged_lanes),
     ("list-pr", test_list_pr),
+    ("spawn-session", test_spawn_session),
+    ("harness-without-session", test_harness_without_session),
+    ("old-database-session", test_old_database_session),
+    ("resume", test_resume),
+    ("resume-refuses", test_resume_refuses),
+    ("resume-pool", test_resume_pool),
+    ("resume-without-worktree", test_resume_without_worktree),
+    ("resume-open-window", test_resume_open_window),
+    ("resume-window-fails", test_resume_window_fails),
+    ("resume-interrupted", test_resume_interrupted),
+    ("resume-race", test_resume_race),
+    ("check", test_check),
+    ("reconcile-leaves-a-resumed-lane", test_reconcile_leaves_a_resumed_lane),
 ]
 
 

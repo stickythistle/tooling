@@ -1,6 +1,9 @@
 # Copy to ~/.config/agent-tools/lanes.toml and fill in. The tool reads it
 # from there, or from $LANE_CONFIG, and refuses a key it cannot act on.
 # Every value here is a placeholder.
+#
+# Every harness's launch must fill {session}: the id names the harness's
+# conversation, and a lane started without one can never be resumed.
 
 tmux_session = "0"          # tmux target session
 worktree_root = "~/wt"      # default worktree: <root>/<repo name>-<issue>
@@ -22,10 +25,15 @@ cost = 2
 model = "flash-next-512k"
 
 [harnesses.hermes]
-launch = "~/.local/bin/hermes -p {profile}"
+# The session id names the harness's conversation: `--continue <name>`
+# creates it the first time and resumes it after. `--create-if-missing`
+# belongs to `hermes chat`.
+launch = "~/.local/bin/hermes chat -p {profile} --continue {session} --create-if-missing"
 
 [harnesses.pi]
-launch = "~/pi-lane/pi-lane.sh {window} {profile}"
+# The launcher's first argument is the session id, which it passes to
+# `pi --session-id`.
+launch = "~/pi-lane/pi-lane.sh {session} {profile}"
 
 [repos."stickythistle/tooling"]
 clone = "~/tooling-fixpr"
