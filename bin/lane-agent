@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""The agent host's side of a lane: its windows and its processes.
+
+    lane-agent tmux ARGS...        run tmux here
+    lane-agent capture TARGET      print a window's text
+    lane-agent stop-in WORKTREE    stop a worktree's processes
+
+The panes and the processes are here.
+"""
+from __future__ import annotations
+
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# How long a signalled process group has to go before it is killed.
+KILL_GRACE = 10.0
+
+
+def tmux_env() -> dict:
+    """The environment tmux runs with.
+
+    The agent host keeps its sockets in its own directory. A tmux that
+    finds no socket starts a second server, and a second server sees no
+    windows, so every lane would read as gone.
+    """
+    env = dict(os.environ)
+    env.setdefault("TMUX_TMPDIR", os.path.expanduser("~/.tmux-sockets"))
+    return env
+
+
+def tmux(args: list[str]) -> int:
+    """Run a tmux command here, and be it.
+
+    The exec keeps the tmux in this process, so a signal to this
+    helper's caller reaches the tmux and not a child of it.
+    """
+    os.execvpe("tmux", ["tmux", *args], tmux_env())
+    return 127
+
+
+def capture(target: str) -> int:
+    """Print what a window shows.
+
+    A window that is gone prints nothing: there is nothing to show.
+    """
+    result = subprocess.run(["tmux", "capture-pane", "-p", "-t", target],
+                            capture_output=True, text=True, env=tmux_env())
+    if result.returncode != 0:
+        return result.returncode
+    sys.stdout.write(result.stdout)
+    return 0
+
+
+def process_alive(pid: int) -> bool:
+    """Whether a process is still running.
+
+    A zombie has exited and is only waiting to be reaped, and it holds
+    nothing.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            data = handle.read()
+    except OSError:
+        return False
+    end = data.rfind(")")
+    if end < 0:
+        return False
+    fields = data[end + 2:].split()
+    return bool(fields) and fields[0] != "Z"
+
+
+def lane_processes(worktree: Path) -> list[tuple[int, int]]:
+    """The processes working inside the worktree, with their groups.
+
+    The working directory is the fact. A pattern over command lines
+    matches this helper's own command and every process that merely
+    names the path.
+    """
+    root = os.path.realpath(str(worktree))
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        real = os.path.realpath(cwd)
+        if real != root and not real.startswith(root + os.sep):
+            continue
+        try:
+            group = os.getpgid(pid)
+        except OSError:
+            continue
+        found.append((pid, group))
+    return found
+
+
+def stop_in(worktree: Path) -> int:
+    """Stop the processes the lane left running, and say which.
+
+    The group goes, not the process: a reparented `gate-verify` holds
+    the builder's bench lock, and a TERM to the gate takes its group
+    down.
+    """
+    groups: dict[int, list[int]] = {}
+    mine = os.getpgrp()
+    for pid, group in lane_processes(worktree):
+        # This helper's own group is skipped: signalling it kills this
+        # helper, and the caller with it.
+        if group <= 1 or group == mine:
+            continue
+        groups.setdefault(group, []).append(pid)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + KILL_GRACE
+    while time.time() < deadline:
+        if not any(process_alive(pid)
+                   for pids in groups.values() for pid in pids):
+            break
+        time.sleep(0.1)
+    for group, pids in groups.items():
+        if any(process_alive(pid) for pid in pids):
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except OSError:
+                pass
+    for group, pids in groups.items():
+        for pid in pids:
+            print(f"stopped pid {pid} in group {group}")
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        print("usage: lane-agent {tmux ARGS... | capture TARGET | "
+              "stop-in WORKTREE}", file=sys.stderr)
+        return 2
+    command, rest = argv[1], argv[2:]
+    if command == "tmux":
+        return tmux(rest)
+    if command == "capture":
+        if len(rest) != 1:
+            print("usage: lane-agent capture TARGET", file=sys.stderr)
+            return 2
+        return capture(rest[0])
+    if command == "stop-in":
+        if len(rest) != 1:
+            print("usage: lane-agent stop-in WORKTREE", file=sys.stderr)
+            return 2
+        return stop_in(Path(rest[0]))
+    print(f"lane-agent: {command} is not something this helper does",
+          file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

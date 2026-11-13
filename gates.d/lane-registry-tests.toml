@@ -1,8 +1,8 @@
-# The lane registry: one database that owns which lanes are running. The
-# gate names the tool and the library it is built from, because a change
-# to either is a change to the claim.
+# The lane registry: one service that owns which lanes are running. The
+# gate names the tool, the helper that runs on the agent host, the
+# libraries they are built from and the reporter's units.
 
 [[gates]]
 name = "lane registry tests"
-when = '^(bin/lane|lib/lane\.py|tests/test_lane\.py)$'
+when = '^(bin/lane|bin/lane-agent|lib/lane\.py|lib/lane_keeper\.py|tests/test_lane\.py|install/lane-report/)$'
 run = "python3 tests/test_lane.py"

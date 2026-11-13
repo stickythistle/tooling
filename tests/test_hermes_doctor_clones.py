@@ -68,10 +68,21 @@ def install_hook(clone, body):
 
 
 def lanes_toml(path, clones):
+    """The settings the doctor reads.
+
+    They carry the keeper's address and the token file: the doctor
+    reads the settings the lane reads, and the lane cannot act without
+    the keeper.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    token = path.parent / "lane-token"
+    token.write_text("a-token")
+    token.chmod(0o600)
     lines = ['tmux_session = "0"', ""]
     for name, clone in clones:
         lines += [f'[repos."{name}"]', f'clone = "{clone}"', ""]
-    path.parent.mkdir(parents=True, exist_ok=True)
+    lines += ["[keeper]", 'url = "http://127.0.0.1:8787"',
+              f'token_file = "{token}"', ""]
     path.write_text("\n".join(lines))
     return path
 

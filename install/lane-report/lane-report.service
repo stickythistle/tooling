@@ -1,0 +1,15 @@
+[Unit]
+Description=Report the lanes' panes and pull requests to the lane keeper
+Documentation=man:lane(1)
+
+[Service]
+Type=oneshot
+# The reporter runs on the agent host, where the windows and the worktrees
+# are: it reads the panes and asks the forge about each lane's pull
+# request, and the keeper cannot do either.
+ExecStart=%h/bin/lane report
+# A user service reads no profile, so the tools it calls are named here.
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+# The tmux sockets live in their own directory, and a tmux that finds
+# another socket sees no windows at all.
+Environment=TMUX_TMPDIR=%h/.tmux-sockets
