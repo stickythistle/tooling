@@ -5,7 +5,10 @@
 # fetch in a sibling worktree can move it between fork and squash. `merge-base`
 # is fixed, so the squash commit's parent stays at the fork point.
 #
-# Usage: squash [--base REF] [-m MSG | -F FILE]
+# `-s` adds the DCO sign-off, and `--onto` moves the commit onto a base newer
+# than the fork point.
+#
+# Usage: squash [--base REF] [-m MSG | -F FILE] [-s] [--onto REF]
 set -euo pipefail
 
 # readlink -f, not `cd -P`: bin/ is reached through a symlink on PATH, and
@@ -16,11 +19,13 @@ LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
 
 usage() {
 	cat >&2 <<'EOF'
-usage: squash [--base REF] [-m MSG | -F FILE]
+usage: squash [--base REF] [-m MSG | -F FILE] [-s] [--onto REF]
 
   --base REF   ref to compute the fork point against (default: origin/main)
   -m MSG       commit message
   -F FILE      commit message file
+  -s           add the DCO sign-off for the identity the commit carries
+  --onto REF   move the squashed commit onto REF
 EOF
 	exit 2
 }
@@ -28,11 +33,17 @@ EOF
 BASE=origin/main
 MSG_FILE=
 MSG_TEXT=
+SIGN=0
+ONTO=
+# Whether the commit is an amend, which keeps the author it already has.
+AMENDING=0
 while [ $# -gt 0 ]; do
 	case "$1" in
 	--base) [ $# -ge 2 ] || usage; BASE=$2; shift 2 ;;
 	-m) [ $# -ge 2 ] || usage; MSG_TEXT=$2; shift 2 ;;
 	-F) [ $# -ge 2 ] || usage; MSG_FILE=$2; shift 2 ;;
+	-s) SIGN=1; shift ;;
+	--onto) [ $# -ge 2 ] || usage; ONTO=$2; shift 2 ;;
 	-h | --help) usage ;;
 	*) echo "squash: unknown argument: $1" >&2; usage ;;
 	esac
@@ -59,6 +70,12 @@ git rev-parse --verify --quiet "$BASE" >/dev/null || {
 	echo "squash: no such ref: $BASE" >&2
 	exit 2
 }
+if [ -n "$ONTO" ]; then
+	git rev-parse --verify --quiet "$ONTO^{commit}" >/dev/null || {
+		echo "squash: no such ref: $ONTO" >&2
+		exit 2
+	}
+fi
 if [ -n "$MSG_FILE" ] && [ ! -r "$MSG_FILE" ]; then
 	echo "squash: message file not readable: $MSG_FILE" >&2
 	exit 2
@@ -90,6 +107,116 @@ current_message() {
 	git cat-file commit HEAD | sed '1,/^$/d'
 }
 
+# The identity the commit carries: the author a new commit gets, or the
+# author an amend keeps. The DCO sign-off names the author, so this is what
+# the sign-off has to say.
+signoff_identity() {
+	local ident
+	if [ "$AMENDING" -eq 1 ]; then
+		git log -1 --format='%an <%ae>' HEAD
+		return 0
+	fi
+	ident=$(git var GIT_AUTHOR_IDENT 2>/dev/null) || return 1
+	printf '%s\n' "$ident" | sed 's/ [0-9][0-9]* [+-][0-9]\{4\}$//'
+}
+
+# The sign-off lines a message carries, without their prefix.
+signoff_lines() {
+	sed -n 's/^[Ss]igned-off-by:[[:space:]]*//p'
+}
+
+# Two identities are the same when they say the same name and address,
+# whatever the spacing or the case.
+same_identity() {
+	[ "$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -d '[:space:]')" = \
+		"$(printf '%s' "$2" | tr 'A-Z' 'a-z' | tr -d '[:space:]')" ]
+}
+
+# The message the commit carries: what the caller asked for, with the
+# sign-off in it when -s was given.
+MESSAGE=
+prepare_message() {
+	local msg=$1 identity existing count
+	if [ "$SIGN" -eq 0 ]; then
+		MESSAGE=$msg
+		return 0
+	fi
+	if ! identity=$(signoff_identity); then
+		echo "squash: no identity to sign with: set user.name and user.email in the repository's git config" >&2
+		exit 2
+	fi
+	existing=$(printf '%s\n' "$msg" | signoff_lines)
+	if [ -n "$existing" ]; then
+		count=$(printf '%s\n' "$existing" | awk 'END {print NR}')
+		if [ "$count" -eq 1 ] && same_identity "$existing" "$identity"; then
+			MESSAGE=$msg
+			return 0
+		fi
+		echo "squash: the message carries a sign-off, and this commit would be signed by $identity" >&2
+		printf 'squash:   %s\n' "$existing" >&2
+		echo "squash: one commit is signed by one person; the existing sign-off was left alone" >&2
+		exit 1
+	fi
+	MESSAGE=$(printf '%s\n' "$msg" | git interpret-trailers --trailer "Signed-off-by: $identity")
+}
+
+# The message git reads the commit from.
+MSG_TMP=$(mktemp "${TMPDIR:-/tmp}/squash-message.XXXXXX") || {
+	echo "squash: could not create a file for the commit message" >&2
+	exit 2
+}
+trap 'rm -f "$MSG_TMP"' EXIT
+
+# The move onto another base, when there was one.
+report_move() {
+	[ "$MOVED" -eq 1 ] || return 0
+	echo "squash: moved the commit onto $ONTO"
+	echo "  undo the move with: git reset --hard $MOVED_FROM"
+}
+
+# What the tool did, and how to undo it.
+report() {
+	echo "squash: $1"
+	report_move
+	echo "  undo with: git reset --hard $PRE"
+}
+
+# Move the one commit onto REF.
+#
+# The rebase keeps REF's newer changes in the tree. A conflict aborts it,
+# leaving HEAD on the squashed commit.
+MOVED=0
+MOVED_FROM=
+move_onto() {
+	local parent onto_sha conflicts path
+	[ -n "$ONTO" ] || return 0
+	onto_sha=$(git rev-parse "$ONTO^{commit}")
+	parent=$(git rev-parse --verify --quiet "HEAD^") || {
+		echo "squash: the commit has no parent to move from" >&2
+		exit 1
+	}
+	[ "$parent" != "$onto_sha" ] || return 0
+	MOVED_FROM=$(git rev-parse HEAD)
+	if git rebase --onto "$onto_sha" "$parent"; then
+		MOVED=1
+		return 0
+	fi
+	conflicts=$(git diff --name-only --diff-filter=U)
+	if [ -d "$(git rev-parse --git-path rebase-merge)" ] ||
+		[ -d "$(git rev-parse --git-path rebase-apply)" ]; then
+		git rebase --abort
+		echo "squash: the rebase onto $ONTO conflicted in:" >&2
+		printf '%s\n' "$conflicts" | while IFS= read -r path; do
+			[ -n "$path" ] && printf 'squash:   %s\n' "$path" >&2
+		done
+		echo "squash: the rebase was aborted; HEAD is at $(git rev-parse HEAD)" >&2
+		echo "squash: resume by hand: git rebase --onto $ONTO $parent" >&2
+		exit 1
+	fi
+	echo "squash: the rebase onto $ONTO failed" >&2
+	exit 1
+}
+
 # Nothing to squash: HEAD is at the fork point, or one commit on top of it.
 # A message needs a commit to sit on, so the fork point refuses one.
 if [ "$COUNT" -eq 0 ]; then
@@ -97,29 +224,41 @@ if [ "$COUNT" -eq 0 ]; then
 		echo "squash: HEAD is at the fork point ($PRE); there is no commit to put the message on" >&2
 		exit 1
 	fi
+	if [ "$SIGN" -eq 1 ]; then
+		echo "squash: HEAD is already at the fork point ($PRE); there is no commit to sign off" >&2
+		exit 0
+	fi
 	echo "squash: HEAD is already at the fork point ($PRE); nothing to squash" >&2
 	exit 0
 fi
 
 if [ "$COUNT" -eq 1 ]; then
-	if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
+	AMENDING=1
+	if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ] && [ "$SIGN" -eq 0 ]; then
 		echo "squash: HEAD is already one commit on top of the fork ($PRE); nothing to squash" >&2
+		move_onto
+		report_move
 		exit 0
 	fi
 
-	if [ "$(current_message)" = "$(desired_message)" ]; then
+	if [ -n "$MSG_TEXT" ] || [ -n "$MSG_FILE" ]; then
+		prepare_message "$(desired_message)"
+	else
+		prepare_message "$(current_message)"
+	fi
+
+	if [ "$MESSAGE" = "$(current_message)" ]; then
 		echo "squash: HEAD is already one commit on top of the fork ($PRE) and carries that message; nothing to squash" >&2
+		move_onto
+		report_move
 		exit 0
 	fi
 
 	# Only the message moves. `--amend` keeps the author, so a squashed
 	# commit still credits the lane that wrote it.
 	trap 'git reset --soft "$PRE" >/dev/null; exit 1' ERR
-	if [ -n "$MSG_FILE" ]; then
-		git commit --quiet --amend -F "$MSG_FILE"
-	else
-		git commit --quiet --amend -m "$MSG_TEXT"
-	fi
+	printf '%s\n' "$MESSAGE" >"$MSG_TMP"
+	git commit --quiet --amend -F "$MSG_TMP"
 	trap - ERR
 
 	if ! git diff --quiet "$PRE" HEAD; then
@@ -132,29 +271,30 @@ if [ "$COUNT" -eq 1 ]; then
 		exit 1
 	fi
 
-	echo "squash: amended the message on $PRE -> $(git rev-parse HEAD)"
-	echo "  undo with: git reset --hard $PRE"
+	move_onto
+	report "amended the message on $PRE -> $(git rev-parse HEAD)"
 	exit 0
 fi
 
 # There is work to squash, so a message is needed to squash it into.
 if [ -z "$MSG_TEXT" ] && [ -z "$MSG_FILE" ]; then
-	echo "squash: a commit message is required (-m MSG or -F FILE)" >&2
+	if [ "$SIGN" -eq 1 ]; then
+		echo "squash: a commit message is required (-m MSG or -F FILE); -s only adds the sign-off" >&2
+	else
+		echo "squash: a commit message is required (-m MSG or -F FILE)" >&2
+	fi
 	exit 2
 fi
+
+prepare_message "$(desired_message)"
 
 git reset --soft "$MERGE_BASE"
 
 # A failing commit (a rejecting hook, a signing error) would leave HEAD on the
 # fork point; put it back.
 trap 'git reset --soft "$PRE" >/dev/null; exit 1' ERR
-
-if [ -n "$MSG_FILE" ]; then
-	git commit --quiet -F "$MSG_FILE"
-else
-	git commit --quiet -m "$MSG_TEXT"
-fi
-
+printf '%s\n' "$MESSAGE" >"$MSG_TMP"
+git commit --quiet -F "$MSG_TMP"
 trap - ERR
 
 # The clean-tree refusal makes the index equal PRE's tree, so a changed tree
@@ -169,5 +309,5 @@ if ! git diff --quiet "$PRE" HEAD; then
 	exit 1
 fi
 
-echo "squash: $PRE -> $(git rev-parse HEAD)"
-echo "  undo with: git reset --hard $PRE"
+move_onto
+report "$PRE -> $(git rev-parse HEAD)"

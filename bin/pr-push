@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+# Push the current branch to the remote branch of the same name.
+#
+# The push is made against the remote's own tip, read with `ls-remote`. Only
+# a tip this branch once held may be replaced.
+#
+# Usage: pr-push [--remote NAME]
+set -euo pipefail
+
+# readlink -f, not `cd -P`: bin/ is reached through a symlink on PATH, and
+# BASH_SOURCE holds the symlink's own path.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+# shellcheck source=../lib/common.sh
+. "$LIB/common.sh"
+
+usage() {
+	cat >&2 <<'EOF'
+usage: pr-push [--remote NAME]
+
+  --remote NAME   the remote to push to (default: origin)
+EOF
+	exit 2
+}
+
+REMOTE=origin
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--remote) [ $# -ge 2 ] || usage; REMOTE=$2; shift 2 ;;
+	-h | --help) usage ;;
+	*) echo "pr-push: unknown argument: $1" >&2; usage ;;
+	esac
+done
+
+SRC=$(repo_root "$PWD")
+cd "$SRC"
+
+# The branch to push. A detached HEAD names no branch, so the remote has
+# nowhere to put it.
+if ! BRANCH=$(git symbolic-ref --quiet --short HEAD); then
+	echo "pr-push: HEAD is detached; there is no branch to push" >&2
+	exit 1
+fi
+
+# The remote's default branch: the branch its HEAD points at.
+if ! REMOTE_HEAD=$(git ls-remote --symref "$REMOTE" HEAD 2>/dev/null); then
+	echo "pr-push: cannot read the remote: $REMOTE" >&2
+	exit 1
+fi
+DEFAULT=$(printf '%s\n' "$REMOTE_HEAD" |
+	sed -n 's|^ref: refs/heads/\([^[:space:]]*\)[[:space:]]*HEAD$|\1|p')
+if [ -n "$DEFAULT" ] && [ "$BRANCH" = "$DEFAULT" ]; then
+	echo "pr-push: $BRANCH is the default branch of $REMOTE; refusing to push over it" >&2
+	exit 1
+fi
+
+# The pre-push hook is the secret scan: a push that skips it carries
+# whatever it carries off the host.
+HOOKS=$(git config --get core.hooksPath 2>/dev/null || true)
+if [ -z "$HOOKS" ]; then
+	echo "pr-push: core.hooksPath is not set, so no pre-push hook runs and push-guard never sees the push" >&2
+	exit 1
+fi
+if [ ! -d "$HOOKS" ]; then
+	echo "pr-push: core.hooksPath is not a directory: $HOOKS" >&2
+	exit 1
+fi
+if [ ! -x "$HOOKS/pre-push" ]; then
+	echo "pr-push: there is no pre-push hook in $HOOKS" >&2
+	exit 1
+fi
+if ! grep -q "push-guard" "$HOOKS/pre-push"; then
+	echo "pr-push: the pre-push hook in $HOOKS does not run push-guard" >&2
+	exit 1
+fi
+
+# The remote's tip for this branch: the commit a force would replace.
+R=$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" | awk 'NR == 1 {print $1}')
+
+if [ -z "$R" ]; then
+	# The branch is new to the remote: a plain push creates it.
+	PUSH=()
+elif git merge-base --is-ancestor "$R" HEAD 2>/dev/null; then
+	# The remote's tip is in our history: a fast-forward, a plain push.
+	PUSH=()
+elif git reflog --format=%H "refs/heads/$BRANCH" 2>/dev/null | grep -qx "$R"; then
+	# This branch held that commit and rewrote it: it may be replaced,
+	# with the lease at the remote's own value.
+	PUSH=(--force-with-lease="$BRANCH:$R")
+else
+	# Another writer's commit: this branch never held it. Fetch it, so
+	# the refusal can name it.
+	git fetch --quiet "$REMOTE" "$BRANCH" >/dev/null 2>&1 || true
+	WHO=$(git log -1 --format='%h %an %s' "$R" 2>/dev/null || echo "$R")
+	echo "pr-push: the remote branch $BRANCH is at $WHO, and this branch never held that commit; refusing to push over it" >&2
+	exit 1
+fi
+
+set +e
+git push "${PUSH[@]+"${PUSH[@]}"}" "$REMOTE" "HEAD:refs/heads/$BRANCH"
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+	echo "pr-push: the push to $REMOTE was refused (git exited $RC)" >&2
+	exit "$RC"
+fi
+
+NEW=$(git ls-remote "$REMOTE" "refs/heads/$BRANCH" | awk 'NR == 1 {print $1}')
+echo "pr-push: pushed $BRANCH to $REMOTE"
+echo "  new sha:    $NEW"
+
+# The merge base with the remote's main, from the remote-tracking ref. It is
+# a reading, not the lease: the lease came from the remote itself.
+BASE_REF=$REMOTE/main
+if git rev-parse --verify --quiet "$BASE_REF" >/dev/null; then
+	MB=$(git merge-base "$BASE_REF" HEAD)
+	echo "  merge base: $MB (with $BASE_REF)"
+	git diff --stat "$MB..HEAD"
+else
+	echo "  merge base: unknown ($BASE_REF is not fetched)"
+fi
