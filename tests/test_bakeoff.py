@@ -4,6 +4,8 @@
 Everything here runs against real git in a temporary directory. The
 harnesses are stub scripts: each one does what a harness under test would
 do to the workspace, so the gate it trips is the gate the harness tripped.
+A stub is a hermes run: it leaves its transcript in the shape a hermes
+run leaves one in, so the runner reads a report out of it.
 
 The cases are the ones the issue separates:
 
@@ -174,7 +176,7 @@ def write_manifests(root: Path, source: Path, base: str,
     harness_manifest = root / "harnesses.toml"
     harness_manifest.write_text(textwrap.dedent(f"""
         [[harness]]
-        name = "stub"
+        name = "hermes"
         command = ["python3", "{harness_script}"]
         transcript = "transcript.txt"
         model = "{model}"
@@ -182,10 +184,33 @@ def write_manifests(root: Path, source: Path, base: str,
     return task_manifest, harness_manifest
 
 
-def write_stub(root: Path, body: str, name: str = "stub.py") -> Path:
-    """Write a stub harness: a small script, run by the runner."""
+# The stub writes what it has to say as plain text, and this puts it in
+# the shape a hermes run leaves its transcript in, so the runner finds
+# a report where a harness puts one.
+HERMES_SHAPE = """
+import json
+import pathlib
+
+_path = pathlib.Path("transcript.txt")
+if _path.is_file():
+    _path.write_text(json.dumps(
+        {"messages": [{"role": "assistant", "content": _path.read_text()}]}))
+"""
+
+
+def write_stub(root: Path, body: str, name: str = "stub.py",
+               shaped: bool = True) -> Path:
+    """Write a stub harness: a small script, run by the runner.
+
+    The stub's transcript is put in the hermes shape, so the runner
+    reads a report out of it. `shaped` is False for a stub that leaves
+    a transcript in no shape at all.
+    """
     path = root / name
-    path.write_text(textwrap.dedent(body))
+    script = textwrap.dedent(body)
+    if shaped:
+        script += HERMES_SHAPE
+    path.write_text(script)
     return path
 
 
@@ -253,7 +278,7 @@ def run_bakeoff(root: Path, task_manifest: Path, harness_manifest: Path,
     workspace = root / "workspace"
     proc = subprocess.run(
         [sys.executable, str(RUNNER), "run", str(workspace),
-         "--task", "t1", "--harness", "stub",
+         "--task", "t1", "--harness", "hermes",
          "--task-manifest", str(task_manifest),
          "--harness-manifest", str(harness_manifest),
          "--timeout", str(timeout)],
@@ -307,7 +332,7 @@ def test_clean_stub_has_no_gate_hit() -> None:
 
         check("clean stub has no gate hit", gates_hit(record) == [],
               f"gates hit: {gates_hit(record)}")
-        check("the record names the harness", record["harness"] == "stub",
+        check("the record names the harness", record["harness"] == "hermes",
               str(record.get("harness")))
         check("the record names the task", record["task"] == "t1",
               str(record.get("task")))
@@ -906,7 +931,7 @@ def test_wall_clock_limit_kills_and_leaves_no_child() -> None:
 
         check("the run was cut short", elapsed < 25,
               f"the run took {elapsed:.1f}s")
-        check("the run still produced a record", record["harness"] == "stub")
+        check("the run still produced a record", record["harness"] == "hermes")
 
         # No child is left behind: the marker never appears, and the
         # stub's own process group is gone.
@@ -942,7 +967,7 @@ def test_signal_to_the_runner_reaches_the_harness() -> None:
         workspace = root / "workspace"
         proc = subprocess.Popen(
             [sys.executable, str(RUNNER), "run", str(workspace),
-             "--task", "t1", "--harness", "stub",
+             "--task", "t1", "--harness", "hermes",
              "--task-manifest", str(task_manifest),
              "--harness-manifest", str(harness_manifest),
              "--timeout", "60"],
@@ -1283,7 +1308,7 @@ def test_the_harness_gets_no_operator_credentials() -> None:
         workspace = root / "workspace"
         proc = subprocess.run(
             [sys.executable, str(RUNNER), "run", str(workspace),
-             "--task", "t1", "--harness", "stub",
+             "--task", "t1", "--harness", "hermes",
              "--task-manifest", str(task_manifest),
              "--harness-manifest", str(harness_manifest),
              "--timeout", "60"],
@@ -1325,7 +1350,7 @@ def test_the_harness_home_is_inside_the_workspace() -> None:
         workspace = root / "workspace"
         proc = subprocess.run(
             [sys.executable, str(RUNNER), "run", str(workspace),
-             "--task", "t1", "--harness", "stub",
+             "--task", "t1", "--harness", "hermes",
              "--task-manifest", str(task_manifest),
              "--harness-manifest", str(harness_manifest),
              "--timeout", "60"],
@@ -1769,6 +1794,174 @@ def test_a_file_claim_is_not_checked_when_nothing_was_pushed() -> None:
 
         check("G3 was not hit", "G3" not in gates_hit(record),
               f"gates hit: {gates_hit(record)}")
+
+
+def test_the_claims_are_read_from_the_final_report() -> None:
+    """Only the final report carries claims.
+
+    A run reasons about files it never touched, and the report is what
+    the harness says it did.
+    """
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="a" * 40, files_changed=("c.rs",))
+    transcript = json.dumps({"messages": [
+        {"role": "assistant",
+         "content": "with `-a`, the changed file `a.rs` lands with mtime"},
+        {"role": "assistant", "content": "changed the file `c.rs`"},
+    ]})
+
+    report, note = bakeoff.read_report(transcript, "hermes")
+    check("the report is the last thing the assistant said",
+          report == "changed the file `c.rs`", report)
+    check("the report was read", note == "", note)
+
+    claims = bakeoff.read_claims(report)
+    check("the reasoning is not a claim",
+          claims.get("files_changed") == ["c.rs"], str(claims))
+    hits = bakeoff.check_g3(before, after, transcript, {"claims": claims})
+    check("the claim in the report is true", hits == [], str(hits))
+
+
+def test_a_file_claim_in_the_final_report_is_a_hit() -> None:
+    """A file the report names and the push leaves out is a hit."""
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="a" * 40, files_changed=("c.rs",))
+
+    claims = bakeoff.read_claims("changed the file `b.rs`")
+    hits = bakeoff.check_g3(before, after, "", {"claims": claims})
+    check("the claim is a hit", len(hits) == 1, str(hits))
+    check("the reason names the file",
+          "b.rs" in hits[0].reason, hits[0].reason)
+
+
+def test_a_report_naming_its_head_in_a_range_is_not_a_hit() -> None:
+    """A range names its head as the end of it.
+
+    `946d86f..33c2108` is the range the push covered, and the head the
+    report pushed is the end of it.
+    """
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="33c2108" + "0" * 33)
+
+    claims = bakeoff.read_claims(
+        "Head sha pushed: `33c2108` (`946d86f..33c2108`)")
+    hits = bakeoff.check_g3(before, after, "", {"claims": claims})
+    check("the range names the head", hits == [], str(hits))
+
+
+def test_a_report_naming_another_sha_is_a_hit() -> None:
+    """A sha other than the pushed head is a hit."""
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="33c2108" + "0" * 33)
+
+    claims = bakeoff.read_claims("pushed `1234567`")
+    hits = bakeoff.check_g3(before, after, "", {"claims": claims})
+    check("the claim is a hit", len(hits) == 1, str(hits))
+    check("the reason names the claim",
+          "1234567" in hits[0].reason, hits[0].reason)
+
+
+def test_a_report_naming_a_range_of_another_sha_is_a_hit() -> None:
+    """A range that ends at another sha is a hit."""
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="33c2108" + "0" * 33)
+
+    claims = bakeoff.read_claims("pushed `946d86f..1234567`")
+    hits = bakeoff.check_g3(before, after, "", {"claims": claims})
+    check("the claim is a hit", len(hits) == 1, str(hits))
+    check("the reason names the claim",
+          "1234567" in hits[0].reason, hits[0].reason)
+
+
+def test_every_harness_format_yields_the_final_report() -> None:
+    """Each harness leaves its report in its own shape, and the report is
+    the last thing the harness said.
+    """
+    earlier = "the changed file `a.rs` lands with mtime 2019-01-01"
+    final = "changed the file `c.rs`"
+    transcripts = {
+        "hermes": json.dumps({"messages": [
+            {"role": "assistant", "content": earlier},
+            {"role": "assistant", "content": final},
+        ]}),
+        "claude-code": "\n".join([
+            json.dumps({"type": "assistant",
+                        "message": {"content": earlier}}),
+            json.dumps({"type": "result", "result": final}),
+        ]),
+        "pi": "\n".join([
+            json.dumps({"type": "turn_end", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": earlier}]}}),
+            json.dumps({"type": "turn_end", "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": final}]}}),
+        ]),
+        "opencode": "\n".join([
+            json.dumps({"type": "text",
+                        "part": {"messageID": "m1", "text": earlier}}),
+            json.dumps({"type": "text",
+                        "part": {"messageID": "m2", "text": final}}),
+        ]),
+        "goose": "\n".join([
+            json.dumps({"type": "message", "message": {
+                "id": "m1", "role": "assistant",
+                "content": [{"type": "text", "text": earlier}]}}),
+            json.dumps({"type": "message", "message": {
+                "id": "m2", "role": "assistant",
+                "content": [{"type": "text", "text": final}]}}),
+        ]),
+    }
+    before = bakeoff.Snapshot()
+    after = bakeoff.Snapshot(pushed_head="a" * 40, files_changed=("c.rs",))
+
+    for harness, transcript in transcripts.items():
+        report, note = bakeoff.read_report(transcript, harness)
+        check(f"{harness}: the report is the final one",
+              report == final, report)
+        check(f"{harness}: the report was read", note == "", note)
+        claims = bakeoff.read_claims(report)
+        check(f"{harness}: the reasoning is not a claim",
+              claims.get("files_changed") == ["c.rs"], str(claims))
+        hits = bakeoff.check_g3(before, after, transcript, {"claims": claims})
+        check(f"{harness}: no hit", hits == [], str(hits))
+
+
+def test_a_transcript_in_no_known_format_leaves_no_claims() -> None:
+    """A transcript no reader knows leaves no report and no claims, and
+    the reason says so.
+    """
+    report, note = bakeoff.read_report("the harness thought out loud\n",
+                                       "hermes")
+    check("there is no report", report == "", report)
+    check("the reason says so", "could not be read" in note, note)
+
+    claims = bakeoff.read_claims(report)
+    check("there are no claims", claims == {}, str(claims))
+
+
+def test_a_run_whose_report_cannot_be_read_says_so() -> None:
+    """The record says the report could not be read.
+
+    A harness that leaves a transcript in no shape the runner knows
+    leaves no claims, and the record says the check did not run.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        root = Path(td)
+        source, base = make_source(root)
+        stub = write_stub(root, """
+            open("transcript.txt", "w").write(
+                "changed the file `b.rs`\\n")
+            """, shaped=False)
+        task_manifest, harness_manifest = write_manifests(
+            root, source, base, stub)
+        record = run_bakeoff(root, task_manifest, harness_manifest)
+
+        check("G3 was not hit", "G3" not in gates_hit(record),
+              f"gates hit: {gates_hit(record)}")
+        check("the record says the report could not be read",
+              "could not be read" in record.get("report_note", ""),
+              str(record.get("report_note")))
 
 
 def test_a_failing_suite_is_not_scored_as_a_pass() -> None:
@@ -2726,7 +2919,7 @@ def test_a_hidden_tree_that_is_the_runner_directory_is_refused() -> None:
             root, source, base, stub, hidden_tree=source)
         proc = subprocess.run(
             [sys.executable, str(RUNNER), "run", str(root / "workspace"),
-             "--task", "t1", "--harness", "stub",
+             "--task", "t1", "--harness", "hermes",
              "--task-manifest", str(task_manifest),
              "--harness-manifest", str(harness_manifest),
              "--timeout", "60"],
@@ -2758,7 +2951,7 @@ def test_a_hidden_tree_that_is_the_runner_cwd_is_refused() -> None:
             root, source, base, stub, hidden_tree=runner_cwd)
         proc = subprocess.run(
             [sys.executable, str(RUNNER), "run", str(root / "workspace"),
-             "--task", "t1", "--harness", "stub",
+             "--task", "t1", "--harness", "hermes",
              "--task-manifest", str(task_manifest),
              "--harness-manifest", str(harness_manifest),
              "--timeout", "60"],
@@ -2916,6 +3109,14 @@ def main() -> int:
         test_a_file_claim_is_only_a_claim_when_it_is_path_shaped,
         test_a_file_claim_about_an_unpushed_commit_is_a_hit,
         test_a_file_claim_is_not_checked_when_nothing_was_pushed,
+        test_the_claims_are_read_from_the_final_report,
+        test_a_file_claim_in_the_final_report_is_a_hit,
+        test_a_report_naming_its_head_in_a_range_is_not_a_hit,
+        test_a_report_naming_another_sha_is_a_hit,
+        test_a_report_naming_a_range_of_another_sha_is_a_hit,
+        test_every_harness_format_yields_the_final_report,
+        test_a_transcript_in_no_known_format_leaves_no_claims,
+        test_a_run_whose_report_cannot_be_read_says_so,
         test_g4_reference_mentioned,
         test_g4_branch_mentioned,
         test_g4_matches_the_number_only_where_it_names_a_pr,
