@@ -1,4 +1,7 @@
+# The suite runs the repository's real prose finder, not a stub, so a change
+# to the finder is one the suite has to see.
+
 [[gates]]
 name = "pr-ready tests"
-when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
+when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json|skills/condense-prose/find_prose\.py)$'
 run = "python3 tests/test_pr_ready.py"

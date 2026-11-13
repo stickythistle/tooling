@@ -13,8 +13,12 @@ the directory, not this tool, and is not coverage for any specific one. The
 same probe distinguishes a real suite-coverage gate from one whose `when` is
 just a catch-all for tests/.
 
+A suite that opens the repository's skills is wired but still runs on no skill
+change: what it opens is a path under skills/, and the gate that runs it has to
+name paths there.
+
 `self_tests` runs the probe against bare and blanket patterns for both
-directories.
+directories, and the skill-read check against a fake tests/ and skills/.
 
 Run directly: `python3 tests/test_gate_coverage.py`.
 """
@@ -49,10 +53,23 @@ SUITE_PHONY = "tests/test___definitely_not_a_real_suite___.py"
 
 # bin/ and tests/ have per-file checks above, which the directory rule would
 # only paper over. skills/ is content the installer symlinks, not code this
-# repository has committed to gating. Hidden directories are VCS state.
+# repository has committed to gating -- but a suite that opens the tree is
+# gated on it, which is what check_skill_reads holds a gate to.
 DIR_EXEMPT = {"bin", "skills", "tests"} | {p.name for p in REPO_ROOT.iterdir()
                                           if p.name.startswith(".")}
 SOURCE_EXTS = (".sh", ".py")
+
+# The repository's skills tree, which a suite can open.
+SKILLS = REPO_ROOT / "skills"
+
+# The path a suite builds to open one: `REPO_ROOT / "skills" / "x" / ...`,
+# component by component. A quoted component is part of the path; a bare name
+# is a variable and ends it, since the check cannot say which skill follows.
+# The construction marks the read -- the word "skills" also turns up in suites
+# that build a fake tree in a tmpdir.
+SKILL_CHAIN = re.compile(
+    r"""REPO_ROOT\s*/\s*"skills"((?:\s*/\s*(?:"[^"]*"|\w+))*)""")
+SKILL_COMPONENT = re.compile(r'''"([^"]*)"|(\w+)''')
 
 
 def check_suites(gates: list, tests_dir: Path) -> tuple[list[str], list[str]]:
@@ -142,6 +159,70 @@ def suite_pins(suite: str) -> list[str]:
     return sorted(tool for tool in found if (REPO_ROOT / tool).is_file())
 
 
+def suite_skill_paths(tests_dir: Path, suite: str) -> list[str]:
+    """The skill paths a suite opens, repo-relative and in source order.
+
+    A path built with a variable resolves to `skills`, the directory under it,
+    which is all the check can name.
+    """
+    try:
+        text = (tests_dir / suite).read_text()
+    except OSError:
+        return []
+    found = []
+    for chain in SKILL_CHAIN.finditer(text):
+        parts = ["skills"]
+        for literal, _name in SKILL_COMPONENT.findall(chain.group(1)):
+            if not literal:
+                break
+            parts.append(literal)
+        path = "/".join(parts)
+        if path not in found:
+            found.append(path)
+    return found
+
+
+def check_skill_reads(gates: list, tests_dir: Path, suites: list[str],
+                      skills_dir: Path) -> list[str]:
+    """A suite that opens the repository's skills breaks when a skill changes,
+    so the gate that runs it has to see that change.
+
+    #260: the skills-sync suite read the skills tree, no `when` named it, and a
+    skill bump sat broken on main through ten merges -- only main's --all run
+    reached the suite. Every path a suite names is checked against the gates
+    that run it. A path built with a variable names no file, so any skill a
+    gate names is enough.
+    """
+    files = sorted(f"{skills_dir.name}/{p.relative_to(skills_dir).as_posix()}"
+                   for p in skills_dir.rglob("*") if p.is_file())
+    failures = []
+    for suite in suites:
+        rel = f"tests/{suite}"
+        running = [g for g in gates
+                   if g.get("when") and re.search(g["when"], rel)]
+        # A suite no gate runs is check_suites' to report.
+        if not running:
+            continue
+        # Name the gate that owns this suite; a `when` selecting every suite
+        # owns none of them.
+        owners = [g for g in running if not re.search(g["when"], SUITE_PHONY)]
+        names = ", ".join(g.get("name", "?") for g in (owners or running))
+        for path in suite_skill_paths(tests_dir, suite):
+            if path == skills_dir.name:
+                opened = f"a path under {path}/ built with a variable"
+                covered = [g for g in running
+                           if any(re.search(g["when"], f) for f in files)]
+            else:
+                opened = path
+                covered = [g for g in running if re.search(g["when"], path)]
+            if covered:
+                continue
+            failures.append(
+                f"{rel} opens {opened}, but the gate that runs it ({names}) "
+                f"does not name it, so a change to it runs nothing")
+    return failures
+
+
 def main() -> int:
     gates = manifest.gates(GATES)
     if not gates:
@@ -150,6 +231,7 @@ def main() -> int:
 
     failures, suites = check_suites(gates, TESTS)
     failures.extend(check_tools(gates, BIN))
+    failures.extend(check_skill_reads(gates, TESTS, suites, SKILLS))
 
     # A top-level directory shipping source must be matched by some `when`, or
     # gate-verify refuses a diff that touches only it. The directory is the unit:
@@ -242,8 +324,9 @@ def main() -> int:
 
 # ----- self_tests ----------------------------------------------------------
 #
-# `check_tools` and `check_suites` against a fake bin/, tests/ and gates list,
-# so the probe is exercised without editing the real manifest.
+# `check_tools`, `check_suites` and `check_skill_reads` against a fake bin/,
+# tests/, skills/ and gates list, so the probe is exercised without editing the
+# real manifest.
 
 def self_tests() -> int:
     failures = []
@@ -386,6 +469,81 @@ def self_tests() -> int:
                         f"{label}: expected a failure containing {expect!r}, "
                         f"got {fails}")
 
+        # Each case gets its own tests/ and skills/, one suite and one skill.
+        #
+        # (label, gates, the suite's source, every expected substring in the
+        # failure, or None when the case must pass cleanly)
+        reads_skill = 'P = REPO_ROOT / "skills" / "swe-updater" / "SKILL.md"\n'
+        reads_a_skill_of_many = (
+            'for name in NAMES:\n'
+            '    P = REPO_ROOT / "skills" / name / "SKILL.md"\n')
+        mentions_skills_elsewhere = (
+            '# a skill lands under the fake home, not the repository\n'
+            'HOME = tmp / "skills" / "swe-updater"\n')
+        only_suite = [{"name": "reading gate",
+                       "when": r"^(tests/test_reading\.py)$", "run": "echo ok"}]
+        names_the_skill = [{"name": "reading gate",
+                            "when": r"^(tests/test_reading\.py"
+                                     r"|skills/swe-updater/SKILL\.md)$",
+                            "run": "echo ok"}]
+
+        skill_cases = [
+            ("a suite reading a skill its gate does not name is rejected",
+             only_suite, reads_skill,
+             ["tests/test_reading.py", "(reading gate)",
+              "skills/swe-updater/SKILL.md"]),
+            ("a gate naming the skill file the suite reads covers it",
+             names_the_skill, reads_skill, None),
+            ("a gate covering skills/ covers any skill the suite reads",
+             [{"name": "reading gate",
+               "when": r"^(tests/test_reading\.py$|^skills/)",
+               "run": "echo ok"}],
+             reads_skill, None),
+            ("a gate naming a different skill does not cover this one",
+             [{"name": "reading gate",
+               "when": r"^(tests/test_reading\.py"
+                        r"|skills/other-skill/SKILL\.md)$",
+               "run": "echo ok"}],
+             reads_skill, ["skills/swe-updater/SKILL.md"]),
+            ("a gate that runs another suite covers this one with nothing",
+             [{"name": "reading gate",
+               "when": r"^(tests/test_reading\.py)$", "run": "echo ok"},
+              {"name": "finder gate",
+               "when": r"^(skills/swe-updater/SKILL\.md)$", "run": "echo ok"}],
+             reads_skill, ["(reading gate)"]),
+            # Built with a loop variable: the check cannot name the file, so
+            # naming a skill is the most the gate is held to.
+            ("a path built with a variable needs a gate naming a skill",
+             only_suite, reads_a_skill_of_many,
+             ["skills/", "(reading gate)"]),
+            ("a path built with a variable is covered by a gate naming a skill",
+             names_the_skill, reads_a_skill_of_many, None),
+            # The wrong turn this pins: a "skills" mention in a comment or in
+            # a tmpdir path, where only the path build marks a read.
+            ("a suite that only mentions skills is not reading them",
+             only_suite, mentions_skills_elsewhere, None),
+        ]
+
+        for case_no, (label, gates, source, expects) in enumerate(skill_cases):
+            case_dir = tmp / f"skill-{case_no}"
+            fake_tests = case_dir / "tests"
+            fake_tests.mkdir(parents=True)
+            (fake_tests / "test_reading.py").write_text(source)
+            fake_skills = case_dir / "skills"
+            (fake_skills / "swe-updater").mkdir(parents=True)
+            (fake_skills / "swe-updater" / "SKILL.md").write_text("name: x\n")
+            fails = check_skill_reads(gates, fake_tests,
+                                      ["test_reading.py"], fake_skills)
+            if expects is None:
+                if fails:
+                    failures.append(f"{label}: expected pass, got {fails}")
+                continue
+            for expect in expects:
+                if not any(expect in f for f in fails):
+                    failures.append(
+                        f"{label}: expected a failure containing {expect!r}, "
+                        f"got {fails}")
+
         # Syntax-floor cases: build one broken and one clean file in a fresh
         # tmpdir each, then assert the gate's run command fails on the broken
         # one and passes on the clean one.
@@ -464,7 +622,8 @@ def self_tests() -> int:
             print(" -", f)
         return 1
     print(f"PASS self_tests ({len(coverage_cases)} coverage, "
-          f"{len(suite_cases)} suite, {len(syntax_cases)} syntax-floor cases)")
+          f"{len(suite_cases)} suite, {len(skill_cases)} skill-read, "
+          f"{len(syntax_cases)} syntax-floor cases)")
     return 0
 
 
