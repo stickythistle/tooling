@@ -265,8 +265,12 @@ def db_path() -> Path:
     return base / "agent-tools" / "lanes.db"
 
 
-def _section(raw: dict, name: str, path: Path) -> dict:
-    """One table of the settings."""
+def section(raw: dict, name: str, path: Path) -> dict:
+    """One table of the settings.
+
+    The service's own settings file carries tables of the same names,
+    so the one reader reads both.
+    """
     body = raw.get(name, {})
     if not isinstance(body, dict):
         raise Refusal("config", f"{path}: [{name}] is not a table")
@@ -300,16 +304,68 @@ def load_config(path: Path | None = None) -> Config:
     if isinstance(ready, bool) or not isinstance(ready, (int, float)):
         raise Refusal("config", f"{path}: ready_seconds is not a number")
 
+    pools = parse_pools(raw, path)
+    profiles = parse_profiles(raw, path, pools)
+
+    harnesses = {}
+    for name, body in section(raw, "harnesses", path).items():
+        if not isinstance(body, dict):
+            raise Refusal("harness", f"harness {name} is not a table")
+        launch = body.get("launch")
+        if not isinstance(launch, str) or not launch:
+            raise Refusal("harness", f"harness {name} does not name a launch command")
+        if "{session}" not in launch:
+            raise Refusal("harness",
+                          f"harness {name} does not fill {{session}}, so a "
+                          f"lane started with it can never be resumed")
+        harnesses[name] = Harness(name, launch)
+
+    repos = {}
+    for name, body in section(raw, "repos", path).items():
+        if not isinstance(body, dict):
+            raise Refusal("repo", f"repository {name} is not a table")
+        clone = body.get("clone")
+        if not isinstance(clone, str) or not clone:
+            raise Refusal("repo", f"repository {name} does not name a clone")
+        repos[name] = Repo(name, Path(clone).expanduser())
+
+    return Config(
+        path=path,
+        tmux_session=tmux_session,
+        worktree_root=Path(root).expanduser() if root else None,
+        ready_seconds=float(ready),
+        pools=pools,
+        profiles=profiles,
+        harnesses=harnesses,
+        repos=repos,
+    )
+
+
+def parse_pools(raw: dict, path: Path) -> dict[str, int]:
+    """The pools: how many units each one has.
+
+    Only a positive whole number is a size; anything else is refused,
+    because a default would be a guess about a cap.
+    """
     pools = {}
-    for name, size in _section(raw, "pools", path).items():
+    for name, size in section(raw, "pools", path).items():
         if isinstance(size, bool) or not isinstance(size, int) or size < 1:
             raise Refusal("pool",
                           f"pool {name} has size {size!r}, which is not a "
                           "positive whole number")
         pools[name] = size
+    return pools
 
+
+def parse_profiles(raw: dict, path: Path,
+                   pools: dict[str, int]) -> dict[str, Profile]:
+    """The profiles: which pool each draws from, what it costs, what it runs.
+
+    A profile may name only a pool the file defines: what a profile costs
+    is known against the pool it draws from.
+    """
     profiles = {}
-    for name, body in _section(raw, "profiles", path).items():
+    for name, body in section(raw, "profiles", path).items():
         if not isinstance(body, dict):
             raise Refusal("profile", f"profile {name} is not a table")
         pool = body.get("pool")
@@ -334,40 +390,7 @@ def load_config(path: Path | None = None) -> Config:
                           f"profile {name} has model {model!r}, which is not "
                           f"a regular expression: {exc}") from exc
         profiles[name] = Profile(name, pool, cost, model)
-
-    harnesses = {}
-    for name, body in _section(raw, "harnesses", path).items():
-        if not isinstance(body, dict):
-            raise Refusal("harness", f"harness {name} is not a table")
-        launch = body.get("launch")
-        if not isinstance(launch, str) or not launch:
-            raise Refusal("harness", f"harness {name} does not name a launch command")
-        if "{session}" not in launch:
-            raise Refusal("harness",
-                          f"harness {name} does not fill {{session}}, so a "
-                          f"lane started with it can never be resumed")
-        harnesses[name] = Harness(name, launch)
-
-    repos = {}
-    for name, body in _section(raw, "repos", path).items():
-        if not isinstance(body, dict):
-            raise Refusal("repo", f"repository {name} is not a table")
-        clone = body.get("clone")
-        if not isinstance(clone, str) or not clone:
-            raise Refusal("repo", f"repository {name} does not name a clone")
-        repos[name] = Repo(name, Path(clone).expanduser())
-
-    return Config(
-        path=path,
-        tmux_session=tmux_session,
-        worktree_root=Path(root).expanduser() if root else None,
-        ready_seconds=float(ready),
-        pools=pools,
-        profiles=profiles,
-        harnesses=harnesses,
-        repos=repos,
-    )
-
+    return profiles
 
 # ----- the database --------------------------------------------------------
 
@@ -405,11 +428,18 @@ def _add_column(conn: sqlite3.Connection, table: str, column: str,
     """Add a column that a database from an earlier version lacks.
 
     The schema is created with CREATE TABLE IF NOT EXISTS, so a database
-    that already carries the table keeps the shape it was made with.
+    that already carries the table keeps the shape it was made with. Two
+    openers can want the same column at once, and the second one's
+    refusal by SQLite is harmless: the column it wanted is there.
     """
     columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
-    if column not in columns:
+    if column in columns:
+        return
+    try:
         conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {spec}")
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" not in str(exc).lower():
+            raise
 
 
 def open_db(path: Path | None = None) -> sqlite3.Connection:
@@ -427,6 +457,10 @@ def open_db(path: Path | None = None) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     _add_column(conn, "leases", "window_opened_at", "REAL NOT NULL DEFAULT 0")
     _add_column(conn, "leases", "harness_session", "TEXT NOT NULL DEFAULT ''")
+    _add_column(conn, "leases", "finished_at", "REAL")
+    _add_column(conn, "leases", "outcome", "TEXT")
+    _add_column(conn, "leases", "pr", "INTEGER")
+    _add_column(conn, "leases", "pr_state", "TEXT")
     return conn
 
 
@@ -435,6 +469,19 @@ def live_leases(conn: sqlite3.Connection) -> list[sqlite3.Row]:
     return conn.execute(
         "SELECT * FROM leases WHERE state != ? ORDER BY id", (RELEASED,)
     ).fetchall()
+
+
+def pool_used(conn: sqlite3.Connection, pool: str) -> int:
+    """The units a pool has taken.
+
+    A released lane holds no unit and a stopped one holds none either:
+    its window is gone. This is the sum the claim applies, read the
+    same way.
+    """
+    filling = conn.execute(
+        "SELECT cost FROM leases WHERE state NOT IN (?, ?) AND pool = ?",
+        (RELEASED, STOPPED, pool)).fetchall()
+    return sum(row["cost"] for row in filling)
 
 
 def set_state(conn: sqlite3.Connection, lease_id: int, state: str,
@@ -464,6 +511,48 @@ def set_state(conn: sqlite3.Connection, lease_id: int, state: str,
         "AND state != ? AND window_opened_at = ?",
         (state, now, lease_id, state, opened_at),
     )
+
+
+# ----- the history ---------------------------------------------------------
+
+# How a lease ended. The state says the lane is over; the outcome says
+# what it was.
+OUTCOME_MERGED = "merged"
+OUTCOME_ABANDONED = "abandoned"
+OUTCOME_RELEASED = "released"
+
+
+def record_history(conn: sqlite3.Connection, lease_id: int, outcome: str,
+                   pr: int | None = None, pr_state: str | None = None,
+                   finished_at: float | None = None) -> None:
+    """Write what a lease's ending was.
+
+    The pull request is written only when it is known; a lane released
+    without one leaves the columns empty.
+    """
+    now = time.time() if finished_at is None else finished_at
+    conn.execute(
+        "UPDATE leases SET finished_at = ?, outcome = ?, "
+        "pr = COALESCE(?, pr), pr_state = COALESCE(?, pr_state) "
+        "WHERE id = ?", (now, outcome, pr, pr_state, lease_id))
+
+
+def record_window_opened(conn: sqlite3.Connection, lease_id: int,
+                         opened_at: float | None = None) -> float:
+    """Record when a lease's window opened, and say when.
+
+    The window is open from here on, so a reconcile that cannot see it
+    knows the lane stopped.
+    """
+    now = time.time() if opened_at is None else opened_at
+    conn.execute("UPDATE leases SET window_opened_at = ? WHERE id = ?",
+                 (now, lease_id))
+    return now
+
+
+def undo_claim(conn: sqlite3.Connection, lease_id: int) -> None:
+    """Take a claim back: the lease goes, as it never was."""
+    conn.execute("DELETE FROM leases WHERE id = ?", (lease_id,))
 
 
 # ----- the claim ------------------------------------------------------------
@@ -1376,12 +1465,16 @@ def check_finished(lease: sqlite3.Row, pr: PullRequest,
 
 
 def take_down(conn: sqlite3.Connection, lease: sqlite3.Row,
-              worktree: Path) -> None:
+              worktree: Path, pr: PullRequest | None = None,
+              outcome: str = OUTCOME_RELEASED) -> None:
     """The steps, in order, stopping at the first one that fails. Each step
     says what it did, so a failure leaves the account of what already
     went.
 
     The window goes first, then the processes it left running.
+
+    `outcome` says how the lane ended, and is written with the ending:
+    a finished lane is history, and what it was is a fact.
     """
     clone = Path(lease["clone"])
     branch = lease["branch"]
@@ -1431,7 +1524,9 @@ def take_down(conn: sqlite3.Connection, lease: sqlite3.Row,
         print(f"the builder caches for {tree} were not pruned")
     else:
         print(f"pruned the builder caches for {tree}")
-    release_lease(conn, lease)
+    release_lease(conn, lease, outcome=outcome,
+                  pr=pr.number if pr else None,
+                  pr_state=pr.state if pr else None)
     print(f"released lease {lease['id']}")
 
 
@@ -1550,16 +1645,22 @@ def lease_record(lease: sqlite3.Row, now: float,
     """One lease, as it is recorded."""
     record = {key: lease[key] for key in lease.keys()}
     record["state_age_seconds"] = int(max(0.0, now - lease["state_since"]))
-    record["pr"] = pr.number if pr else None
-    record["pr_state"] = pr.state if pr else None
+    record["pr"] = pr.number if pr else lease["pr"]
+    record["pr_state"] = pr.state if pr else lease["pr_state"]
     return record
 
 
-def release_lease(conn: sqlite3.Connection, lease: sqlite3.Row) -> None:
+def release_lease(conn: sqlite3.Connection, lease: sqlite3.Row,
+                   outcome: str | None = None, pr: int | None = None,
+                   pr_state: str | None = None) -> None:
     """End a lease: close its window, mark it released, take the label off.
 
     The label goes even for a released lease: a label left on one is the
     operator's to clean up, and releasing again is how they ask.
+
+    `outcome` says how the lease ended, and is written with the ending.
+    A pull request is written when it is known. Releasing a lease that
+    is already released writes nothing: its ending happened once.
     """
     if lease["state"] != RELEASED:
         if window_exists(lease):
@@ -1571,6 +1672,8 @@ def release_lease(conn: sqlite3.Connection, lease: sqlite3.Row) -> None:
                 raise StepFailure("window", CommandError(
                     ["tmux", "kill-window"], code, err).detail())
         set_state(conn, lease["id"], RELEASED)
+        if outcome:
+            record_history(conn, lease["id"], outcome, pr, pr_state)
     code, _, err = run(
         ["gh", "issue", "edit", str(lease["issue"]), "--repo",
          lease["repo"], "--remove-label", LABEL],
@@ -1628,7 +1731,7 @@ def cmd_release(args: argparse.Namespace) -> int:
                              (args.lease,)).fetchone()
         if lease is None:
             raise Refusal("lease", f"no lease {args.lease}")
-        release_lease(conn, lease)
+        release_lease(conn, lease, outcome=OUTCOME_RELEASED)
     finally:
         conn.close()
     return 0
@@ -1657,7 +1760,8 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if pr is None:
             raise Refusal("pr", f"no pull request for branch {lease['branch']}")
         worktree = check_finished(lease, pr, args.abandon)
-        take_down(conn, lease, worktree)
+        outcome = OUTCOME_ABANDONED if args.abandon else OUTCOME_MERGED
+        take_down(conn, lease, worktree, pr, outcome)
     finally:
         conn.close()
     return 0
@@ -1676,7 +1780,7 @@ def finish_merged(conn: sqlite3.Connection) -> int:
             if pr is None or pr.state != MERGED:
                 continue
             worktree = check_finished(lease, pr, False)
-            take_down(conn, lease, worktree)
+            take_down(conn, lease, worktree, pr, OUTCOME_MERGED)
         except (Refusal, StepFailure) as exc:
             failures += 1
             print(f"ERR lease {lease['id']}: {exc.detail}", file=sys.stderr)
