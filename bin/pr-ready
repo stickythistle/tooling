@@ -39,6 +39,8 @@ Marks PR ready for review, but only if all of these hold:
   - every CI check has finished and passed, OR every non-passing CI check
     never started (zero steps, no log); the latter is promoted with an
     annotation naming which local gates ran
+  - a head with no CI checks at all is refused, unless the repository runs
+    no workflows, where no CI applies
   - gate-verify passes on the worktree
   - condense-prose flags nothing in the diff
 
@@ -111,7 +113,26 @@ CHECKS=$(gh pr checks "$PR" --json name,bucket,link 2>/dev/null || echo '[]')
 PENDING=$(jq -r '[.[] | select(.bucket=="pending")] | length' <<<"$CHECKS")
 TOTAL=$(jq -r 'length' <<<"$CHECKS")
 
-[ "$TOTAL" -gt 0 ] || refuse "no CI checks reported for this head -- has it been pushed?"
+# Zero checks is an unpushed head or a repository with no CI; the
+# pushed-head check above told them apart, so ask for the workflow count.
+# A failed count refuses: reading it as zero promotes a PR before its CI
+# reports.
+if [ "$TOTAL" -eq 0 ]; then
+	WF_ERR=$(mktemp -t pr-ready-workflows-err-XXXXXX)
+	WF_FAILED=0
+	WORKFLOWS=$(gh api "repos/{owner}/{repo}/actions/workflows" --jq .total_count 2>"$WF_ERR") || WF_FAILED=1
+	WF_DETAIL=$(cat "$WF_ERR")
+	rm -f "$WF_ERR"
+	if [ "$WF_FAILED" -ne 0 ]; then
+		refuse "could not count the repository's workflows: ${WF_DETAIL:-gh exited non-zero}"
+	elif ! [[ "$WORKFLOWS" =~ ^[0-9]+$ ]]; then
+		refuse "could not count the repository's workflows: gh reported '$WORKFLOWS'"
+	elif [ "$WORKFLOWS" -eq 0 ]; then
+		echo "note: this repository has no workflows; no CI applies" >&2
+	else
+		refuse "no CI checks reported for this head -- has it been pushed?"
+	fi
+fi
 [ "$PENDING" -eq 0 ] || refuse "$PENDING CI check(s) still running"
 
 # A check with bucket fail/cancel is either "ran and failed" (steps with
