@@ -403,6 +403,11 @@ name = "finding-check tests"
 when = '^(bin/finding-check|tests/test_finding_check\.py)$'
 run = "python3 tests/test_finding_check.py"
 
+[[gates]]
+name = "review-post tests"
+when = '^(bin/review-post|lib/review_post\.py|tests/test_review_post\.py)$'
+run = "python3 tests/test_review_post.py"
+
 # The fakes that run git on a path from their arguments, and the lane
 # skills that say an experiment belongs in a scratch copy. The gate
 # names the test files whose fakes are guarded and the two skills that
