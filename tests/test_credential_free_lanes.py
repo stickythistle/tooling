@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """Pin the implementer's identity, and the lane's empty gh config.
 
-The loop has two identities and they are not the same person: the
-implementer authors the pull request, and the reviewer is the repository's
-owner. A verdict can only be a real review state when the reviewer is not
-the author.
+The loop has two identities: the implementer authors the pull request,
+and the reviewer is the repository's owner. A verdict is a real review
+state only when the reviewer differs from the author.
 
-Two contracts are pinned here:
+Three contracts are pinned here:
 
 - `gh_as implementer` runs gh with the implementer's credentials, and
   refuses -- naming the variable to set -- when there are none. It resolves
@@ -17,7 +16,10 @@ Two contracts are pinned here:
   empty config directory: an accidental `gh` call inside the lane fails.
   The lane runs as the same operating-system user as the dispatcher, so
   credentials that user can reach are still on the host; the empty config
-  makes an accidental call fail, it does not make them unreadable.
+  makes an accidental call fail, and those credentials stay readable.
+- `gh_as implementer api` is for the repository its endpoint names. `gh api`
+  takes no `-R`, so the path is the only thing that says which repository
+  the call acts on.
 
 Run directly: `python3 tests/test_credential_free_lanes.py`.
 """
@@ -453,6 +455,161 @@ def test_the_implementer_token_and_the_ambient_login_are_different():
         result = bash("gh_as implementer api orgs", env=env)
         assert result.returncode == 0, result.stderr
         assert "token=implementer-token-value" in result.stdout, result.stdout
+
+
+# ---------------------------------------------------------------------------
+# gh_as: an api call is for the repository its endpoint names.
+
+# A gh stub that reports the login it would act as, and the repository of
+# the working directory when the working directory is a checkout. An api
+# call outside a checkout names its repository in its own path.
+API_GH_STUB = textwrap.dedent("""\
+    #!/usr/bin/env bash
+    if [[ "$1" == "api" && "$2" == "user" ]]; then
+        echo "${STUB_LOGIN:-implementer-login}"
+        exit 0
+    fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        # The repository of the working directory. Outside a checkout
+        # there is none.
+        if [[ -e .git ]]; then
+            echo "${STUB_REPO-example-org/tooling}"
+        fi
+        exit 0
+    fi
+    echo "ran"
+    """)
+
+
+def api_gh_env(tmp: Path, **extra) -> dict:
+    """An environment whose `gh` is a stub that knows a checkout.
+
+    The binding names the owners of both repositories the cases use, and
+    the login that acts. The owner of a repository reviews it, so the
+    owner's own login cannot implement there.
+    """
+    gh = tmp / "gh"
+    gh.write_text(API_GH_STUB)
+    gh.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
+        "TOOLS_ENV": str(tmp / "no-env"),
+        "TMPDIR": str(tmp),
+    }
+    for var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_IMPLEMENTER_TOKEN",
+                "GH_IMPLEMENTER_CONFIG_DIR", "IMPLEMENTER_LOGINS"):
+        env.pop(var, None)
+    env["ROLES_CONFIG"] = str(roles_file(
+        tmp / "roles.toml",
+        owners={"Jerhaad": "Jerhaad", "stickythistle": "stickythistle"},
+        logins=("harbord-st", "Jerhaad")))
+    env.update(extra)
+    return env
+
+
+def make_checkout(tmp: Path) -> Path:
+    """A directory the stub's `gh repo view` answers from."""
+    checkout = tmp / "checkout"
+    checkout.mkdir()
+    (checkout / ".git").mkdir()
+    return checkout
+
+
+def test_an_api_call_is_checked_against_the_repository_its_path_names():
+    # `gh api` takes no -R: the repository is in the path. A call made in
+    # a checkout of another repository would be checked against the
+    # checkout's, and the owner of the repository it acts on would pass
+    # as an implementer on it.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad",
+                         STUB_REPO="stickythistle/tooling")
+        result = bash(
+            "gh_as implementer api repos/Jerhaad/harbord-infra/issues",
+            env=env, cwd=str(make_checkout(tmp)))
+        assert result.returncode != 0, (
+            f"gh_as checked the call against the checkout: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        # The refusal names the repository the path named, and its owner.
+        assert "Jerhaad/harbord-infra" in result.stderr, result.stderr
+        assert "owner" in result.stderr, result.stderr
+
+
+def test_an_api_call_outside_a_checkout_is_for_the_repository_its_path_names():
+    # The path names the repository, so a call made outside a checkout is
+    # allowed. The leading slash names the same repository.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad")
+        result = bash(
+            "gh_as implementer api /repos/stickythistle/tooling/pulls",
+            env=env, cwd=str(tmp))
+        assert result.returncode == 0, (
+            f"gh_as refused a call outside a checkout: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+
+
+def test_an_api_call_that_names_no_repository_outside_a_checkout_is_refused():
+    # The implementer's logins are per repository, and a call that names
+    # none resolves none: the unscoped list would let the owner implement
+    # on the repository it reviews.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad")
+        result = bash("gh_as implementer api user", env=env, cwd=str(tmp))
+        assert result.returncode != 0, (
+            f"gh_as ran with no repository: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        assert "repository" in result.stderr, result.stderr
+
+
+def test_an_api_call_that_names_no_repository_uses_the_checkout():
+    # A path that names no repository leaves the call to the checkout it
+    # runs in.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad",
+                         STUB_REPO="stickythistle/tooling")
+        result = bash("gh_as implementer api user", env=env,
+                      cwd=str(make_checkout(tmp)))
+        assert result.returncode == 0, (
+            f"gh_as refused a call in a checkout: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+
+
+def test_a_graphql_call_is_for_the_repository_its_fields_name():
+    # The owner of a repository reviews it, so the owner's own login may
+    # not act as the implementer on it. The fields a graphql call sends
+    # name the repository it acts on.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad",
+                         STUB_REPO="stickythistle/tooling")
+        result = bash(
+            "gh_as implementer api graphql -F owner=Jerhaad "
+            "-F name=harbord-infra -f query='query {}'",
+            env=env, cwd=str(make_checkout(tmp)))
+        assert result.returncode != 0, (
+            f"gh_as checked the call against the checkout: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        assert "Jerhaad/harbord-infra" in result.stderr, result.stderr
+
+
+def test_an_api_call_is_not_for_the_repository_a_body_names():
+    # The body is a value, not the endpoint: a path in it is text the
+    # caller sent.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = api_gh_env(tmp, STUB_LOGIN="Jerhaad",
+                         STUB_REPO="stickythistle/tooling")
+        result = bash(
+            "gh_as implementer api repos/stickythistle/tooling/issues "
+            "-f body='see repos/Jerhaad/harbord-infra'",
+            env=env, cwd=str(make_checkout(tmp)))
+        assert result.returncode == 0, (
+            f"gh_as took the body's path for the endpoint: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
 
 
 # ---------------------------------------------------------------------------
