@@ -1,0 +1,25 @@
+# The secret scan's own config: push-guard reads it out of the commit it
+# pushes.
+#
+# Each exception names its file AND a regex for that file's own value, so a
+# real secret pasted into the same file is still found.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "the made-up key the bakeoff proxy test checks never leaks"
+paths = ['''^tests/test_bakeoff_proxy\.py$''']
+regexes = ['''^test-key-the-harness-sent-''']
+condition = "AND"
+
+[[allowlists]]
+description = "the made-up key the picker test forwards"
+paths = ['''^tests/test_pick_lane\.py$''']
+regexes = ['''^test-key-picklane-''']
+condition = "AND"
+
+[[allowlists]]
+description = "the tokenizer hash the llama swap setup names"
+paths = ['''^skills/llama-swap-setup/SKILL\.md$''']
+regexes = ['''^1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f$''']
+condition = "AND"

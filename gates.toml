@@ -440,6 +440,14 @@ name = "push-guard tests"
 when = '^(bin/push-guard|hooks/pre-push|tests/test_push_guard\.py)$'
 run = "python3 tests/test_push_guard.py"
 
+# The repository's secret scan: the three fixture values pass it, and a real
+# token in the same files is still found. The gate names the config and the
+# suite, so a change to either runs the suite.
+[[gates]]
+name = "gitleaks config tests"
+when = '^(\.gitleaks\.toml|tests/test_gitleaks_config\.py)$'
+run = "python3 tests/test_gitleaks_config.py"
+
 [[gates]]
 name = "lane rustc tests"
 when = '^(lib/lane-rustc|lib/common\.sh|lib/manifest\.py|bin/hermes-implement|pipeline/implement\.sh|tests/test_lane_rustc\.py|tests/test_hermes_implement_tmp\.py)$'
