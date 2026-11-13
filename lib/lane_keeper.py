@@ -218,6 +218,9 @@ class Store:
         if conn is None:
             conn = lane.open_db(self.path)
             self._local.conn = conn
+        # The record's shape is checked on the way in, so a database
+        # from an earlier version is brought up to date.
+        lane.ensure_schema(conn)
         return conn
 
 
@@ -249,6 +252,80 @@ class Keeper:
             (lane.RELEASED, limit)).fetchall()
         moment = time.time()
         return [lane.lease_record(row, moment, None) for row in rows]
+
+
+# ----- the import ----------------------------------------------------------
+
+# The columns a lease carries, in the order the record holds them.
+LEASE_COLUMNS = (
+    "id", "repo", "issue", "harness", "profile", "model", "pool", "cost",
+    "branch", "base", "base_sha", "worktree", "clone", "tmux_session",
+    "window", "window_opened_at", "session", "harness_session", "state",
+    "state_since", "created_at", "finished_at", "outcome", "pr", "pr_state",
+)
+
+# The value each column takes in an older database.
+IMPORT_DEFAULTS = {
+    "base_sha": "",
+    "window_opened_at": 0,
+    "harness_session": "",
+    "finished_at": None,
+    "outcome": None,
+    "pr": None,
+    "pr_state": None,
+}
+
+
+def import_leases(settings: Settings, source: Path) -> int:
+    """Copy the leases of an old database into the record.
+
+    The ids are kept, so the history continues where it stopped. An
+    import that lands a lease on an id the record holds is refused:
+    the record has one owner.
+    """
+    if not source.is_file():
+        raise lane.Refusal("import", f"{source} does not exist")
+    old = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30.0)
+    old.row_factory = sqlite3.Row
+    try:
+        rows = old.execute("SELECT * FROM leases").fetchall()
+    except sqlite3.Error as exc:
+        raise lane.Refusal("import",
+                           f"{source} holds no leases table: {exc}") from None
+    finally:
+        old.close()
+
+    conn = Keeper(settings).store.connection()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for row in rows:
+            held = conn.execute("SELECT id FROM leases WHERE id = ?",
+                                (row["id"],)).fetchone()
+            if held is not None:
+                raise lane.Refusal("import",
+                                   f"lease {row['id']} is already in the "
+                                   "record")
+            columns = set(row.keys())
+            values = []
+            for column in LEASE_COLUMNS:
+                if column in columns:
+                    values.append(row[column])
+                elif column in IMPORT_DEFAULTS:
+                    values.append(IMPORT_DEFAULTS[column])
+                else:
+                    raise lane.Refusal("import",
+                                       f"lease {row['id']} records no "
+                                       f"{column}")
+            conn.execute(
+                f"INSERT INTO leases ({','.join(LEASE_COLUMNS)}) "
+                f"VALUES ({','.join('?' * len(LEASE_COLUMNS))})", values)
+        conn.execute("COMMIT")
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    print(f"imported {len(rows)} leases from {source}")
+    return 0
 
 
 # ----- the page ------------------------------------------------------------
@@ -557,7 +634,21 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/history":
             self._json(200, {"leases": self.keeper.history(self._limit(query))})
             return
+        match = re.fullmatch(r"/api/lease/(\d+)", path)
+        if match:
+            self._lease_json(int(match.group(1)))
+            return
         self._json(404, {"key": "path", "detail": f"{path} is not an endpoint"})
+
+    def _lease_json(self, lease_id: int) -> None:
+        """One lease, as the record holds it."""
+        conn = self.keeper.store.connection()
+        row = conn.execute("SELECT * FROM leases WHERE id = ?",
+                           (lease_id,)).fetchone()
+        if row is None:
+            self._json(404, {"key": "lease", "detail": f"no lease {lease_id}"})
+            return
+        self._json(200, lane.lease_record(row, time.time(), None))
 
     def _limit(self, query: dict) -> int:
         """How many finished lanes the caller asks for."""
@@ -640,7 +731,12 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"lease": lease_id, "branch": branch})
 
     def _state(self, lease_id: int, body: dict) -> None:
-        """Record what a lane's pane says about it."""
+        """Record what a lane's pane says about it.
+
+        The pull request comes with it: the reporter is the only one
+        that can see a lane's pull request, and the keeper cannot reach
+        the forge.
+        """
         conn = self.keeper.store.connection()
         lease = self._lease(conn, lease_id)
         if lease["state"] == lane.RELEASED:
@@ -648,14 +744,29 @@ class Handler(BaseHTTPRequestHandler):
         state = _field(body, "state")
         opened_at = _number(body, "opened_at")
         lane.set_state(conn, lease_id, state, opened_at=opened_at)
+        pr = _integer(body, "pr")
+        pr_state = _optional(body, "pr_state")
+        if pr is not None or pr_state:
+            conn.execute(
+                "UPDATE leases SET pr = COALESCE(?, pr), "
+                "pr_state = COALESCE(?, pr_state) WHERE id = ?",
+                (pr, pr_state, lease_id))
         self._json(200, {"lease": lease_id, "state": state})
 
     def _opened(self, lease_id: int, body: dict) -> None:
-        """Record that a lane's window is open."""
+        """Record that a lane's window is open.
+
+        The commit the worktree was cut at goes with it: a worktree
+        reused later may sit on another commit, and the lease has to say
+        which one it was given.
+        """
         conn = self.keeper.store.connection()
         self._lease(conn, lease_id)
         opened = lane.record_window_opened(conn, lease_id,
                                            _number(body, "opened_at"))
+        base_sha = _optional(body, "base_sha")
+        if base_sha:
+            lane.record_base_sha(conn, lease_id, base_sha)
         self._json(200, {"lease": lease_id, "window_opened_at": opened})
 
     def _release(self, lease_id: int, body: dict) -> None:
@@ -790,7 +901,7 @@ def make_server(settings: Settings,
     keeper = keeper if keeper is not None else Keeper(settings)
     # The record is created and brought up to date before the server
     # answers, so two requests cannot both add a column.
-    keeper.store.connection().close()
+    keeper.store.connection()
     handler = type("BoundHandler", (Handler,), {"keeper": keeper})
     server = ThreadingHTTPServer((settings.host, settings.port), handler)
     server.daemon_threads = True
@@ -824,12 +935,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--config", default=None,
                         help="the settings file (default $LANE_KEEPER_CONFIG)")
+    parser.add_argument("--import", dest="import_db", default=None,
+                        metavar="PATH",
+                        help="copy the leases of an old database into the "
+                             "record, once")
     args = parser.parse_args(argv)
     try:
         settings = load_settings(Path(args.config) if args.config else None)
     except lane.Refusal as exc:
         print(f"ERR {exc.key}: {exc.detail}", file=sys.stderr)
         return 2
+    if args.import_db:
+        try:
+            return import_leases(settings,
+                                 Path(args.import_db).expanduser())
+        except lane.Refusal as exc:
+            print(f"ERR {exc.key}: {exc.detail}", file=sys.stderr)
+            return 1
     return serve(settings)
 
 

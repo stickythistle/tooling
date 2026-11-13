@@ -29,6 +29,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
 
+import lane  # noqa: E402
 import lane_keeper  # noqa: E402
 
 # The tokens the cases use. The settings hold their digests.
@@ -410,6 +411,116 @@ def make_cert(tmp: Path) -> tuple[Path, Path]:
     return cert, key
 
 
+def old_database(path: Path, count: int = 2) -> None:
+    """A database from before the keeper owned the record.
+
+    It carries the columns it had then: the ones the record grew since
+    are missing, and the import has to fill them.
+    """
+    conn = lane.open_db(path)
+    for number in range(1, count + 1):
+        conn.execute(
+            "INSERT INTO leases (id, repo, issue, harness, profile, model, "
+            "pool, cost, branch, base, worktree, clone, tmux_session, "
+            "window, session, state, state_since, created_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (number, REPO, 100 + number, "hermes", "minimax", "MiniMax",
+             "minimax", 1, f"lane/{100 + number}-{number}", "origin/main",
+             f"/wt/tooling-{100 + number}", "/clone", "0",
+             f"tooling-{100 + number}", "coord-a", "released", 1.0, 1.0))
+    conn.execute("ALTER TABLE leases DROP COLUMN window_opened_at")
+    conn.execute("ALTER TABLE leases DROP COLUMN harness_session")
+    conn.close()
+
+
+def test_import(world: World) -> list[str]:
+    """An old database is imported once, and the ids are kept.
+
+    The history the old database holds continues where it left off: a
+    lease keeps its number, so the record is one record and not two.
+    """
+    failures = []
+    old = world.tmp / "old-lanes.db"
+    old_database(old)
+    command = [str(REPO_ROOT / "bin" / "lane-keeper"), "--config",
+               str(world.config), "--import", str(old)]
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.returncode != 0:
+        return [f"import: the import failed: {result.stderr.strip()!r}"]
+    status, answer = world.call("/api/history", token=TOKENS["reader"])
+    if status != 200:
+        return [f"import: the history answered {status}, not 200: {answer!r}"]
+    records = {record["id"]: record
+               for record in json.loads(answer)["leases"]}
+    for number in (1, 2):
+        if number not in records:
+            failures.append(f"import: lease {number} did not come across: "
+                            f"{records}")
+        elif records[number].get("issue") != 100 + number:
+            failures.append(f"import: lease {number} carries another "
+                            f"issue: {records[number]}")
+        elif records[number].get("harness_session") != "":
+            failures.append(f"import: lease {number} carries a session id "
+                            f"the old database did not have: {records[number]}")
+    again = subprocess.run(command, capture_output=True, text=True)
+    if again.returncode == 0:
+        failures.append("import: a second import was allowed")
+    elif "already" not in again.stderr:
+        failures.append("import: the refusal did not say why: "
+                        f"{again.stderr.strip()!r}")
+    return failures
+
+
+def test_single_lease(world: World) -> list[str]:
+    """One lease is read on its own, and a lease that is gone says so."""
+    failures = []
+    status, answer = world.claim()
+    if status != 200:
+        return [f"single lease: the claim failed: {answer!r}"]
+    lease = json.loads(answer)["lease"]
+    status, answer = world.call(f"/api/lease/{lease}", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"single lease: the read answered {status}, not 200: "
+                        f"{answer[:120]!r}")
+    elif json.loads(answer).get("id") != lease:
+        failures.append("single lease: the answer is not the lease: "
+                        f"{answer[:120]!r}")
+    status, answer = world.call("/api/lease/9999", token=TOKENS["reader"])
+    if status != 404:
+        failures.append(f"single lease: a lease that is gone answered "
+                        f"{status}, not 404: {answer[:120]!r}")
+    return failures
+
+
+def test_state_pr(world: World) -> list[str]:
+    """The state a reporter sends carries the pull request with it.
+
+    The keeper cannot reach the forge, so the reporter is the only one
+    that can say which pull request a lane carries.
+    """
+    failures = []
+    status, answer = world.claim()
+    if status != 200:
+        return [f"state pr: the claim failed: {answer!r}"]
+    lease = json.loads(answer)["lease"]
+    status, answer = world.call(f"/api/lease/{lease}/state",
+                                token=TOKENS["reporter"], method="POST",
+                                body={"state": "idle", "pr": 12,
+                                      "pr_state": "MERGED"})
+    if status != 200:
+        failures.append(f"state pr: the state answered {status}, not 200: "
+                        f"{answer[:120]!r}")
+    status, answer = world.call(f"/api/lease/{lease}", token=TOKENS["reader"])
+    record = json.loads(answer)
+    if record.get("pr") != 12:
+        failures.append(f"state pr: the lease records no pull request: "
+                        f"{record!r}")
+    if record.get("pr_state") != "MERGED":
+        failures.append(f"state pr: the lease records no pull request "
+                        f"state: {record!r}")
+    return failures
+
+
 CASES = [
     ("no-token", test_no_token, 1),
     ("reader", test_reader, 1),
@@ -420,6 +531,9 @@ CASES = [
     ("history", test_history, 1),
     ("dashboard", test_dashboard, 1),
     ("tls", test_tls, 1),
+    ("import", test_import, 1),
+    ("single-lease", test_single_lease, 1),
+    ("state-pr", test_state_pr, 1),
 ]
 
 

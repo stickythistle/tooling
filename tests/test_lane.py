@@ -5,15 +5,22 @@ The tool exists because several coordinator sessions start lanes against
 the same account, and nothing recorded which lanes were running. Two
 sessions that each believe the last pool unit is free both start a lane,
 and the cap is gone. So the claims are the contract: a lease is taken in
-one transaction before anything outside the database happens, and a
+one transaction before anything outside the record happens, and a
 refusal names the pool or the lease that refused.
 
-Every case here runs the tool against a stub `tmux`, a stub `gh` and a
+The record is the keeper's now: every case here runs the keeper in this
+process, on loopback, and the tool against it with the token the
+settings name. The side effects happen on the agent host, so they go
+over ssh: the stub `ssh` runs the command here, where the stubs for
+`tmux`, `gh` and the harness are.
+
+Every case runs the tool against a stub `tmux`, a stub `gh` and a
 stub harness, each logging what it was asked to do, so the assertions are
 over what the tool actually did. The real `git` cuts the worktrees,
 against a throwaway origin: the worktree step is the one the tool cannot
 fake its way through.
 """
+import hashlib
 import json
 import os
 import shutil
@@ -21,14 +28,23 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+
+import lane_keeper  # noqa: E402
 
 # The repository every case spawns against.
 REPO = "stickythistle/tooling"
+
+# The tokens the keeper knows. The settings hold their digests.
+TOKENS = {"writer": "writer-token", "reporter": "reporter-token",
+          "reader": "reader-token"}
 
 
 # ----- the world a case runs in ---------------------------------------------
@@ -273,11 +289,42 @@ exec "''' + real + r'''" "$@"
     path.chmod(0o755)
 
 
-def write_stub_remote_prune(path: Path) -> None:
+def write_stub_ssh(bin_dir: Path) -> None:
+    """An ssh that runs the command here.
+
+    The lane's side effects happen on the agent host, so the tool sends
+    them over ssh. The stub runs the command in this world, and execs
+    it: the command's parent is then the tool, which is what a stub
+    that interrupts the tool has to signal.
+
+    Every argument is logged as it arrives, and the arguments the far
+    side would see are logged too, so a case can tell a path that
+    reached the command whole from one that was split in two.
+    """
+    body = r'''#!/usr/bin/env bash
+printf 'ssh %s\n' "$*" >> "$STUB_DATA/ssh.log"
+for arg in "$@"; do printf 'ssh-arg %s\n' "$arg" >> "$STUB_DATA/ssh.log"; done
+shift
+[ "$1" = "--" ] && shift
+cmd="$*"
+show_split() {
+    eval "set -- $1"
+    for arg in "$@"; do printf 'ssh-split %s\n' "$arg" >> "$STUB_DATA/ssh.log"; done
+}
+show_split "$cmd"
+run_remote() { exec bash -c "$1"; }
+run_remote "$cmd"
+'''
+    path = bin_dir / "ssh"
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+def write_stub_remote_prune(bin_dir: Path) -> None:
     """A remote-prune that logs the tree it was asked to prune and where.
 
-    The working directory is part of what it was asked: the prune reads
-    the repository it runs in.
+    The prune runs on the agent host now, and it reads the repository
+    it is given: the clone the lease names.
 
     A test asks it to fail by creating `$STUB_DATA/fail_remote_prune`.
     """
@@ -290,25 +337,20 @@ if [ -f "$STUB_DATA/fail_remote_prune" ]; then
 fi
 exit 0
 '''
+    path = bin_dir / "remote-prune"
     path.write_text(body)
     path.chmod(0o755)
 
 
-def mirror_tool(root: Path) -> Path:
-    """A copy of the tool, with a stub `remote-prune` beside it.
+def install_lane_agent(bin_dir: Path) -> None:
+    """The agent's helper, on the path the commands are run with.
 
-    `lane finish` prunes the builder's caches by calling the
-    `remote-prune` that sits beside it, so the tool is copied into the
-    case's own directory: the stub beside that copy is the one the tool
-    calls, and the real one never runs.
+    The helper is the real one: it reads `/proc` and runs tmux, and the
+    stubs for those are what the helper finds.
     """
-    tool = root / "tool"
-    (tool / "bin").mkdir(parents=True)
-    (tool / "lib").mkdir()
-    shutil.copy(REPO_ROOT / "bin" / "lane", tool / "bin" / "lane")
-    shutil.copy(REPO_ROOT / "lib" / "lane.py", tool / "lib" / "lane.py")
-    write_stub_remote_prune(tool / "bin" / "remote-prune")
-    return tool / "bin" / "lane"
+    path = bin_dir / "lane-agent"
+    path.write_text((REPO_ROOT / "bin" / "lane-agent").read_text())
+    path.chmod(0o755)
 
 
 def write_stub_harness(bin_dir: Path, name: str) -> None:
@@ -324,7 +366,7 @@ def write_stub_harness(bin_dir: Path, name: str) -> None:
     path.chmod(0o755)
 
 
-def config_text(cfg: dict) -> str:
+def config_text(cfg: dict, keeper_url: str, token_file: str) -> str:
     """The settings file, as TOML."""
     lines = [f'tmux_session = "{cfg["tmux_session"]}"',
              f'worktree_root = "{cfg["worktree_root"]}"',
@@ -352,30 +394,81 @@ def config_text(cfg: dict) -> str:
         for key, value in body.items():
             lines.append(f'{key} = "{value}"')
         lines.append("")
+    lines.append("[keeper]")
+    lines.append(f'url = "{keeper_url}"')
+    lines.append(f'token_file = "{token_file}"')
+    lines.append("")
+    lines.append("[agent]")
+    lines.append('ssh = "agent-host"')
+    lines.append("")
+    return "\n".join(lines)
+
+
+def keeper_config_text(db: Path, cfg: dict) -> str:
+    """The keeper's settings, as TOML.
+
+    The keeper holds the pools and the profiles the lanes hold too: a
+    pool's cap is one number, and the keeper is the one that counts it.
+    """
+    lines = [f'database = "{db}"', "",
+             "[listen]", "host = \"127.0.0.1\"", "port = 0", "",
+             "[pools]"]
+    for name, size in cfg["pools"].items():
+        lines.append(f"{name} = {size}")
+    lines.append("")
+    for name, body in cfg["profiles"].items():
+        lines.append(f"[profiles.{name}]")
+        for key, value in body.items():
+            if isinstance(value, str):
+                lines.append(f'{key} = "{value}"')
+            else:
+                lines.append(f"{key} = {value}")
+        lines.append("")
+    for role, token in TOKENS.items():
+        lines.append("[[tokens]]")
+        lines.append(f'role = "{role}"')
+        digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        lines.append(f'sha256 = "{digest}"')
+        lines.append("")
     return "\n".join(lines)
 
 
 class Env:
-    """One case's world: stubs, a throwaway origin, and the settings."""
+    """One case's world: the keeper, the stubs, and the settings."""
 
     def __init__(self, tmp: Path):
         self.tmp = tmp
         self.bin = tmp / "stub-bin"
         self.bin.mkdir(parents=True)
+        self.home = tmp / "home"
+        self.home.mkdir()
+        # The agent host keeps its tools in its own bin directory, and
+        # the remote PATH names it: a stub the real tool shadows is no
+        # stub at all.
+        (self.home / "bin").symlink_to(self.bin)
         self.data = tmp / "data"
         self.data.mkdir(parents=True)
         self.config = tmp / "lanes.toml"
+        self.keeper_config = tmp / "lane-keeper.toml"
+        self.token_file = tmp / "lane-token"
         self.db = tmp / "lanes.db"
         self.worktree_root = tmp / "wt"
         self.worktree_root.mkdir(parents=True)
         self.clone = make_origin(tmp)
         self.origin = tmp / "origin.git"
-        self.lane = mirror_tool(tmp)
+        self.lane = REPO_ROOT / "bin" / "lane"
+        self.token = TOKENS["writer"]
+        self.keeper = None
+        self.keeper_url = ""
         write_stub_tmux(self.bin)
         write_stub_gh(self.bin)
+        write_stub_ssh(self.bin)
+        write_stub_remote_prune(self.bin)
+        install_lane_agent(self.bin)
         write_stub_harness(self.bin, "hermes-stub")
         write_stub_harness(self.bin, "pi-stub")
         self.write_config(self.default_config())
+        self.start_keeper()
 
     def default_config(self) -> dict:
         """The settings every case starts from."""
@@ -399,10 +492,49 @@ class Env:
         }
 
     def write_config(self, cfg: dict) -> None:
-        """Write the settings, and tell the stub gh where the worktree goes."""
-        self.config.write_text(config_text(cfg))
+        """Write the settings, and tell the stub gh where the worktree goes.
+
+        The keeper's own settings are written with them: the pools and
+        the profiles it holds are the ones the lanes hold.
+        """
+        self.cfg = cfg
+        self.keeper_config.write_text(keeper_config_text(self.db, cfg))
+        if self.keeper is not None:
+            try:
+                self.keeper.settings = lane_keeper.load_settings(
+                    self.keeper_config)
+            except lane_keeper.lane.Refusal:
+                # A settings file the keeper cannot read is a case's own
+                # doing: the keeper keeps the settings it had, and the
+                # tool refuses the file before it asks for anything.
+                pass
+        self.config.write_text(config_text(cfg, self.keeper_url,
+                                            str(self.token_file)))
+        self.token_file.write_text(f"{self.token}\n")
+        self.token_file.chmod(0o600)
         (self.data / "worktree_path").write_text(
             str(self.worktree_root / "tooling-5"))
+
+    def start_keeper(self) -> None:
+        """The keeper, in this process, on loopback."""
+        self.keeper = lane_keeper.Keeper(
+            lane_keeper.load_settings(self.keeper_config))
+        self.server = lane_keeper.make_server(self.keeper.settings,
+                                               self.keeper)
+        self.port = self.server.server_address[1]
+        self.keeper_url = f"http://127.0.0.1:{self.port}"
+        self.thread = threading.Thread(target=self.server.serve_forever,
+                                        daemon=True)
+        self.thread.start()
+        self.write_config(self.cfg)
+
+    def stop_keeper(self) -> None:
+        """Stop the keeper."""
+        if self.server is None:
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        self.server = None
 
     def sibling(self, name: str) -> "Env":
         """Another world, for a case that needs a second one."""
@@ -414,8 +546,8 @@ class Env:
         """The environment the tool runs in."""
         env = os.environ.copy()
         env["PATH"] = f"{self.bin}:{env['PATH']}"
+        env["HOME"] = str(self.home)
         env["STUB_DATA"] = str(self.data)
-        env["LANE_DB"] = str(self.db)
         env["LANE_CONFIG"] = str(self.config)
         env["LANE_PI_SETTLE"] = "0"
         env.pop("LANE_SESSION", None)
@@ -546,16 +678,18 @@ def window_lines(env: Env) -> list[str]:
 
 
 def prune_calls(env: Env) -> dict[str, str]:
-    """The prunes the stub recorded: the tree it was asked for, and where.
+    """The prunes the stub recorded: the tree, and the repository it read.
 
-    The tree keys the entry and the working directory is the value.
+    The prune runs on the agent host now, and it reads the repository it
+    is given: the clone the lease names.
     """
     calls = {}
     for line in env.log("calls.log").splitlines():
         if not line.startswith("remote-prune "):
             continue
-        call, _, cwd = line.partition(" cwd=")
-        calls[call.split("--tree ")[-1].strip()] = cwd
+        words = line.partition(" cwd=")[0].split()
+        tree = words[words.index("--tree") + 1] if "--tree" in words else ""
+        calls[tree] = words[-1]
     return calls
 
 
@@ -2396,6 +2530,194 @@ def test_history_facts(env: Env) -> list[str]:
     return failures
 
 
+def test_keeper_unreachable(env: Env) -> list[str]:
+    """A keeper that cannot answer refuses the spawn, and the agent host
+    is left alone.
+
+    The record has one owner: the keeper.
+    """
+    failures = []
+    env.stop_keeper()
+    result = env.spawn(5)
+    if result.returncode == 0:
+        failures.append("keeper unreachable: the spawn reported success")
+    elif env.keeper_url not in result.stderr:
+        failures.append("keeper unreachable: the refusal did not name the "
+                        f"keeper's URL: {result.stderr.strip()!r}")
+    if env.log("ssh.log"):
+        failures.append("keeper unreachable: something happened on the "
+                        f"agent host: {env.log('ssh.log')!r}")
+    return failures
+
+
+def test_token_file_mode(env: Env) -> list[str]:
+    """A token file other users can read is refused, and it names the file.
+
+    The token is the writer's: a lane runs as the user every lane runs
+    as, so a token any of them can read is a token any of them can use.
+    """
+    failures = []
+    env.token_file.chmod(0o644)
+    result = env.spawn(5)
+    if result.returncode == 0:
+        failures.append("token mode: the spawn reported success")
+    elif str(env.token_file) not in result.stderr:
+        failures.append("token mode: the refusal did not name the token "
+                        f"file: {result.stderr.strip()!r}")
+    if env.log("ssh.log"):
+        failures.append("token mode: something happened on the agent host")
+    return failures
+
+
+def test_check_reader_token(env: Env) -> list[str]:
+    """The check asks the keeper, and a reader's token is enough for it."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["check reader: the spawn failed"]
+    env.token = TOKENS["reader"]
+    env.write_config(env.cfg)
+    live = env.run("check", "1")
+    if live.returncode != 0:
+        failures.append("check reader: a live lease did not check out: "
+                        f"{live.stderr.strip()!r}")
+    env.token = TOKENS["writer"]
+    env.write_config(env.cfg)
+    env.run("release", "1")
+    env.token = TOKENS["reader"]
+    env.write_config(env.cfg)
+    released = env.run("check", "1")
+    if released.returncode != 1:
+        failures.append("check reader: a released lease checked out: "
+                        f"{released.stdout!r}")
+    elif "released" not in released.stderr:
+        failures.append("check reader: the refusal did not name the "
+                        f"release: {released.stderr.strip()!r}")
+    return failures
+
+
+def keeper_now(env: Env) -> list[dict]:
+    """The live leases, as the keeper holds them."""
+    request = urllib.request.Request(f"{env.keeper_url}/api/now")
+    request.add_header("Authorization", f"Bearer {TOKENS['reader']}")
+    with urllib.request.urlopen(request, timeout=30) as answer:
+        return json.loads(answer.read().decode("utf-8"))["leases"]
+
+
+def test_report(env: Env) -> list[str]:
+    """The reporter says what the pane shows and which pull request it carries.
+
+    The reporter runs on the agent host, where the panes are, and it is
+    the only one that can see a lane's pull request: the keeper cannot
+    reach the forge.
+    """
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["report: the spawn failed"]
+    env.set_pane("tooling-5", HERMES_IDLE)
+    head = git_out(lane_worktree(env, 5), "rev-parse", "HEAD")
+    set_pr(env, lease_branch(5, 1), 12, "MERGED", head)
+    env.token = TOKENS["reporter"]
+    env.write_config(env.cfg)
+    result = env.run("report")
+    if result.returncode != 0:
+        failures.append(f"report: the report failed: {result.stderr.strip()!r}")
+    live = keeper_now(env)
+    if not live:
+        failures.append("report: the keeper holds no live lease")
+        return failures
+    lease = live[0]
+    if lease.get("state") != "idle":
+        failures.append("report: the lease reads "
+                        f"{lease.get('state')!r} rather than 'idle'")
+    if lease.get("pr") != 12:
+        failures.append(f"report: the lease records no pull request: {lease}")
+    if lease.get("pr_state") != "MERGED":
+        failures.append(f"report: the lease records no pull request state: "
+                        f"{lease}")
+    return failures
+
+
+def test_report_stopped(env: Env) -> list[str]:
+    """A window that is gone reports the lane stopped."""
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["report stopped: the spawn failed"]
+    env.remove_window("tooling-5")
+    env.token = TOKENS["reporter"]
+    env.write_config(env.cfg)
+    result = env.run("report")
+    if result.returncode != 0:
+        failures.append("report stopped: the report failed: "
+                        f"{result.stderr.strip()!r}")
+    live = keeper_now(env)
+    if not live:
+        failures.append("report stopped: the keeper holds no live lease")
+        return failures
+    if live[0].get("state") != "stopped":
+        failures.append("report stopped: the lease reads "
+                        f"{live[0].get('state')!r} rather than 'stopped'")
+    return failures
+
+
+def test_ssh_argv(env: Env) -> list[str]:
+    """A path with a space reaches the agent host as one argument.
+
+    The command is joined into one string, so the path is quoted. An
+    unquoted path arrives as two arguments.
+    """
+    failures = []
+    worktree = env.worktree_root / "a work tree"
+    spawn = env.spawn(5, extra=("--worktree", str(worktree)))
+    if spawn.returncode != 0:
+        return [f"ssh argv: the spawn failed: {spawn.stderr.strip()!r}"]
+    head = git_out(worktree, "rev-parse", "HEAD")
+    set_pr(env, lease_branch(5, 1), 12, "MERGED", head)
+    env.set_pane("tooling-5", HERMES_IDLE)
+    finished = env.run("finish", "1")
+    if finished.returncode != 0:
+        failures.append(f"ssh argv: the finish failed: "
+                        f"{finished.stderr.strip()!r}")
+    log = env.log("ssh.log").splitlines()
+    if not any(line == f"ssh-split {worktree}" for line in log):
+        failures.append("ssh argv: the path with a space did not reach the "
+                        f"command whole: {log!r}")
+    if any(line.endswith(" a work") for line in log):
+        failures.append("ssh argv: the path with a space was split in two")
+    if not any(f"'{worktree}'" in line for line in log):
+        failures.append("ssh argv: the path with a space was not quoted")
+    return failures
+
+
+def test_report_install(env: Env) -> list[str]:
+    """The reporter ships with a timer, and the timer runs every minute.
+
+    The record is read when somebody looks at it otherwise, and a
+    dashboard that shows a lane as it was an hour ago is a dashboard
+    nobody trusts.
+    """
+    failures = []
+    service = REPO_ROOT / "install" / "lane-report" / "lane-report.service"
+    timer = REPO_ROOT / "install" / "lane-report" / "lane-report.timer"
+    for path in (service, timer):
+        if not path.is_file():
+            failures.append(f"report install: {path} is not there")
+            return failures
+    unit = service.read_text()
+    if "lane report" not in unit:
+        failures.append("report install: the service does not run the "
+                        f"reporter: {unit!r}")
+    if "Type=oneshot" not in unit:
+        failures.append("report install: the service is not a one-shot")
+    ticks = timer.read_text()
+    if "OnUnitActiveSec=60s" not in ticks:
+        failures.append("report install: the timer does not run every "
+                        f"minute: {ticks!r}")
+    if "WantedBy=timers.target" not in ticks:
+        failures.append("report install: the timer is not installed for "
+                        "the timers target")
+    return failures
+
+
 CASES = [
     ("race", test_race),
     ("read-under-a-write-lock", test_read_under_a_write_lock),
@@ -2452,6 +2774,13 @@ CASES = [
     ("resume-race", test_resume_race),
     ("check", test_check),
     ("reconcile-leaves-a-resumed-lane", test_reconcile_leaves_a_resumed_lane),
+    ("keeper-unreachable", test_keeper_unreachable),
+    ("token-file-mode", test_token_file_mode),
+    ("check-reader-token", test_check_reader_token),
+    ("report", test_report),
+    ("report-stopped", test_report_stopped),
+    ("ssh-argv", test_ssh_argv),
+    ("report-install", test_report_install),
 ]
 
 
@@ -2467,6 +2796,8 @@ def main() -> int:
                 failures.extend(case(env))
             except AssertionError as exc:
                 failures.append(f"{name}: unexpected assertion error: {exc}")
+            finally:
+                env.stop_keeper()
     if failures:
         print("FAIL:")
         for failure in failures:

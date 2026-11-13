@@ -1,0 +1,12 @@
+[Unit]
+Description=Report the lanes to the lane keeper every minute
+
+[Timer]
+# The record is read every minute, so the dashboard says what the lanes
+# are doing now rather than what they were doing when somebody looked.
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=lane-report.service
+
+[Install]
+WantedBy=timers.target

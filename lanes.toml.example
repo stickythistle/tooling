@@ -9,6 +9,19 @@ tmux_session = "0"          # tmux target session
 worktree_root = "~/wt"      # default worktree: <root>/<repo name>-<issue>
 ready_seconds = 8           # wait after starting a harness, before it is used
 
+# The keeper owns the lane record; this tool reads and changes it there.
+#
+# The token file holds the token alone, and its mode is checked: a token
+# any other user can read is a token any lane can use.
+[keeper]
+url = "http://127.0.0.1:8787"
+token_file = "~/.config/agent-tools/lane-token"
+
+# The host the side effects happen on: the windows, the worktrees and the
+# processes are there, and this host only asks for them over ssh.
+[agent]
+ssh = "hermesagent"
+
 # A pool is a cap; a profile's cost is what it takes from its pool.
 [pools]
 minimax = 4
