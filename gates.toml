@@ -382,6 +382,14 @@ name = "squash tests"
 when = '^(bin/squash|tests/test_squash\.py)$'
 run = "python3 tests/test_squash.py"
 
+# The push side of a pull request: the branch goes to the remote under a
+# lease read from the remote itself, and a push that cannot be the push the
+# caller meant is refused before it starts.
+[[gates]]
+name = "pr-push tests"
+when = '^(bin/pr-push|tests/test_pr_push\.py)$'
+run = "python3 tests/test_pr_push.py"
+
 [[gates]]
 name = "find_prose tests"
 when = '^(skills/condense-prose/find_prose\.py|tests/test_find_prose\.py)$'

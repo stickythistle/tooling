@@ -11,6 +11,12 @@ IDENTITY = {"GIT_AUTHOR_NAME": "squash-test",
             "GIT_AUTHOR_EMAIL": "squash-test@example.com",
             "GIT_COMMITTER_NAME": "squash-test",
             "GIT_COMMITTER_EMAIL": "squash-test@example.com"}
+# The identity the repository's git config carries, and the one the sign-off
+# has to name. The two agree here, because a commit signed by somebody other
+# than its author is no DCO sign-off.
+NAME = IDENTITY["GIT_AUTHOR_NAME"]
+EMAIL = IDENTITY["GIT_AUTHOR_EMAIL"]
+SIGNOFF = f"Signed-off-by: {NAME} <{EMAIL}>"
 
 
 def git(cwd, *args):
@@ -28,8 +34,8 @@ def init_repo(tmpdir):
     repo = Path(tmpdir) / "repo"
     repo.mkdir()
     git(repo, "init", "-q", "-b", "main")
-    git(repo, "config", "user.email", "t@t")
-    git(repo, "config", "user.name", "t")
+    git(repo, "config", "user.email", IDENTITY["GIT_AUTHOR_EMAIL"])
+    git(repo, "config", "user.name", NAME)
     (repo / "base.txt").write_text("base\n")
     git(repo, "add", ".")
     git(repo, "commit", "-q", "-m", "base")
@@ -395,6 +401,176 @@ def case_commit_failure_restores_head(failures):
         hook.unlink(missing_ok=True)
 
 
+def signoff_lines(message):
+    """The sign-off lines a commit message carries."""
+    return [line for line in message.splitlines()
+            if line.lower().startswith("signed-off-by:")]
+
+
+def read_or_empty(path):
+    """The file's content, or an empty string."""
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def move_main_and_publish(repo):
+    """Move main forward and publish its tip as origin/main."""
+    git(repo, "checkout", "--quiet", "main")
+    (repo / "main_added.txt").write_text("main moved\n")
+    git(repo, "add", "-A")
+    git(repo, "commit", "--quiet", "-m", "main moved")
+    tip = head(repo)
+    git(repo, "update-ref", "refs/remotes/origin/main", tip)
+    git(repo, "checkout", "--quiet", "feat")
+    return tip
+
+
+def case_signoff_adds_one_signoff(failures):
+    # The DCO wants exactly one sign-off, naming the commit's author.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=3)
+
+        r = run_squash(repo, "--base", "main", "-s", "-m", "squashed")
+
+        assert_rc("signoff exit code", 0, r, failures)
+
+        count = git(repo, "rev-list", "--count", "main..HEAD").stdout.strip()
+        assert_eq("signoff produced one commit", "1", count, failures)
+
+        assert_eq("the commit carries the caller's subject", "squashed",
+                  git(repo, "log", "-1", "--format=%s").stdout.strip(), failures)
+
+        message = git(repo, "log", "-1", "--format=%B").stdout
+        lines = signoff_lines(message)
+        assert_eq("exactly one sign-off", 1, len(lines), failures)
+        if lines:
+            assert_eq("the sign-off names the configured identity", SIGNOFF,
+                      lines[0], failures)
+
+
+def case_signoff_one_commit_keeps_one_signoff(failures):
+    # The DCO wants one sign-off, and the message already carries it.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        git(repo, "checkout", "--quiet", "-b", "feat")
+        (repo / "feat.txt").write_text("feat\n")
+        git(repo, "add", "-A")
+        old_msg = Path(tmpdir) / "old.txt"
+        old_msg.write_text(f"already signed off\n\n{SIGNOFF}\n")
+        git(repo, "commit", "--quiet", "-F", str(old_msg))
+        pre = head(repo)
+
+        new_msg = Path(tmpdir) / "new.txt"
+        new_msg.write_text(f"the coordinator's subject\n\nand its body\n\n{SIGNOFF}\n")
+
+        r = run_squash(repo, "--base", "main", "-s", "-F", str(new_msg))
+
+        assert_rc("one-commit signoff exit code", 0, r, failures)
+
+        message = git(repo, "log", "-1", "--format=%B").stdout
+        lines = signoff_lines(message)
+        assert_eq("still exactly one sign-off", 1, len(lines), failures)
+        if lines:
+            assert_eq("the sign-off is the one that was there", SIGNOFF,
+                      lines[0], failures)
+        assert_in("the message was replaced", "the coordinator's subject",
+                  message, failures)
+        if "already signed off" in message:
+            fail(failures, "the old message is still on the commit",
+                 f"message: {message!r}")
+
+        count = git(repo, "rev-list", "--count", f"{pre}..HEAD").stdout.strip()
+        assert_eq("the amend added no commit", "1", count, failures)
+
+
+def case_signoff_refuses_another_person(failures):
+    # A sign-off by somebody else is left alone and the tool refuses,
+    # naming both: the DCO wants one signer.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=3)
+        pre = head(repo)
+        other = "Someone Else <else@example.com>"
+
+        r = run_squash(repo, "--base", "main", "-s", "-m",
+                       f"a subject\n\nSigned-off-by: {other}")
+
+        assert_rc("another sign-off exit code", 1, r, failures)
+        assert_in("the other sign-off is named", other, r.stderr, failures)
+        assert_in("our identity is named", f"{NAME} <{EMAIL}>", r.stderr, failures)
+        assert_eq("HEAD unchanged after the refusal", pre, head(repo), failures)
+
+
+def case_onto_moves_the_commit(failures):
+    # `--onto` moves the squashed commit onto a base that moved, so the tree
+    # keeps what the base added.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        make_branch_with_commits(repo, n=3)
+        main_tip = move_main_and_publish(repo)
+
+        r = run_squash(repo, "--base", "origin/main", "--onto", "origin/main",
+                       "-m", "squashed")
+
+        assert_rc("onto exit code", 0, r, failures)
+
+        count = git(repo, "rev-list", "--count", "origin/main..HEAD").stdout.strip()
+        assert_eq("onto produced one commit", "1", count, failures)
+
+        parent = git(repo, "rev-parse", "HEAD^").stdout.strip()
+        assert_eq("the commit sits on origin/main's tip", main_tip, parent, failures)
+
+        files = git(repo, "ls-tree", "-r", "--name-only", "HEAD").stdout.split()
+        if "main_added.txt" not in files:
+            fail(failures, "the move lost what main added", f"tree: {files}")
+        for i in range(3):
+            if f"feat_{i}.txt" not in files:
+                fail(failures, "the move lost a file of the branch", f"tree: {files}")
+
+        assert_eq("the branch's file is unchanged", "feat 0\n",
+                  read_or_empty(repo / "feat_0.txt"), failures)
+        assert_eq("main's file came with the move", "main moved\n",
+                  read_or_empty(repo / "main_added.txt"), failures)
+
+
+def case_onto_conflict_refuses(failures):
+    # A conflict aborts the rebase: HEAD stays on the squashed commit, and the
+    # reader is told which paths to resolve.
+    with tempfile.TemporaryDirectory() as tmpdir:
+        repo = init_repo(tmpdir)
+        fork = head(repo)
+        git(repo, "checkout", "--quiet", "-b", "feat")
+        (repo / "both.txt").write_text("the branch\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "--quiet", "-m", "branch side")
+        git(repo, "checkout", "--quiet", "main")
+        (repo / "both.txt").write_text("the base\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "--quiet", "-m", "base side")
+        main_tip = head(repo)
+        git(repo, "update-ref", "refs/remotes/origin/main", main_tip)
+        git(repo, "checkout", "--quiet", "feat")
+
+        r = run_squash(repo, "--base", "origin/main", "--onto", "origin/main",
+                       "-m", "squashed")
+
+        assert_rc("onto conflict exit code", 1, r, failures)
+        assert_in("onto conflict names the path", "both.txt", r.stderr, failures)
+
+        assert_eq("HEAD carries the squashed message", "squashed",
+                  git(repo, "log", "-1", "--format=%s").stdout.strip(), failures)
+        assert_eq("HEAD sits on the fork point", fork,
+                  git(repo, "rev-parse", "HEAD^").stdout.strip(), failures)
+
+        git_dir = Path(git(repo, "rev-parse", "--absolute-git-dir").stdout.strip())
+        for name in ("rebase-merge", "rebase-apply"):
+            if (git_dir / name).exists():
+                fail(failures, f"a rebase is still in progress ({name})")
+
+
 def main():
     if not SQUASH.is_file():
         return 1
@@ -411,7 +587,9 @@ def main():
           "one-commit amends the message, keeps the author, "
           "same message is a no-op (issue #175); "
           "commit failure restores HEAD; "
-          "relative -F resolves from caller's CWD (issue #86)")
+          "relative -F resolves from caller's CWD (issue #86); "
+          "-s signs the commit off once and refuses another person's sign-off; "
+          "--onto moves the commit onto a newer base, and a conflict aborts")
     return 0
 
 
@@ -425,7 +603,12 @@ CASES = (case_moving_base_preserves_tree, case_dirty_index_refuses,
          case_single_commit_keeps_the_author,
          case_single_commit_with_same_message_is_a_noop,
          case_single_commit_without_message_exits_zero,
-         case_commit_failure_restores_head)
+         case_commit_failure_restores_head,
+         case_signoff_adds_one_signoff,
+         case_signoff_one_commit_keeps_one_signoff,
+         case_signoff_refuses_another_person,
+         case_onto_moves_the_commit,
+         case_onto_conflict_refuses)
 
 if __name__ == "__main__":
     sys.exit(main())
