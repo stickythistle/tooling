@@ -140,15 +140,17 @@ def _forwarded_signals(child: subprocess.Popen):
             signal.signal(sig, old)
 
 
-def run(cmd: list[str], env: dict | None = None) -> tuple[int, str, str]:
+def run(cmd: list[str], env: dict | None = None,
+        cwd: Path | None = None) -> tuple[int, str, str]:
     """Run one command and return its exit status, stdout and stderr.
 
     The child is waited for, and a signal to this process reaches it
-    first.
+    first. `cwd` is the directory the child starts in.
     """
     try:
         child = subprocess.Popen(cmd, stdout=subprocess.PIPE,
-                                 stderr=subprocess.PIPE, text=True, env=env)
+                                 stderr=subprocess.PIPE, text=True, env=env,
+                                 cwd=str(cwd) if cwd is not None else None)
     except OSError as exc:
         raise CommandError(cmd, 127, str(exc)) from exc
     try:
@@ -1364,7 +1366,11 @@ def take_down(conn: sqlite3.Connection, lease: sqlite3.Row,
                                                       "-d"], code, err).detail())
         print(f"deleted refs/remotes/origin/{branch}")
     tree = tree_name(worktree)
-    code, _, err = run([str(prune_tool()), "--prune", "--tree", tree])
+    # The prune reads the repository it runs in, so it runs in the
+    # clone: the worktree is gone by now, and the caller's own directory
+    # is whatever the caller happened to be in.
+    code, _, err = run([str(prune_tool()), "--prune", "--tree", tree],
+                       cwd=clone)
     if code != 0:
         # The lane is gone either way, so a prune that failed is
         # reported and not fatal.

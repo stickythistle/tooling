@@ -273,13 +273,16 @@ exec "''' + real + r'''" "$@"
 
 
 def write_stub_remote_prune(path: Path) -> None:
-    """A remote-prune that logs the tree it was asked to prune.
+    """A remote-prune that logs the tree it was asked to prune and where.
+
+    The working directory is part of what it was asked: the prune reads
+    the repository it runs in.
 
     A test asks it to fail by creating `$STUB_DATA/fail_remote_prune`.
     """
     body = r'''#!/usr/bin/env bash
-printf 'remote-prune %s\n' "$*" >> "$STUB_DATA/remote-prune.log"
-printf 'remote-prune %s\n' "$*" >> "$STUB_DATA/calls.log"
+printf 'remote-prune %s cwd=%s\n' "$*" "$(pwd)" >> "$STUB_DATA/remote-prune.log"
+printf 'remote-prune %s cwd=%s\n' "$*" "$(pwd)" >> "$STUB_DATA/calls.log"
 if [ -f "$STUB_DATA/fail_remote_prune" ]; then
     echo "remote-prune: simulated failure" >&2
     exit 1
@@ -419,16 +422,17 @@ class Env:
             env.update(extra)
         return env
 
-    def run(self, *args: str, extra: dict | None = None) -> subprocess.CompletedProcess:
-        """Run the tool."""
+    def run(self, *args: str, extra: dict | None = None,
+            cwd: Path | None = None) -> subprocess.CompletedProcess:
+        """Run the tool, from `cwd` when the case names one."""
         return subprocess.run([str(self.lane), *args], capture_output=True,
-                              text=True, env=self.env(extra))
+                              text=True, env=self.env(extra), cwd=cwd)
 
     def spawn(self, issue: int, harness: str = "hermes",
               profile: str = "minimax", session: str = "coord-a",
-              extra: tuple = ()) -> subprocess.CompletedProcess:
+              extra: tuple = (), repo: str = REPO) -> subprocess.CompletedProcess:
         """Spawn a lane."""
-        return self.run("spawn", "--repo", REPO, "--issue", str(issue),
+        return self.run("spawn", "--repo", repo, "--issue", str(issue),
                         "--harness", harness, "--profile", profile,
                         "--session", session, *extra)
 
@@ -525,6 +529,20 @@ def window_lines(env: Env) -> list[str]:
     """The windows the tool opened, in order."""
     return [line for line in env.log("tmux.log").splitlines()
             if "new-window" in line]
+
+
+def prune_calls(env: Env) -> dict[str, str]:
+    """The prunes the stub recorded: the tree it was asked for, and where.
+
+    The tree keys the entry and the working directory is the value.
+    """
+    calls = {}
+    for line in env.log("calls.log").splitlines():
+        if not line.startswith("remote-prune "):
+            continue
+        call, _, cwd = line.partition(" cwd=")
+        calls[call.split("--tree ")[-1].strip()] = cwd
+    return calls
 
 
 def spawn_merged(env: Env, issue: int, number: int = 12) -> str:
@@ -1701,6 +1719,63 @@ def test_finish_prune_fails(env: Env) -> list[str]:
     return failures
 
 
+def test_finish_prune_in_the_clone(env: Env) -> list[str]:
+    """A finish started outside the repository still prunes the caches.
+
+    The prune reads the repository it runs in, so it runs in the clone
+    the lease names.
+    """
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish prune in the clone: the spawn failed"]
+    outside = env.tmp / "outside"
+    outside.mkdir()
+    result = env.run("finish", "1", cwd=outside)
+    if result.returncode != 0:
+        return [f"finish prune in the clone: the finish failed: "
+                f"{result.stderr.strip()!r}"]
+    calls = prune_calls(env)
+    clone = os.path.realpath(str(env.clone))
+    if calls.get("tooling_5") != clone:
+        failures.append(f"finish prune in the clone: the prune ran in "
+                        f"{calls.get('tooling_5')!r} rather than in the "
+                        f"lease's clone {clone!r}")
+    return failures
+
+
+def test_finish_merged_prunes_each_clone(env: Env) -> list[str]:
+    """Two lanes in two clones: each prune runs in its own lease's clone."""
+    failures = []
+    second = env.tmp / "second"
+    second.mkdir()
+    other_clone = make_origin(second)
+    cfg = env.default_config()
+    cfg["repos"]["stickythistle/other"] = {"clone": str(other_clone)}
+    env.write_config(cfg)
+    if not spawn_merged(env, 5):
+        return ["finish merged clones: the first spawn failed"]
+    spawn = env.spawn(9, repo="stickythistle/other")
+    if spawn.returncode != 0:
+        return [f"finish merged clones: the second spawn failed: "
+                f"{spawn.stderr.strip()!r}"]
+    other_worktree = env.worktree_root / "other-9"
+    head = git_out(other_worktree, "rev-parse", "HEAD")
+    set_pr(env, "lane/9", 19, "MERGED", head)
+    env.set_pane("other-9", HERMES_IDLE)
+    result = env.run("finish", "--merged")
+    if result.returncode != 0:
+        return [f"finish merged clones: the finish failed: "
+                f"{result.stderr.strip()!r}"]
+    calls = prune_calls(env)
+    wanted = {"tooling_5": os.path.realpath(str(env.clone)),
+              "other_9": os.path.realpath(str(other_clone))}
+    for tree, clone in wanted.items():
+        if calls.get(tree) != clone:
+            failures.append(f"finish merged clones: the prune for {tree} ran "
+                            f"in {calls.get(tree)!r} rather than in {clone!r}")
+    return failures
+
+
 def test_finish_merged_lanes(env: Env) -> list[str]:
     """`--merged` takes down every lane whose pull request merged."""
     failures = []
@@ -2193,6 +2268,8 @@ CASES = [
     ("finish-abandon-ahead", test_finish_abandon_ahead),
     ("finish-abandon-merged", test_finish_abandon_merged),
     ("finish-prune-fails", test_finish_prune_fails),
+    ("finish-prune-in-the-clone", test_finish_prune_in_the_clone),
+    ("finish-merged-prunes-each-clone", test_finish_merged_prunes_each_clone),
     ("finish-merged-lanes", test_finish_merged_lanes),
     ("list-pr", test_list_pr),
     ("spawn-session", test_spawn_session),
