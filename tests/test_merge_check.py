@@ -312,6 +312,104 @@ def case_a_running_check_is_not_a_failure(failures: list[str]) -> None:
              str(names))
 
 
+def rollup_run(name: str = "ci/build", workflow: str = "CI", status: str = "COMPLETED",
+               conclusion: str | None = None, started: str | None = None):
+    """A `CheckRun` as the rollup reports it, fields the reads use only.
+
+    `started` left out is a run that has not started, which is how a
+    queued run reaches the rollup.
+    """
+    entry = {"__typename": "CheckRun", "name": name,
+             "workflowName": workflow, "status": status,
+             "conclusion": conclusion}
+    if started is not None:
+        entry["startedAt"] = started
+    return entry
+
+
+def rollup_status(context: str = "ci/build", state: str = "SUCCESS",
+                  started: str | None = None):
+    """A `StatusContext` as the rollup reports it: `context`, `state`,
+    and `startedAt` for the moment the status was posted."""
+    entry = {"__typename": "StatusContext", "context": context, "state": state}
+    if started is not None:
+        entry["startedAt"] = started
+    return entry
+
+
+# Each row is the runs of one check on one head, oldest first, and what
+# the two reads answer. A workflow with `concurrency: cancel-in-progress`
+# leaves two runs of a job on a head: the push supersedes the first, which
+# ends `cancelled`. GitHub judges a check by its latest run, so a
+# superseded run says nothing about the branch.
+SUPERSEDED_ROWS = [
+    ("cancelled then success",
+     [rollup_run(conclusion="CANCELLED", started="2026-11-13T05:50:12Z"),
+      rollup_run(conclusion="SUCCESS", started="2026-11-13T06:11:27Z")],
+     [], False),
+    ("success then failure",
+     [rollup_run(conclusion="SUCCESS", started="2026-11-13T05:00:00Z"),
+      rollup_run(conclusion="FAILURE", started="2026-11-13T06:00:00Z")],
+     ["ci/build"], False),
+    ("cancelled only",
+     [rollup_run(conclusion="CANCELLED", started="2026-11-13T05:50:12Z")],
+     ["ci/build"], False),
+    ("success then a queued run",
+     [rollup_run(conclusion="SUCCESS", started="2026-11-13T05:00:00Z"),
+      rollup_run(status="QUEUED", conclusion=None)],
+     [], True),
+    # Two workflows, one job name. The name is what a read returns, so
+    # the row says which run survives: the success is the later one, and
+    # keying by name alone would drop the failure with it.
+    ("the same job name in two workflows",
+     [rollup_run(name="test", workflow="A", conclusion="FAILURE",
+                 started="2026-11-13T05:00:00Z"),
+      rollup_run(name="test", workflow="B", conclusion="SUCCESS",
+                 started="2026-11-13T06:00:00Z")],
+     ["test"], False),
+    ("cancelled then skipped",
+     [rollup_run(conclusion="CANCELLED", started="2026-11-13T05:50:12Z"),
+      rollup_run(conclusion="SKIPPED", started="2026-11-13T06:11:27Z")],
+     [], False),
+    # A commit status supersedes the one before it for the same context.
+    ("a status failure then a status success",
+     [rollup_status(state="FAILURE", started="2026-11-13T05:00:00Z"),
+      rollup_status(state="SUCCESS", started="2026-11-13T06:00:00Z")],
+     [], False),
+    ("a status success then a pending status",
+     [rollup_status(state="SUCCESS", started="2026-11-13T05:00:00Z"),
+      rollup_status(state="PENDING", started="2026-11-13T06:00:00Z")],
+     [], True),
+]
+
+
+def case_a_superseded_check_run_is_not_evidence(failures: list[str]) -> None:
+    for label, runs, expected_failed, expected_pending in SUPERSEDED_ROWS:
+        names = pr_gate.failed_check_names(runs)
+        if names != expected_failed:
+            fail(failures, f"checks: {label}: unexpected failed names",
+                 f"got {names}, expected {expected_failed}")
+        pending = bool(pr_gate.pending_checks(runs))
+        if pending is not expected_pending:
+            fail(failures, f"checks: {label}: unexpected pending answer",
+                 f"got {pending}, expected {expected_pending}")
+
+
+def case_a_superseded_run_of_another_check_is_not_dropped(failures: list[str]) -> None:
+    # Dropping every cancelled entry would let a check whose only run was
+    # cancelled pass for lack of evidence. A check with nothing but a
+    # superseded run still refuses.
+    runs = [rollup_run(name="other", conclusion="SUCCESS"),
+            rollup_run(name="cancelled_only", conclusion="CANCELLED",
+                       started="2026-11-13T05:50:12Z")]
+    names = pr_gate.failed_check_names(runs)
+    if names != ["cancelled_only"]:
+        fail(failures, "checks: a check whose only run was cancelled was "
+                       "not named", str(names))
+    if pr_gate.pending_checks(runs):
+        fail(failures, "checks: completed runs were reported as pending")
+
+
 def case_a_wrong_committer_is_refused(failures: list[str]) -> None:
     # The committer is who put the commit in the repository. A commit
     # the lane wrote and something else committed is no lane commit.
@@ -1102,6 +1200,31 @@ def case_the_driver_refuses_a_real_rollup_that_is_still_running(failures: list[s
                  r.stderr)
 
 
+def case_the_driver_accepts_a_superseded_cancelled_run(failures: list[str]) -> None:
+    # The shape `concurrency: cancel-in-progress` leaves on a head: one
+    # cancelled run of a job and one success of it. The cancelled run was
+    # superseded, so it says nothing about the branch and the pull request
+    # is ready.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, head, _main, env = setup(tmp, rollup=[
+            rollup_run(name="check", conclusion="CANCELLED",
+                       started="2026-11-13T05:50:12Z"),
+            rollup_run(name="check", conclusion="SUCCESS",
+                       started="2026-11-13T06:11:27Z")])
+        r = run(env, clone)
+        if r.returncode != 0:
+            fail(failures, "checks: a check whose cancelled run was "
+                           "superseded by a success was refused",
+                 f"rc={r.returncode} stderr={r.stderr}")
+            return
+        if "READY" not in r.stdout:
+            fail(failures, "checks: the output does not say READY", r.stdout)
+        if head not in r.stdout:
+            fail(failures, "checks: the merge command does not name the head",
+                 r.stdout)
+
+
 def case_the_driver_reads_every_commit(failures: list[str]) -> None:
     # Three commits on the branch, and the oldest one carries a wrong
     # identity. Every commit is read, so the oldest is refused and
@@ -1478,6 +1601,8 @@ def main() -> int:
     case_a_failed_check_is_refused(failures)
     case_only_success_neutral_and_skipped_pass(failures)
     case_a_running_check_is_not_a_failure(failures)
+    case_a_superseded_check_run_is_not_evidence(failures)
+    case_a_superseded_run_of_another_check_is_not_dropped(failures)
     case_a_wrong_committer_is_refused(failures)
     case_a_third_party_comment_is_refused(failures)
     case_a_needs_decision_label_is_refused(failures)
@@ -1491,6 +1616,7 @@ def main() -> int:
     case_the_driver_refuses_a_failed_status(failures)
     case_the_driver_accepts_a_real_check_rollup(failures)
     case_the_driver_refuses_a_real_rollup_that_is_still_running(failures)
+    case_the_driver_accepts_a_superseded_cancelled_run(failures)
     case_the_driver_reads_every_commit(failures)
     case_the_driver_counts_every_commit(failures)
     case_the_stub_refuses_a_read_sent_as_a_post(failures)

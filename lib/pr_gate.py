@@ -178,8 +178,74 @@ def changes_requested_count(checked_reviews: list, reviewer: str) -> int:
                and r["state"] == "CHANGES_REQUESTED")
 
 
+def _check_key(entry: dict) -> tuple | None:
+    """The check an entry is one run of; None for an entry of neither shape.
+
+    A `CheckRun` is keyed by (`workflowName`, `name`), since two workflows
+    can each carry a job called `test`; a `StatusContext` by its `context`.
+    """
+    typename = entry.get("__typename")
+    if typename == "CheckRun":
+        workflow = entry.get("workflowName")
+        name = entry.get("name")
+        return ("CheckRun",
+                workflow if isinstance(workflow, str) else "",
+                name if isinstance(name, str) else "")
+    if typename == "StatusContext":
+        context = entry.get("context")
+        return ("StatusContext", context if isinstance(context, str) else "")
+    return None
+
+
+def _check_started(entry: dict) -> str | None:
+    """When the run started, or None while it has not started.
+
+    `startedAt` is ISO-8601 UTC, so it sorts as text. A run nobody has
+    started carries no value, and it was queued after every run that has.
+    """
+    started = entry.get("startedAt")
+    return started if isinstance(started, str) and started else None
+
+
+def _supersedes(newer: dict, older: dict) -> bool:
+    """True when `newer` is the later run of the same check.
+
+    Two runs with no start time say nothing of their order, so neither
+    supersedes the other: dropping one is a guess.
+    """
+    newer_started = _check_started(newer)
+    older_started = _check_started(older)
+    if newer_started is None:
+        return older_started is not None
+    if older_started is None:
+        return False
+    return newer_started > older_started
+
+
+def latest_check_runs(checks: list) -> list:
+    """Return the rollup holding only each check's latest run, in input order.
+
+    A `concurrency: cancel-in-progress` push leaves a superseded run
+    beside the new one, and it is no evidence about the branch. An entry
+    of neither shape passes through.
+    """
+    runs: dict[tuple, list] = {}
+    for entry in checks:
+        if isinstance(entry, dict):
+            key = _check_key(entry)
+            if key is not None:
+                runs.setdefault(key, []).append(entry)
+
+    out = []
+    for entry in checks:
+        key = _check_key(entry) if isinstance(entry, dict) else None
+        if key is None or not any(_supersedes(o, entry) for o in runs[key]):
+            out.append(entry)
+    return out
+
+
 def pending_checks(checks: list) -> bool:
-    """True when a check on the head has not finished.
+    """True when a check's latest run on the head has not finished.
 
     `statusCheckRollup` mixes two shapes, told apart by `__typename`: a
     `CheckRun` carries a `status`, a `StatusContext` a `state`
@@ -187,7 +253,7 @@ def pending_checks(checks: list) -> bool:
 
     An empty rollup counts as finished.
     """
-    for entry in checks:
+    for entry in latest_check_runs(checks):
         if not isinstance(entry, dict):
             continue
         typename = entry.get("__typename")
@@ -206,7 +272,8 @@ def failed_check_names(checks: list) -> list[str]:
     """The names of the checks that concluded against the branch.
 
     A check is a `CheckRun` (a `conclusion`) or a `StatusContext` (a
-    `state`), told apart by `__typename`. A running check is never named.
+    `state`), told apart by `__typename`. A running check is never named,
+    and only each check's latest run is read at all.
 
     Only `success`, `neutral` and `skipped` count as evidence.
 
@@ -214,7 +281,7 @@ def failed_check_names(checks: list) -> list[str]:
     startup-failed run is named.
     """
     failed: list[str] = []
-    for entry in checks:
+    for entry in latest_check_runs(checks):
         if not isinstance(entry, dict):
             continue
         typename = entry.get("__typename")
@@ -245,12 +312,12 @@ def failed_checks(checks: list) -> bool:
     """True when a check on the head concluded against the branch.
 
     A `CheckRun` is failed by its `conclusion`, a `StatusContext` by
-    its `state`.
+    its `state`, and only a check's latest run speaks for it.
 
-    The loop asks for evidence against the branch, so a cancelled run
-    is not: every push cancels the run it supersedes.
+    The loop asks for evidence against the branch, and a cancelled run
+    gives none: every push cancels the run it supersedes.
     """
-    for entry in checks:
+    for entry in latest_check_runs(checks):
         if not isinstance(entry, dict):
             continue
         typename = entry.get("__typename")

@@ -106,13 +106,23 @@ def status_marker(review_id, head):
 
 
 def check_run(status: str = "COMPLETED", conclusion=None,
-             name: str = "Gates"):
-    return {"__typename": "CheckRun", "status": status,
-            "conclusion": conclusion, "name": name}
+             name: str = "Gates", workflow: str | None = None,
+             started: str | None = None):
+    entry = {"__typename": "CheckRun", "status": status,
+             "conclusion": conclusion, "name": name}
+    if workflow is not None:
+        entry["workflowName"] = workflow
+    if started is not None:
+        entry["startedAt"] = started
+    return entry
 
 
-def status_context(state: str = "SUCCESS", name: str = "ci"):
-    return {"__typename": "StatusContext", "state": state, "context": name}
+def status_context(state: str = "SUCCESS", name: str = "ci",
+                   started: str | None = None):
+    entry = {"__typename": "StatusContext", "state": state, "context": name}
+    if started is not None:
+        entry["startedAt"] = started
+    return entry
 
 
 def pr(state="open", merged=False, head=HEAD, draft=False,
@@ -166,6 +176,69 @@ def scenarios():
     # Row 3d: an empty rollup is WAIT never.
     add("no_checks", pr(),
                 [], [], [], {}, "REVIEW " + HEAD)
+
+    # Rows 3e onward: a check with more than one run on the head. A workflow
+    # with `concurrency: cancel-in-progress` leaves a cancelled run and a
+    # later run of the same job on one commit, and GitHub judges the check
+    # by the later one. Keyed by workflow and job name, because two
+    # workflows may each carry a job called `test`.
+    add("superseded_cancelled_run", pr(),
+                [], [], [check_run(conclusion="CANCELLED",
+                                   started="2026-11-13T05:50:12Z"),
+                         check_run(conclusion="SUCCESS",
+                                   started="2026-11-13T06:11:27Z")],
+                {}, "REVIEW " + HEAD)
+
+    add("superseded_by_a_queued_run", pr(),
+                [], [], [check_run(conclusion="SUCCESS",
+                                   started="2026-11-13T05:00:00Z"),
+                         check_run(status="QUEUED", conclusion=None)],
+                {}, "WAIT checks")
+
+    # A superseded failure is no evidence either: the run that failed was
+    # re-run and the re-run passed.
+    add("superseded_failed_run", pr(),
+                [], [], [check_run(conclusion="FAILURE",
+                                   started="2026-11-13T05:00:00Z"),
+                         check_run(conclusion="SUCCESS",
+                                   started="2026-11-13T06:00:00Z")],
+                {}, "REVIEW " + HEAD)
+
+    # The loop asks only for evidence *against* the branch, so a latest
+    # cancelled run is no FIX -- and keeping the older success must not
+    # change that.
+    add("latest_run_cancelled", pr(),
+                [], [], [check_run(conclusion="SUCCESS",
+                                   started="2026-11-13T05:00:00Z"),
+                         check_run(conclusion="CANCELLED",
+                                   started="2026-11-13T06:00:00Z")],
+                {}, "REVIEW " + HEAD)
+
+    add("latest_run_failed", pr(),
+                [], [], [check_run(conclusion="SUCCESS",
+                                   started="2026-11-13T05:00:00Z"),
+                         check_run(conclusion="FAILURE",
+                                   started="2026-11-13T06:00:00Z")],
+                {}, "FIX checks")
+
+    # The failure belongs to workflow A; workflow B's job of the same name
+    # ran later and passed. Keying by name alone drops the failure.
+    add("same_job_name_in_two_workflows", pr(),
+                [], [], [check_run(name="test", workflow="A",
+                                   conclusion="FAILURE",
+                                   started="2026-11-13T05:00:00Z"),
+                         check_run(name="test", workflow="B",
+                                   conclusion="SUCCESS",
+                                   started="2026-11-13T06:00:00Z")],
+                {}, "FIX checks")
+
+    # A commit status is keyed by its `context` and told the same way.
+    add("superseded_status_context", pr(),
+                [], [], [status_context(state="FAILURE",
+                                        started="2026-11-13T05:00:00Z"),
+                         status_context(state="SUCCESS",
+                                        started="2026-11-13T06:00:00Z")],
+                {}, "REVIEW " + HEAD)
 
     # Row 4: the reviewer has never ruled.
     add("no_verdict", pr(),
