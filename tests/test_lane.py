@@ -2351,6 +2351,51 @@ def test_reconcile_leaves_a_resumed_lane(env: Env) -> list[str]:
     return failures
 
 
+def test_history_facts(env: Env) -> list[str]:
+    """A lane that ends records how it ended, and when.
+
+    The record the dashboard shows is the record the tool writes: a
+    finished lane carries its pull request and the state it was in, and
+    a released one carries the fact that it was released.
+    """
+    failures = []
+    if not spawn_merged(env, 5, number=12):
+        return ["history facts: the spawn failed"]
+    finished = env.run("finish", "1")
+    if finished.returncode != 0:
+        failures.append(f"history facts: the finish failed: "
+                        f"{finished.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("outcome") != "merged":
+        failures.append(f"history facts: the finished lane does not read as "
+                        f"merged: {row}")
+    if row.get("pr") != 12:
+        failures.append(f"history facts: the finished lane records no pull "
+                        f"request: {row}")
+    if row.get("pr_state") != "MERGED":
+        failures.append(f"history facts: the finished lane records no pull "
+                        f"request state: {row}")
+    if not row.get("finished_at"):
+        failures.append(f"history facts: the finished lane records no "
+                        f"finishing time: {row}")
+
+    if env.spawn(6).returncode != 0:
+        failures.append("history facts: the second spawn failed")
+        return failures
+    released = env.run("release", "2")
+    if released.returncode != 0:
+        failures.append(f"history facts: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    row = lease_row(env, 2)
+    if row.get("outcome") != "released":
+        failures.append(f"history facts: the released lane does not read as "
+                        f"released: {row}")
+    if not row.get("finished_at"):
+        failures.append(f"history facts: the released lane records no "
+                        f"finishing time: {row}")
+    return failures
+
+
 CASES = [
     ("race", test_race),
     ("read-under-a-write-lock", test_read_under_a_write_lock),
@@ -2391,6 +2436,7 @@ CASES = [
     ("finish-prune-in-the-clone", test_finish_prune_in_the_clone),
     ("finish-merged-prunes-each-clone", test_finish_merged_prunes_each_clone),
     ("finish-merged-lanes", test_finish_merged_lanes),
+    ("history-facts", test_history_facts),
     ("list-pr", test_list_pr),
     ("pr-created-before-the-lease", test_pr_created_before_the_lease),
     ("spawn-session", test_spawn_session),

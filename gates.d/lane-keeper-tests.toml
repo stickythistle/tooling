@@ -1,0 +1,8 @@
+# The service that owns the lane record: the API, the roles and the
+# dashboard. The gate names the tool, the library it is built from, the
+# library it asks for the record's rules, and the suite that pins it.
+
+[[gates]]
+name = "lane keeper tests"
+when = '^(bin/lane-keeper|lib/lane_keeper\.py|lib/lane\.py|tests/test_lane_keeper\.py)$'
+run = "python3 tests/test_lane_keeper.py"

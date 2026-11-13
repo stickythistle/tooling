@@ -1,0 +1,60 @@
+# Copy to ~/.config/agent-tools/lane-keeper.toml and fill in. The service
+# reads it from there, or from $LANE_KEEPER_CONFIG, and refuses a key it
+# cannot act on. Every value here is a placeholder.
+
+# The pools and the profiles are the tables lanes.toml carries: a pool is
+# a cap, and a profile's cost is what it takes from that pool.
+
+database = "~/.local/state/agent-tools/lanes.db"
+
+[listen]
+host = "127.0.0.1"       # the address the service answers on
+port = 8787              # the port; 0 asks the system for one
+
+[pools]
+minimax = 4
+logan = 2
+
+[profiles.minimax]
+pool = "minimax"
+cost = 1
+model = "MiniMax"        # the model the lane runs on; it is shown, not used
+
+[profiles.flashnext512]
+pool = "logan"
+cost = 2
+model = "flash-next-512k"
+
+# A token is stored as its digest, never as itself, so a settings file
+# that leaks hands out nothing that can be used.
+#
+#   printf %s 'the token' | sha256sum
+
+# The roles:
+#   writer    everything: claim, state, release, resume, finish, undo
+#   reporter  only what a lane's pane says: POST /api/lease/<id>/state
+#   reader    only the reads: the dashboard and GET /api/...
+
+# A digest listed twice is one credential, and it takes the stronger role.
+[[tokens]]
+role = "writer"
+sha256 = "0000000000000000000000000000000000000000000000000000000000000000"
+
+[[tokens]]
+role = "reporter"
+sha256 = "1111111111111111111111111111111111111111111111111111111111111111"
+
+[[tokens]]
+role = "reader"
+sha256 = "2222222222222222222222222222222222222222222222222222222222222222"
+
+# The forge the dashboard links to: an issue and a pull request are
+# linked, and the link names the repository they are in.
+[web]
+base = "https://github.com"
+
+# TLS. Both a certificate and a key, or neither: with both the service
+# speaks HTTPS.
+# [tls]
+# cert = "/etc/lane-keeper/cert.pem"
+# key = "/etc/lane-keeper/key.pem"
