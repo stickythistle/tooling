@@ -30,6 +30,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 LANE_SETTLED = REPO_ROOT / "bin" / "lane-settled"
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
@@ -246,6 +247,10 @@ if [[ "$1" == "api" && "$2" == "user" ]]; then
     echo "test-implementer"
     exit 0
 fi
+if [[ "$1" == "repo" && "$2" == "view" ]]; then
+    echo "${STUB_REPO-example-org/tooling}"
+    exit 0
+fi
 cat <<'ISSUE'
 title: stub
 number: 0
@@ -276,7 +281,6 @@ def run_hermes_implement(worktree: Path, extra: str,
         # `gh`, `lane-settled` is not on its PATH, and the hermes
         # binary itself is named by HERMES_PYTHON.
         "PATH": f"{bin_dir}:/usr/bin:/bin",
-        "IMPLEMENTER_LOGINS": "test-implementer",
         # Override the hermes binary.
         "HERMES_PYTHON": str(bin_dir / "fake-hermes"),
         # State + evidence: the script defaults these to $HOME/.local
@@ -291,10 +295,8 @@ def run_hermes_implement(worktree: Path, extra: str,
         # a safety net.
         "HERMES_IMPLEMENT_TIMEOUT": "5",
         "HERMES_IMPLEMENT_ATTEMPTS": "3",
-        # The lane identity is configuration; the lane refuses
-        # without it.
-        "LANE_GIT_NAME": "Lane",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
+        "ROLES_CONFIG": str(roles_file(log_path.parent / "roles.toml",
+                                        logins=("test-implementer",))),
     }
     cmd = [
         str(HERMES_IMPLEMENT),

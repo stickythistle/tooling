@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import roles  # noqa: E402
 from pr_gate import (  # noqa: E402
     Malformed,
     decide,
@@ -193,12 +193,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("repo", help="owner/repo")
     parser.add_argument("pr", help="pull request number")
     parser.add_argument("--reviewer", default=None,
-                        help="the reviewer's login (default $REVIEWER_LOGIN, "
-                             "then the repository owner)")
+                        help="the reviewer's login (default: the role "
+                             "binding's owner for this repository)")
     parser.add_argument("--implementer", action="append", default=[],
                         metavar="LOGIN",
                         help="an implementer whose answer markers are "
-                             "trusted; repeatable (default $IMPLEMENTER_LOGINS)")
+                             "trusted; repeatable (default: the role "
+                             "binding's implementer logins)")
     parser.add_argument("--max-rounds", type=int, default=4,
                         help="changes-requested rounds before ESCALATE (default 4)")
     args = parser.parse_args(argv)
@@ -210,17 +211,20 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ERR pr: {args.pr} is not a number", file=sys.stderr)
         return 2
 
-    # The reviewer is the repository's owner unless told otherwise.
-    reviewer = (args.reviewer or os.environ.get("REVIEWER_LOGIN")
-                or args.repo.split("/", 1)[0])
-    # With no implementers configured, no marker is trusted: an extra
-    # review is the safe direction.
-    implementers = frozenset(args.implementer or
-                             (os.environ.get("IMPLEMENTER_LOGINS") or
-                              "").split())
-
     repo, number = args.repo, args.pr
     try:
+        # The role binding: who reviews, and the logins the implementer
+        # may act as. It is read before anything is fetched, so a
+        # binding that cannot be honored stops the run here.
+        binding = roles.load()
+        # The reviewer is the login the role binding maps the
+        # repository's owner to, unless told otherwise.
+        reviewer = args.reviewer or binding.owner_login(repo)
+        # With no implementers configured, no marker is trusted: an
+        # extra review is the safe direction.
+        implementers = frozenset(args.implementer
+                               or binding.implementer_logins(repo))
+
         pr = gh_json(f"repos/{repo}/pulls/{number}")
         reviews = fetch_reviews(repo, number)
         comments = fetch_comments(repo, number)
@@ -277,6 +281,9 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     except Malformed as exc:
         print(f"ERR {exc}", file=sys.stderr)
+        return 1
+    except roles.Refusal as exc:
+        print(f"ERR {exc.detail}", file=sys.stderr)
         return 1
 
     print(line)

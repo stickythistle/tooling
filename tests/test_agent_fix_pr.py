@@ -25,6 +25,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 BIN = REPO_ROOT / "bin" / "agent-fix-pr"
 REPO = "owner/proj"
@@ -232,12 +233,10 @@ def setup(tmp: Path, *, body="Closes #7.", lane="commit", gate_rc=0,
         FAKE_GH_DATA=str(data),
         FAKE_LANE=lane,
         FAKE_REPLIES=str(replies_src),
-        # The verifier refuses when LANE_GIT_NAME / LANE_GIT_EMAIL are
-        # unset, so the suite configures the identity the way the
-        # operator does. The worktree's own user.name/user.email are
-        # not the expected identity.
-        LANE_GIT_NAME="Lane",
-        LANE_GIT_EMAIL="lane@example.invalid")
+        # The role binding: the identity the verifier expects, not the
+        # worktree's own user.name/user.email.
+        ROLES_CONFIG=str(roles_file(tmp / "roles.toml",
+                                    owners={tmp.name: "the-owner"})))
     return wt, origin, head, env, ledger_dir
 
 
@@ -818,12 +817,12 @@ def test_author_override_is_reauthored_before_push():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         wt, origin, head, env, ld = setup(tmp, lane="commit_with_author")
-        # The expected identity comes from LANE_GIT_*; without those,
-        # the verifier falls back to the worktree's user.name=t.
-        # Set the override so the test names a specific expected
-        # identity that is neither t nor Wrong Author.
-        env["LANE_GIT_NAME"] = "Expected"
-        env["LANE_GIT_EMAIL"] = "expected@example.invalid"
+        # The expected identity comes from the role binding. Name one
+        # that is neither t nor Wrong Author.
+        env["ROLES_CONFIG"] = str(roles_file(
+            tmp / "roles.toml",
+            owners={tmp.name: "the-owner"},
+            identity=("Expected", "expected@example.invalid")))
         r = run(env, wt)
         assert r.returncode == 0, (
             f"agent-fix-pr failed: rc={r.returncode} stderr={r.stderr!r}")
@@ -850,8 +849,10 @@ def test_refuse_setting_refuses_with_commit_name_and_nothing_pushed():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         wt, origin, head, env, ld = setup(tmp, lane="commit_with_author")
-        env["LANE_GIT_NAME"] = "Expected"
-        env["LANE_GIT_EMAIL"] = "expected@example.invalid"
+        env["ROLES_CONFIG"] = str(roles_file(
+            tmp / "roles.toml",
+            owners={tmp.name: "the-owner"},
+            identity=("Expected", "expected@example.invalid")))
         env["LANE_GIT_IDENTITY"] = "refuse"
         r = run(env, wt)
         # The verifier refused; agent-fix-pr records the refusal as the verdict.

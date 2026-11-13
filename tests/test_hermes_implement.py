@@ -20,6 +20,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 BIN = REPO_ROOT / "bin" / "hermes-implement"
 LIB = REPO_ROOT / "lib" / "common.sh"
@@ -34,6 +35,10 @@ FAKE_GH = textwrap.dedent("""\
     # checks against IMPLEMENTER_LOGINS.
     if [[ "$1" == "api" && "$2" == "user" ]]; then
         echo "test-implementer"
+        exit 0
+    fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
         exit 0
     fi
     # Whatever the operator asks gh to do, return a no-op success unless
@@ -272,11 +277,16 @@ FAKE_HERMES = textwrap.dedent("""\
 """)
 
 
-def setup_env(tmp: Path, **extra) -> dict:
+def setup_env(tmp: Path, identity=("Lane", "lane@example.invalid"),
+              logins=("test-implementer",), **extra) -> dict:
     """Build the env hermes-implement will run under: a fake `gh` on
     PATH, a fake hermes at HERMES_PYTHON, a scratch state directory,
     and a GPU_GROUP_DEFAULT so the lock is configured. `**extra`
-    overrides the defaults (HERMES_IMPLEMENT_ATTEMPTS, FAKE_HERMES_PLAN)."""
+    overrides the defaults (HERMES_IMPLEMENT_ATTEMPTS, FAKE_HERMES_PLAN).
+
+    The lane's identity and the implementer's logins come from the role
+    binding, the file every tool reads; `identity` and `logins` name
+    what the binding says."""
     bin_dir = tmp / "fakebin"
     bin_dir.mkdir()
     fake_gh = bin_dir / "gh"
@@ -311,12 +321,12 @@ def setup_env(tmp: Path, **extra) -> dict:
                       or k.startswith("LANE_GIT_"))}
     base = {**parent,
             "PATH": f"{bin_dir}:/usr/bin:/bin",
-            # The lane identity is configuration, and hermes-implement
-            # refuses to start a lane without it. The default here is
-            # that configuration; a test that is about the refusal
-            # clears it.
-            "LANE_GIT_NAME": "Lane",
-            "LANE_GIT_EMAIL": "lane@example.invalid",
+            # The role binding: the lane's identity and the
+            # implementer's logins. hermes-implement refuses to start a
+            # lane without it.
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml",
+                                            identity=identity,
+                                            logins=logins)),
             # The fake HERMES_PYTHON script is its own python interpreter
             # (shebang), so the script's -m hermes_cli.main invocation is
             # answered by the fake rather than the real hermes package.
@@ -338,13 +348,9 @@ def setup_env(tmp: Path, **extra) -> dict:
             # stand in for the operator's so HOST_BUILDER etc. do not
             # leak into the test.
             "TOOLS_ENV": str(tmp / "fake.env"),
-            # The login the implementer role may act as. `gh_as` resolves
-            # the login the call would act as and refuses unless it is
-            # one of these.
-            "IMPLEMENTER_LOGINS": "test-implementer",
             # hermes-implement reads the verification evidence DB if it
             # exists at $HERMES_HOME/verification_evidence.db. Point it
-            # at a path that does not have one.
+            # at a path without one.
             "HERMES_HOME": str(tmp / "hermes_home")}
     base.update(extra)
     # The lane refuses to start when a dispatched skill differs from the
@@ -682,8 +688,7 @@ def test_lane_identity_env_vars_win_over_c_flag_override():
                         # Force the expected identity to a name the host
                         # config does not use, so the verifier has a
                         # specific value to compare against.
-                        LANE_GIT_NAME="Expected",
-                        LANE_GIT_EMAIL="expected@example.invalid",
+                        identity=("Expected", "expected@example.invalid"),
                         FAKE_HERMES_PLAN="commit_with_c_flag")
         repo = make_repo(tmp)
         # make_repo sets user.email/name in the worktree's local config.
@@ -725,8 +730,7 @@ def test_lane_identity_verifier_rewrites_author_flag_commit():
         tmp = Path(t)
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
-                        LANE_GIT_NAME="Expected",
-                        LANE_GIT_EMAIL="expected@example.invalid",
+                        identity=("Expected", "expected@example.invalid"),
                         FAKE_HERMES_PLAN="commit_with_author")
         repo = make_repo(tmp)
         subprocess.run(["git", "-C", str(repo), "config",
@@ -781,8 +785,7 @@ def test_lane_identity_verifier_rewrites_env_override_commit():
         tmp = Path(t)
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
-                        LANE_GIT_NAME="Expected",
-                        LANE_GIT_EMAIL="expected@example.invalid",
+                        identity=("Expected", "expected@example.invalid"),
                         FAKE_HERMES_PLAN="commit_with_env_override")
         repo = make_repo(tmp)
         subprocess.run(["git", "-C", str(repo), "config",
@@ -815,8 +818,7 @@ def test_lane_identity_env_vars_win_over_config_override():
         tmp = Path(t)
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
-                        LANE_GIT_NAME="Expected",
-                        LANE_GIT_EMAIL="expected@example.invalid",
+                        identity=("Expected", "expected@example.invalid"),
                         FAKE_HERMES_PLAN="commit_with_config_override")
         repo = make_repo(tmp)
         subprocess.run(["git", "-C", str(repo), "config",
@@ -850,8 +852,7 @@ def test_lane_identity_refuses_with_author_override_when_setting_says_so():
         tmp = Path(t)
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
-                        LANE_GIT_NAME="Expected",
-                        LANE_GIT_EMAIL="expected@example.invalid",
+                        identity=("Expected", "expected@example.invalid"),
                         LANE_GIT_IDENTITY="refuse",
                         FAKE_HERMES_PLAN="commit_with_author")
         repo = make_repo(tmp)
@@ -875,17 +876,16 @@ def test_lane_identity_refuses_with_author_override_when_setting_says_so():
 
 
 def test_lane_identity_refuses_before_agent_when_unresolvable():
-    """With LANE_GIT_NAME/LANE_GIT_EMAIL unset, hermes-implement must
-    refuse with a named error before the agent starts, even when the
-    worktree's user.name/user.email would resolve. A wrong host config
-    cannot pin the lane. The agent is never spawned."""
+    """With no role binding, hermes-implement must refuse with a named
+    error before the agent starts, even when the worktree's own
+    user.name/user.email would resolve. A wrong host config cannot pin
+    the lane. The agent is never spawned."""
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         env = setup_env(tmp,
                         HERMES_IMPLEMENT_ATTEMPTS="1",
                         FAKE_HERMES_PLAN="commit_with_author")
-        env.pop("LANE_GIT_NAME", None)
-        env.pop("LANE_GIT_EMAIL", None)
+        env["ROLES_CONFIG"] = str(tmp / "absent.toml")
         repo = make_repo(tmp)
         # The worktree's own config does resolve -- make_repo sets both
         # -- and it must not be used as the expected identity.
@@ -903,12 +903,9 @@ def test_lane_identity_refuses_before_agent_when_unresolvable():
         assert proc.returncode == 3, (
             f"expected exit 3 (lane refused), got {proc.returncode}: "
             f"stderr={proc.stderr!r}")
-        assert "cannot pin lane identity" in proc.stderr, (
+        # The refusal names the file the operator has to write.
+        assert str(tmp / "absent.toml") in proc.stderr, (
             f"refusal message missing: stderr={proc.stderr!r}")
-        # The refusal names both variables the operator has to set.
-        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-            assert var in proc.stderr, (
-                f"the refusal does not name {var}: stderr={proc.stderr!r}")
         # No commit was made.
         log = subprocess.run(
             ["git", "-C", str(repo), "log", "--format=%H %s"],
@@ -955,6 +952,8 @@ def test_lane_identity_verifier_does_not_leak_pinned_env_to_caller():
         fake_env.write_text("")
         env = {**os.environ,
                "TOOLS_ENV": str(fake_env),
+               "ROLES_CONFIG": str(roles_file(tmp / "roles.toml",
+                                               identity=("Caller", "caller@x"))),
                "LANE_GIT_NAME": "Caller",
                "LANE_GIT_EMAIL": "caller@x",
                "GIT_AUTHOR_NAME": "Caller",
@@ -1172,8 +1171,7 @@ def test_refusal_cap_still_runs_the_identity_check():
         env = _fast_clocks(setup_env(
             tmp,
             HERMES_IMPLEMENT_ATTEMPTS="2",
-            LANE_GIT_NAME="Expected",
-            LANE_GIT_EMAIL="expected@example.invalid",
+            identity=("Expected", "expected@example.invalid"),
             FAKE_HERMES_PLAN="commit_with_author:refuse:refuse:refuse:refuse"))
         repo = make_repo(tmp)
         subprocess.run(["git", "-C", str(repo), "config",

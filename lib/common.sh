@@ -303,26 +303,61 @@ tree_name() { basename "$1" | tr -c 'A-Za-z0-9_' '_' | tr -s '_' | sed 's/_$//';
 
 repo_root() { (cd "${1:-$PWD}" && git rev-parse --show-toplevel); }
 
-# The identity a lane's commits must carry. It is configuration and
-# nothing else: LANE_GIT_NAME and LANE_GIT_EMAIL, both set and both
-# non-empty.
-#
-# It is never inferred from the worktree's `git config user.name` /
-# user.email. A host whose git config is wrong -- a scratch identity
-# left behind by a CI workflow, say -- would then pin every lane to
-# that identity and pass its own check.
-#
-# Either variable unset or empty refuses: one line naming both, on
-# stderr, and a non-zero return so the caller stops before the agent
-# starts. No host, account or project name is interpolated -- the
-# identity is the operator's, not ours.
-lane_expected_identity() { # -> stdout: "<name>|<email>"
-	local name="${LANE_GIT_NAME:-}" email="${LANE_GIT_EMAIL:-}"
+# The identity a lane's commits must carry: the operator's role binding,
+# read through lib/roles.py. The binding names it per repository, and a
+# repository whose commits carry a sign-off names the signer.
+
+# The worktree's user.name and user.email are never consulted: a host
+# whose identity is wrong would pin every lane to it and pass its own
+# check.
+lane_expected_identity() { # [repo] -> stdout: "<name>|<email>"
+	# The three assignments are declared local: the eval must not leave a
+	# role behind in the caller's scope.
+	local IMPLEMENTER_LOGINS LANE_GIT_NAME LANE_GIT_EMAIL
+	local bindings name email
+	if ! bindings=$(roles_bindings "$@"); then
+		return 1
+	fi
+	eval "$bindings"
+	name="${LANE_GIT_NAME:-}" email="${LANE_GIT_EMAIL:-}"
 	if [ -z "$name" ] || [ -z "$email" ]; then
-		echo "cannot pin lane identity: set LANE_GIT_NAME and LANE_GIT_EMAIL" >&2
+		echo "cannot pin lane identity: the role binding names no name and email" >&2
 		return 1
 	fi
 	printf '%s|%s\n' "$name" "$email"
+}
+
+# The operator's role bindings, as shell assignments.
+#
+# lib/roles.py prints them the way lib/manifest.py prints a gate's:
+# quoted for `eval`. A binding that cannot be read exits non-zero with
+# its message on stderr, and the caller stops on it.
+roles_bindings() { # [repo]
+	python3 "$TOOLS_LIB/roles.py" shell "$@"
+}
+
+# The repository a checkout belongs to: owner/name, from its origin
+# remote. Without that remote the binding answers with the default
+# identity.
+lane_repo_slug() { # <worktree>
+	local wt="$1" url rest owner name
+	[ -n "$wt" ] || return 0
+	url=$(git -C "$wt" remote get-url origin 2>/dev/null) || return 0
+	url=${url%.git}
+	case "$url" in
+	*://*) url=${url#*://}; url=${url#*/} ;;
+	esac
+	url=${url##*:}
+	url=${url#/}
+	case "$url" in
+	*/*) ;;
+	*) return 0 ;;
+	esac
+	rest=${url%/*}
+	name=${url##*/}
+	owner=${rest##*/}
+	[ -n "$owner" ] || return 0
+	printf '%s/%s' "$owner" "$name"
 }
 
 # Resolve the lane identity and export it as the env vars git reads
@@ -330,9 +365,9 @@ lane_expected_identity() { # -> stdout: "<name>|<email>"
 # and the worktree config, so the common case lands authored by the
 # expected identity. `--author` and `GIT_AUTHOR_NAME=...` on the
 # agent's command line bypass this; the verifier is the backstop.
-export_lane_identity_env() {
+export_lane_identity_env() { # [repo]
 	local identity name email
-	identity=$(lane_expected_identity) || return $?
+	identity=$(lane_expected_identity "$@") || return $?
 	name=${identity%%|*}
 	email=${identity##*|}
 	export GIT_AUTHOR_NAME="$name"
@@ -436,7 +471,7 @@ verify_lane_identity() { # <worktree> <base> [handover_path] [default_branch]
 		echo "refusing: base $base_sha is not an ancestor of $head_sha in $wt (history rewritten)" >&2
 		return 2
 	fi
-	identity=$(lane_expected_identity) || return 1
+	identity=$(lane_expected_identity "$(lane_repo_slug "$wt")") || return 1
 	name=${identity%%|*}
 	email=${identity##*|}
 	# The lane's own commits, computed once and used for both the check
@@ -769,10 +804,9 @@ hermes_query() {
 
 # `gh_as <role> <gh args...>` -- run gh as one of the loop's roles, for one call.
 #
-# The loop has two GitHub identities, and they are not the same person: the
+# The loop has two GitHub identities, and the two are different people: the
 # implementer authors the pull request, and the reviewer is the repository's
-# owner. A verdict can only exist as a real review state when the reviewer is
-# not the author. Credentials per role are what make both possible.
+# owner. Credentials per role are what make both possible.
 #
 # A role's credentials come from the host the role runs on, never from a
 # token carried to another host:
@@ -785,13 +819,8 @@ hermes_query() {
 # the process table to every other process on the host.
 #
 # The login the call would act as is resolved and checked against the role.
-# Checking that the variable is set, or that `gh auth status` passes, is not
-# enough: on the coordinator host the ambient login is the reviewer, so an
-# implementer call there would act as the reviewer with no error at all.
 #
-#   IMPLEMENTER_LOGINS   the logins the implementer role may act as, space
-#                         separated. A call whose login is not among them is
-#                         refused, naming both.
+#   The logins the implementer may act as are in the operator's role binding.
 gh_as() {
 	local role="${1:-}" token_var config_var token config_dir
 	shift || true
@@ -832,12 +861,49 @@ gh_as() {
 		login=$(GH_TOKEN="$token" GH_CONFIG_DIR="$config_dir" \
 			GH_AS_CACHE_DIR="$cache_dir" gh_as_login "token")
 	fi
-	# The login the call acts as must be one the role may act as.
-	local allowed=" ${IMPLEMENTER_LOGINS:-} "
+	# The repository the call is for: the one its arguments name, else
+	# the one of the working directory. The implementer's logins are per
+	# repository, so a call that resolves no repository is refused; the
+	# unscoped list never answers it.
+	local repo="" arg
+	local -a gh_args=("$@")
+	local i
+	for ((i = 0; i < ${#gh_args[@]}; i++)); do
+		arg="${gh_args[$i]}"
+		case "$arg" in
+		-R | --repo)
+			i=$((i + 1))
+			repo="${gh_args[$i]:-}"
+			;;
+		--repo=*)
+			repo="${arg#--repo=}"
+			;;
+		esac
+	done
+	[ -n "$repo" ] || repo=$(gh_as_repo_view "$token" "$config_dir")
+	if [ -z "$repo" ]; then
+		echo "gh_as: cannot tell which repository this call is for; name it with -R or --repo, or run it in a checkout" >&2
+		return 1
+	fi
+
+	# The logins the role may act as, for that repository.
+	local IMPLEMENTER_LOGINS LANE_GIT_NAME LANE_GIT_EMAIL bindings
+	if ! bindings=$(roles_bindings "$repo"); then
+		return 1
+	fi
+	eval "$bindings"
+
+	# Checking that the credentials are there, or that `gh auth status`
+	# passes, proves too little: on the coordinator host the ambient
+	# login is the reviewer, so an implementer call there would act as
+	# the reviewer with no error at all.
+	local allowed=" ${IMPLEMENTER_LOGINS} "
 	case "$allowed" in
 	*" $login "*) ;;
 	*)
-		echo "gh_as: this call would act as '${login}', which is not an implementer login (IMPLEMENTER_LOGINS='${IMPLEMENTER_LOGINS:-}')" >&2
+		local owner
+		owner=$(python3 "$TOOLS_LIB/roles.py" owner "$repo" 2>/dev/null)
+		echo "gh_as: this call would act as '${login}', which is not an implementer for ${repo}: the role binding names '${IMPLEMENTER_LOGINS}' as implementers there, and the owner '${owner}' reviews it." >&2
 		return 1
 		;;
 	esac
@@ -847,6 +913,18 @@ gh_as() {
 		GH_TOKEN="$token" gh "$@"
 	else
 		GH_CONFIG_DIR="$config_dir" gh "$@"
+	fi
+}
+
+# The repository of the working directory, under the role's credentials.
+gh_as_repo_view() { # <token> <config_dir>
+	local token="$1" config_dir="$2"
+	if [ -n "$token" ]; then
+		GH_TOKEN="$token" gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null
+	elif [ -n "$config_dir" ]; then
+		GH_CONFIG_DIR="$config_dir" gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null
+	else
+		gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null
 	fi
 }
 

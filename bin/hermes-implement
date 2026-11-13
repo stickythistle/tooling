@@ -150,6 +150,13 @@ export TMPDIR="$WORK" TMP="$WORK" TEMP="$WORK"
 export_lane_build_env "$WORKTREE"
 
 
+# The role binding: the implementer's logins and the lane's identity.
+# Read before anything else, so a binding that cannot be read stops the
+# run here, with the lane's own refusal.
+if ! lane_expected_identity >/dev/null; then
+	exit 3
+fi
+
 # The issue is read with the implementer's credentials: the one that reads
 # the work item must be the one that will answer for it. `gh_as` refuses
 # when no implementer credentials are available.
@@ -301,8 +308,11 @@ EOF
 # inherits the env vars and commits as the expected one; the verifier
 # below is the backstop for one that overrides them.
 #
+# The repository is named, because the binding may give it an identity
+# of its own -- a DCO sign-off has to match the author.
+#
 # Refusing up front names a missing setting.
-if ! export_lane_identity_env; then
+if ! export_lane_identity_env "$(lane_repo_slug "$WORKTREE")"; then
 	exit 3
 fi
 # UTC, matching how hermes stamps last_edit_at, so the stray-write check below

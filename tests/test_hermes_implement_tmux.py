@@ -28,6 +28,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 LANE_WATCH = REPO_ROOT / "bin" / "lane-watch"
@@ -121,6 +122,10 @@ def make_fake_tmux(stem: Path) -> Path:
             echo "test-implementer"
             exit 0
         fi
+        if [[ "$1" == "repo" && "$2" == "view" ]]; then
+            echo "${STUB_REPO-example-org/tooling}"
+            exit 0
+        fi
         exit 0
         """))
     gh.chmod(0o755)
@@ -195,16 +200,13 @@ def make_env(stem: Path, wt: Path, **extra) -> dict:
     return {
         **os.environ,
         "PATH": f"{bin_dir}:/usr/bin:/bin",
-        "IMPLEMENTER_LOGINS": "test-implementer",
         "HOME": str(env_dir),
         "HERMES_PYTHON": str(stem / "bin" / "hermes"),
         "TMPDIR": str(stem),
         "AGENT_STATE_DIR": str(stem / "state"),
         "HERMES_HOME": str(env_dir),
-        # The lane identity is configuration; the lane refuses
-        # without it.
-        "LANE_GIT_NAME": "Lane",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
+        "ROLES_CONFIG": str(roles_file(stem / "roles.toml",
+                                            logins=("test-implementer",))),
         **extra,
     }
 
@@ -352,6 +354,10 @@ def main() -> int:
         #!/usr/bin/env bash
         if [[ "$1" == "api" && "$2" == "user" ]]; then
             echo "test-implementer"
+            exit 0
+        fi
+        if [[ "$1" == "repo" && "$2" == "view" ]]; then
+            echo "${STUB_REPO-example-org/tooling}"
             exit 0
         fi
         exit 0
