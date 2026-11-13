@@ -880,6 +880,16 @@ gh_as() {
 			;;
 		esac
 	done
+	# `gh api` takes no -R: the repository it acts on is in its endpoint,
+	# and the endpoint is the call. A call in a checkout of another
+	# repository would be checked against the wrong one.
+	if [[ "${gh_args[0]:-}" == "api" ]]; then
+		local api_repo
+		api_repo=$(gh_as_api_repo "${gh_args[@]:1}")
+		if [ -n "$api_repo" ]; then
+			repo="$api_repo"
+		fi
+	fi
 	[ -n "$repo" ] || repo=$(gh_as_repo_view "$token" "$config_dir")
 	if [ -z "$repo" ]; then
 		echo "gh_as: cannot tell which repository this call is for; name it with -R or --repo, or run it in a checkout" >&2
@@ -914,6 +924,97 @@ gh_as() {
 	else
 		GH_CONFIG_DIR="$config_dir" gh "$@"
 	fi
+}
+
+# The repository an `api` call is for, from its endpoint.
+#
+# `gh api` takes no -R: the repository is in the path. The endpoint is the
+# first argument that is neither a flag nor a flag's value. Prints
+# owner/name, or nothing.
+gh_as_api_repo() { # <args after "api">
+	local -a args=("$@")
+	local -a fields=()
+	local i arg endpoint="" field value
+	local path_re='^/?repos/([^/]+)/([^/]+)(/|$)'
+	for ((i = 0; i < ${#args[@]}; i++)); do
+		arg="${args[$i]}"
+		case "$arg" in
+		--)
+			if [ -z "$endpoint" ]; then
+				endpoint="${args[$((i + 1))]:-}"
+			fi
+			break
+			;;
+		--*=*)
+			# A long flag with its value attached.
+			case "${arg%%=*}" in
+			--raw-field | --field) fields+=("${arg#*=}") ;;
+			esac
+			continue
+			;;
+		--*)
+			# A long flag: the value, when it takes one, is the
+			# next argument.
+			case "$arg" in
+			--raw-field | --field)
+				fields+=("${args[$((i + 1))]:-}")
+				i=$((i + 1))
+				;;
+			--method | --header | --hostname | --input | --jq | --template | --cache | --media-type)
+				i=$((i + 1))
+				;;
+			esac
+			continue
+			;;
+		-?*)
+			# A short flag: its value is attached to it, or it is
+			# the next argument.
+			if [[ ${#arg} -gt 2 ]]; then
+				case "${arg:1:1}" in
+				f | F) fields+=("${arg:2}") ;;
+				esac
+				continue
+			fi
+			case "${arg:1:1}" in
+			f | F)
+				fields+=("${args[$((i + 1))]:-}")
+				i=$((i + 1))
+				;;
+			X | H | q | t) i=$((i + 1)) ;;
+			esac
+			continue
+			;;
+		*)
+			# The fields come after the endpoint, so the scan goes on.
+			if [ -z "$endpoint" ]; then
+				endpoint="$arg"
+			fi
+			continue
+			;;
+		esac
+	done
+	# A path names the repository: repos/OWNER/NAME, with or without a
+	# leading slash.
+	if [[ "$endpoint" =~ $path_re ]]; then
+		printf '%s/%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"
+		return 0
+	fi
+	# A graphql call names its repository in the fields it sends: the
+	# owner and the name.
+	if [[ "$endpoint" == "graphql" ]]; then
+		local owner="" name=""
+		for field in "${fields[@]}"; do
+			value="${field#*=}"
+			case "${field%%=*}" in
+			owner) owner="$value" ;;
+			name) name="$value" ;;
+			esac
+		done
+		if [ -n "$owner" ] && [ -n "$name" ]; then
+			printf '%s/%s\n' "$owner" "$name"
+		fi
+	fi
+	return 0
 }
 
 # The repository of the working directory, under the role's credentials.
