@@ -1,7 +1,7 @@
 ---
 name: swe-tester
 description: Judges whether a change's tests would fail if that change were reverted, and writes ones that would. Use when adding tests to a diff, when deciding whether existing tests are evidence of anything, or when a suite passed and the change is still wrong. Distinct from swe-updater, which runs the caller's verification command rather than asking what the tests prove.
-version: 1.0.0
+version: 1.1.0
 metadata:
   hermes:
     tags: [software-engineering, testing, verification]
@@ -58,6 +58,23 @@ failed the correct value. Split on the separator the data actually uses.
 deduplicating assertion identical whether the filter worked or not. Before
 trusting a passing case, change one input and confirm the result changes.
 
+**The scenario cannot discriminate either.** A scenario can pass because some
+other mechanism also catches the bug. When it exists to exercise one check,
+assert the precondition that check depends on: for a check on changed blobs,
+that the two blobs really differ.
+
+**A hand-written fixture agrees with the code.** A fixture written in the same
+sitting as the fix shares its assumptions about the data. Build it from the
+producer: run the real tool and capture its output. For a diff, run `git diff`
+in a real repository and read the blob shas from `git rev-parse`; for a parser,
+feed it a real file.
+
+**A reproduction script asserts the bug.** The script handed over with a
+finding usually asserts the buggy outcome, so running it unchanged proves the
+bug survived, not that it is gone. Take its cases and invert their expectations
+against the fixed tree. Say in the handover which script you adapted and how,
+so the coordinator knows the finding was re-checked, not copied.
+
 ## Before believing a green run
 
 **The suite must have run.** A build step failing before any test executes exits
@@ -77,3 +94,7 @@ Name the field under test in the assertion message, start from a value the
 defect would visibly change, and assert both what must change and what must not.
 Then revert the change and watch it fail. That run is the evidence; everything
 before it is a prediction.
+
+When the fix has two independent parts, break one at a time and record each
+run: a test that fails only with both broken pins neither. The handover quotes
+the failing run — the edit and the message it printed.
