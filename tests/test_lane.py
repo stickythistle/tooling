@@ -25,7 +25,6 @@ import time
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LANE = REPO_ROOT / "bin" / "lane"
 
 # The repository every case spawns against.
 REPO = "stickythistle/tooling"
@@ -161,10 +160,28 @@ def write_stub_gh(bin_dir: Path) -> None:
     """A gh that answers the label calls and logs them.
 
     A test asks `issue edit` to fail by creating `$STUB_DATA/fail_issue_edit`.
+    `pr list` answers with the pull request the case wrote to
+    `$STUB_DATA/pr_<branch>.json`, or with an empty list when it wrote
+    none.
     """
     body = r'''#!/usr/bin/env bash
 printf 'gh %s\n' "$*" >> "$STUB_DATA/gh.log"
 printf 'gh %s\n' "$*" >> "$STUB_DATA/calls.log"
+if [ "$1 $2" = "pr list" ]; then
+    branch=""
+    prev=""
+    for arg in "$@"; do
+        if [ "$prev" = "--head" ]; then branch="$arg"; fi
+        prev="$arg"
+    done
+    name=$(printf '%s' "$branch" | tr '/' '_')
+    if [ -f "$STUB_DATA/pr_$name.json" ]; then
+        cat "$STUB_DATA/pr_$name.json"
+    else
+        printf '[]\n'
+    fi
+    exit 0
+fi
 if [ "$1 $2" = "label create" ]; then
     printf 'label-create %s\n' "$*" >> "$STUB_DATA/steps.log"
     exit 0
@@ -243,6 +260,41 @@ exec "''' + real + r'''" "$@"
     path.chmod(0o755)
 
 
+def write_stub_remote_prune(path: Path) -> None:
+    """A remote-prune that logs the tree it was asked to prune.
+
+    A test asks it to fail by creating `$STUB_DATA/fail_remote_prune`.
+    """
+    body = r'''#!/usr/bin/env bash
+printf 'remote-prune %s\n' "$*" >> "$STUB_DATA/remote-prune.log"
+printf 'remote-prune %s\n' "$*" >> "$STUB_DATA/calls.log"
+if [ -f "$STUB_DATA/fail_remote_prune" ]; then
+    echo "remote-prune: simulated failure" >&2
+    exit 1
+fi
+exit 0
+'''
+    path.write_text(body)
+    path.chmod(0o755)
+
+
+def mirror_tool(root: Path) -> Path:
+    """A copy of the tool, with a stub `remote-prune` beside it.
+
+    `lane finish` prunes the builder's caches by calling the
+    `remote-prune` that sits beside it, so the tool is copied into the
+    case's own directory: the stub beside that copy is the one the tool
+    calls, and the real one never runs.
+    """
+    tool = root / "tool"
+    (tool / "bin").mkdir(parents=True)
+    (tool / "lib").mkdir()
+    shutil.copy(REPO_ROOT / "bin" / "lane", tool / "bin" / "lane")
+    shutil.copy(REPO_ROOT / "lib" / "lane.py", tool / "lib" / "lane.py")
+    write_stub_remote_prune(tool / "bin" / "remote-prune")
+    return tool / "bin" / "lane"
+
+
 def write_stub_harness(bin_dir: Path, name: str) -> None:
     """A harness that logs the arguments it was started with."""
     body = (
@@ -301,6 +353,8 @@ class Env:
         self.worktree_root = tmp / "wt"
         self.worktree_root.mkdir(parents=True)
         self.clone = make_origin(tmp)
+        self.origin = tmp / "origin.git"
+        self.lane = mirror_tool(tmp)
         write_stub_tmux(self.bin)
         write_stub_gh(self.bin)
         write_stub_harness(self.bin, "hermes-stub")
@@ -353,7 +407,7 @@ class Env:
 
     def run(self, *args: str, extra: dict | None = None) -> subprocess.CompletedProcess:
         """Run the tool."""
-        return subprocess.run([str(LANE), *args], capture_output=True,
+        return subprocess.run([str(self.lane), *args], capture_output=True,
                               text=True, env=self.env(extra))
 
     def spawn(self, issue: int, harness: str = "hermes",
@@ -394,6 +448,43 @@ class Env:
         path.write_text("".join(f"{line}\n" for line in kept))
 
 
+# ----- the helpers ----------------------------------------------------------
+
+def git_out(directory: Path, *args: str) -> str:
+    """What git says about a directory."""
+    proc = subprocess.run(["git", "-C", str(directory), *args],
+                          capture_output=True, text=True)
+    return proc.stdout.strip()
+
+
+def set_pr(env: Env, branch: str, number: int, state: str, head: str) -> None:
+    """The pull request the stubbed gh answers with."""
+    name = branch.replace("/", "_")
+    (env.data / f"pr_{name}.json").write_text(json.dumps([
+        {"number": number, "state": state, "headRefOid": head,
+         "mergedAt": None}]))
+
+
+def lane_worktree(env: Env, issue: int) -> Path:
+    """The worktree a lane for the issue works in."""
+    return env.worktree_root / f"tooling-{issue}"
+
+
+def spawn_merged(env: Env, issue: int, number: int = 12) -> str:
+    """A lane whose pull request merged, and the head it merged at.
+
+    An empty string says the lane could not be set up.
+    """
+    spawn = env.spawn(issue)
+    if spawn.returncode != 0:
+        return ""
+    worktree = lane_worktree(env, issue)
+    head = git_out(worktree, "rev-parse", "HEAD")
+    set_pr(env, f"lane/{issue}", number, "MERGED", head)
+    env.set_pane(f"tooling-{issue}", HERMES_IDLE)
+    return head
+
+
 # ----- the cases ------------------------------------------------------------
 
 def test_race(env: Env) -> list[str]:
@@ -409,7 +500,7 @@ def test_race(env: Env) -> list[str]:
         args = ["spawn", "--repo", REPO, "--issue", str(201 + number),
                 "--harness", "hermes", "--profile", "minimax",
                 "--session", "coord-a"]
-        procs.append(subprocess.Popen([str(LANE), *args],
+        procs.append(subprocess.Popen([str(env.lane), *args],
                                       stdout=subprocess.PIPE,
                                       stderr=subprocess.PIPE, text=True,
                                       env=env.env()))
@@ -852,7 +943,7 @@ def test_read_under_a_write_lock(env: Env) -> list[str]:
     holder.execute("BEGIN IMMEDIATE")
     holder.execute("INSERT INTO placeholder VALUES (1)")
     spawner = subprocess.Popen(
-        [str(LANE), "spawn", "--repo", REPO, "--issue", "5", "--harness",
+        [str(env.lane), "spawn", "--repo", REPO, "--issue", "5", "--harness",
          "hermes", "--profile", "minimax", "--session", "coord-a"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env=env.env())
@@ -1022,7 +1113,7 @@ def test_claim_in_flight(env: Env) -> list[str]:
     failures = []
     (env.data / "hold_new_window").write_text("")
     first = subprocess.Popen(
-        [str(LANE), "spawn", "--repo", REPO, "--issue", "1", "--harness",
+        [str(env.lane), "spawn", "--repo", REPO, "--issue", "1", "--harness",
          "hermes", "--profile", "minimax", "--session", "coord-a"],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         env=env.env())
@@ -1063,7 +1154,7 @@ def test_interrupted(env: Env) -> list[str]:
 
     def spawn(world: Env, issue: int) -> subprocess.CompletedProcess:
         proc = subprocess.Popen(
-            [str(LANE), "spawn", "--repo", REPO, "--issue", str(issue),
+            [str(world.lane), "spawn", "--repo", REPO, "--issue", str(issue),
              "--harness", "hermes", "--profile", "minimax", "--session",
              "coord-a"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1257,6 +1348,366 @@ def test_undo_leaves_a_leased_branch(env: Env) -> list[str]:
     return failures
 
 
+def test_finish_merged(env: Env) -> list[str]:
+    """A merged lane comes down: window, worktree, branch, caches, lease."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish merged: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    result = env.run("finish", "1")
+    if result.returncode != 0:
+        return [f"finish merged: the finish failed: {result.stderr.strip()!r}"]
+    if "tooling-5" in (env.data / "windows").read_text():
+        failures.append("finish merged: the window is still open")
+    if worktree.exists():
+        failures.append("finish merged: the worktree is still there")
+    if branch_exists(env, "lane/5"):
+        failures.append("finish merged: the branch is still there")
+    if "remote-prune --prune --tree tooling_5" not in env.log("calls.log"):
+        failures.append(f"finish merged: the builder caches were not pruned "
+                        f"under the tree's name: {env.log('calls.log')!r}")
+    leases = env.leases()
+    if not leases or leases[0]["state"] != "released":
+        failures.append(f"finish merged: the lease was not released: {leases}")
+    if "--remove-label" not in env.log("gh.log"):
+        failures.append("finish merged: the label was not taken off")
+    return failures
+
+
+def test_finish_tracking_ref(env: Env) -> list[str]:
+    """A merged lane whose remote branch is gone takes its tracking ref too.
+
+    Another lane's tracking ref stays: a prune that dropped every stale
+    ref in the clone would take other lanes' work with it.
+    """
+    failures = []
+    head = spawn_merged(env, 5)
+    if not head:
+        return ["finish tracking ref: the spawn failed"]
+    subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
+                    "lane/5"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(env.origin), "update-ref", "-d",
+                    "refs/heads/lane/5"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(env.clone), "update-ref",
+                    "refs/remotes/origin/other", head], check=True,
+                   capture_output=True)
+    refs = git_out(env.clone, "for-each-ref", "--format=%(refname)",
+                   "refs/remotes/origin")
+    if "refs/remotes/origin/lane/5" not in refs:
+        return [f"finish tracking ref: the clone carries no tracking ref: "
+                f"{refs}"]
+    result = env.run("finish", "1")
+    if result.returncode != 0:
+        return [f"finish tracking ref: the finish failed: "
+                f"{result.stderr.strip()!r}"]
+    refs = git_out(env.clone, "for-each-ref", "--format=%(refname)",
+                   "refs/remotes/origin")
+    if "refs/remotes/origin/lane/5" in refs:
+        failures.append("finish tracking ref: the tracking ref of the "
+                        "finished branch is still there")
+    if "refs/remotes/origin/other" not in refs:
+        failures.append(f"finish tracking ref: another lane's tracking ref "
+                        f"was dropped: {refs}")
+    return failures
+
+
+def test_finish_processes(env: Env) -> list[str]:
+    """A process still working in the lane's worktree goes with the lane."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish processes: the spawn failed"]
+    inside = subprocess.Popen(["sleep", "600"], cwd=str(lane_worktree(env, 5)),
+                              start_new_session=True)
+    elsewhere = subprocess.Popen(["sleep", "600"], cwd=str(env.tmp),
+                                 start_new_session=True)
+    try:
+        result = env.run("finish", "1")
+        if result.returncode != 0:
+            return [f"finish processes: the finish failed: "
+                    f"{result.stderr.strip()!r}"]
+        if inside.poll() is None:
+            failures.append("finish processes: the process working in the "
+                            "worktree is still running")
+        if str(inside.pid) not in result.stdout:
+            failures.append(f"finish processes: the process was not reported: "
+                            f"{result.stdout!r}")
+        if elsewhere.poll() is not None:
+            failures.append("finish processes: a process outside the worktree "
+                            "was stopped")
+    finally:
+        for process in (inside, elsewhere):
+            if process.poll() is None:
+                process.kill()
+    return failures
+
+
+def untouched(env: Env, issue: int, failures: list[str], why: str) -> None:
+    """Nothing about the lane was touched."""
+    if not lane_worktree(env, issue).exists():
+        failures.append(f"{why}: the worktree is gone")
+    if not branch_exists(env, f"lane/{issue}"):
+        failures.append(f"{why}: the branch is gone")
+    if f"tooling-{issue}" not in (env.data / "windows").read_text():
+        failures.append(f"{why}: the window was closed")
+    leases = env.leases()
+    if not leases or leases[0]["state"] == "released":
+        failures.append(f"{why}: the lease was released")
+    if "--remove-label" in env.log("gh.log"):
+        failures.append(f"{why}: the label was taken off")
+    if "remote-prune" in env.log("calls.log"):
+        failures.append(f"{why}: the builder caches were pruned")
+
+
+def test_finish_open_pr(env: Env) -> list[str]:
+    """An open pull request leaves the lane alone."""
+    failures = []
+    spawn = env.spawn(5)
+    if spawn.returncode != 0:
+        return ["finish open pr: the spawn failed"]
+    head = git_out(lane_worktree(env, 5), "rev-parse", "HEAD")
+    set_pr(env, "lane/5", 12, "OPEN", head)
+    env.set_pane("tooling-5", HERMES_IDLE)
+    result = env.run("finish", "1")
+    if result.returncode == 0:
+        failures.append("finish open pr: the lane was taken down with an "
+                        "open pull request")
+    elif "OPEN" not in result.stderr:
+        failures.append(f"finish open pr: the refusal did not name the pull "
+                        f"request's state: {result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish open pr")
+    return failures
+
+
+def test_finish_busy(env: Env) -> list[str]:
+    """A lane that is still working is left alone."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish busy: the spawn failed"]
+    env.set_pane("tooling-5", HERMES_BUSY)
+    result = env.run("finish", "1")
+    if result.returncode == 0:
+        failures.append("finish busy: the lane was taken down while it was "
+                        "still working")
+    elif "busy" not in result.stderr:
+        failures.append(f"finish busy: the refusal did not name the state: "
+                        f"{result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish busy")
+    return failures
+
+
+def test_finish_dirty(env: Env) -> list[str]:
+    """A worktree with changes in it is left alone."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish dirty: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    (worktree / "notes").write_text("work in progress\n")
+    result = env.run("finish", "1")
+    if result.returncode == 0:
+        failures.append("finish dirty: the lane was taken down with changes "
+                        "in the worktree")
+    elif str(worktree) not in result.stderr:
+        failures.append(f"finish dirty: the refusal did not name the dirty "
+                        f"worktree: {result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish dirty")
+    return failures
+
+
+def test_finish_head_mismatch(env: Env) -> list[str]:
+    """A worktree that is ahead of the pull request's head is refused."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish head mismatch: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@example.com",
+                    "-c", "user.name=T", "commit", "--allow-empty", "-q",
+                    "-m", "wip"], check=True, capture_output=True)
+    ahead = git_out(worktree, "rev-parse", "HEAD")
+    result = env.run("finish", "1")
+    if result.returncode == 0:
+        failures.append("finish head mismatch: the lane was taken down with "
+                        "commits the pull request does not carry")
+    elif ahead not in result.stderr:
+        failures.append(f"finish head mismatch: the refusal did not name the "
+                        f"head it found: {result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish head mismatch")
+    return failures
+
+
+def test_finish_no_pr(env: Env) -> list[str]:
+    """A branch with no pull request is left alone."""
+    failures = []
+    spawn = env.spawn(5)
+    if spawn.returncode != 0:
+        return ["finish no pr: the spawn failed"]
+    env.set_pane("tooling-5", HERMES_IDLE)
+    result = env.run("finish", "1")
+    if result.returncode == 0:
+        failures.append("finish no pr: the lane was taken down with no pull "
+                        "request")
+    elif "lane/5" not in result.stderr:
+        failures.append(f"finish no pr: the refusal did not name the branch: "
+                        f"{result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish no pr")
+    return failures
+
+
+def test_finish_abandon(env: Env) -> list[str]:
+    """A closed pull request takes the lane down and keeps the branch."""
+    failures = []
+    spawn = env.spawn(5)
+    if spawn.returncode != 0:
+        return ["finish abandon: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    head = git_out(worktree, "rev-parse", "HEAD")
+    subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
+                    "lane/5"], check=True, capture_output=True)
+    set_pr(env, "lane/5", 13, "CLOSED", head)
+    env.set_pane("tooling-5", HERMES_IDLE)
+    result = env.run("finish", "--abandon", "1")
+    if result.returncode != 0:
+        return [f"finish abandon: the finish failed: {result.stderr.strip()!r}"]
+    if worktree.exists():
+        failures.append("finish abandon: the worktree is still there")
+    if branch_exists(env, "lane/5"):
+        failures.append("finish abandon: the local branch is still there")
+    if not git_out(env.clone, "ls-remote", "origin", "refs/heads/lane/5"):
+        failures.append("finish abandon: the remote branch was deleted")
+    leases = env.leases()
+    if not leases or leases[0]["state"] != "released":
+        failures.append(f"finish abandon: the lease was not released: {leases}")
+    return failures
+
+
+def test_finish_abandon_ahead(env: Env) -> list[str]:
+    """A lane ahead of the remote branch is left alone."""
+    failures = []
+    spawn = env.spawn(5)
+    if spawn.returncode != 0:
+        return ["finish abandon ahead: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    head = git_out(worktree, "rev-parse", "HEAD")
+    subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
+                    "lane/5"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@example.com",
+                    "-c", "user.name=T", "commit", "--allow-empty", "-q",
+                    "-m", "wip"], check=True, capture_output=True)
+    ahead = git_out(worktree, "rev-parse", "HEAD")
+    set_pr(env, "lane/5", 13, "CLOSED", head)
+    env.set_pane("tooling-5", HERMES_IDLE)
+    result = env.run("finish", "--abandon", "1")
+    if result.returncode == 0:
+        failures.append("finish abandon ahead: the lane was taken down with "
+                        "work the remote does not carry")
+    elif ahead not in result.stderr:
+        failures.append(f"finish abandon ahead: the refusal did not name the "
+                        f"head it found: {result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish abandon ahead")
+    return failures
+
+
+def test_finish_abandon_merged(env: Env) -> list[str]:
+    """`--abandon` on a merged pull request points at the plain finish."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish abandon merged: the spawn failed"]
+    result = env.run("finish", "--abandon", "1")
+    if result.returncode == 0:
+        failures.append("finish abandon merged: a merged pull request was "
+                        "abandoned")
+    elif "lane finish" not in result.stderr:
+        failures.append(f"finish abandon merged: the refusal did not point "
+                        f"at the plain finish: {result.stderr.strip()!r}")
+    untouched(env, 5, failures, "finish abandon merged")
+    return failures
+
+
+def test_finish_prune_fails(env: Env) -> list[str]:
+    """A prune that fails is reported, and the lane still comes down."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["finish prune fails: the spawn failed"]
+    (env.data / "fail_remote_prune").write_text("")
+    result = env.run("finish", "1")
+    if result.returncode != 0:
+        failures.append(f"finish prune fails: the finish failed: "
+                        f"{result.stderr.strip()!r}")
+    if "caches" not in result.stderr:
+        failures.append(f"finish prune fails: the failure was not reported: "
+                        f"{result.stderr.strip()!r}")
+    if lane_worktree(env, 5).exists():
+        failures.append("finish prune fails: the worktree is still there")
+    leases = env.leases()
+    if not leases or leases[0]["state"] != "released":
+        failures.append(f"finish prune fails: the lease was not released: "
+                        f"{leases}")
+    return failures
+
+
+def test_finish_merged_lanes(env: Env) -> list[str]:
+    """`--merged` takes down every lane whose pull request merged."""
+    failures = []
+    for issue in (5, 6, 7):
+        if not spawn_merged(env, issue, number=10 + issue):
+            return [f"finish merged lanes: the spawn for {issue} failed"]
+    set_pr(env, "lane/7", 17, "OPEN",
+           git_out(lane_worktree(env, 7), "rev-parse", "HEAD"))
+    result = env.run("finish", "--merged")
+    if result.returncode != 0:
+        failures.append(f"finish merged lanes: the finish failed: "
+                        f"{result.stderr.strip()!r}")
+    for issue in (5, 6):
+        if lane_worktree(env, issue).exists():
+            failures.append(f"finish merged lanes: the worktree for {issue} "
+                            f"is still there")
+        if branch_exists(env, f"lane/{issue}"):
+            failures.append(f"finish merged lanes: the branch for {issue} is "
+                            f"still there")
+    if not lane_worktree(env, 7).exists():
+        failures.append("finish merged lanes: the open lane's worktree is gone")
+    if not branch_exists(env, "lane/7"):
+        failures.append("finish merged lanes: the open lane's branch is gone")
+    leases = {lease["id"]: lease for lease in env.leases()}
+    for number in (1, 2):
+        if leases.get(number, {}).get("state") != "released":
+            failures.append(f"finish merged lanes: lease {number} was not "
+                            f"released: {leases}")
+    if leases.get(3, {}).get("state") == "released":
+        failures.append("finish merged lanes: the open lane was released")
+    return failures
+
+
+def test_list_pr(env: Env) -> list[str]:
+    """The list says which lanes are finished."""
+    failures = []
+    if not spawn_merged(env, 5):
+        return ["list pr: the spawn failed"]
+    spawn = env.spawn(6)
+    if spawn.returncode != 0:
+        return ["list pr: the second spawn failed"]
+    set_pr(env, "lane/6", 21, "OPEN",
+           git_out(lane_worktree(env, 6), "rev-parse", "HEAD"))
+    env.set_pane("tooling-6", HERMES_IDLE)
+    leases = {lease["id"]: lease for lease in env.leases()}
+    if leases.get(1, {}).get("pr") != 12:
+        failures.append(f"list pr: the merged lane does not show its pull "
+                        f"request: {leases}")
+    if leases.get(1, {}).get("pr_state") != "MERGED":
+        failures.append(f"list pr: the merged lane does not read as merged: "
+                        f"{leases}")
+    if leases.get(2, {}).get("pr") != 21:
+        failures.append(f"list pr: the open lane does not show its pull "
+                        f"request: {leases}")
+    if leases.get(2, {}).get("pr_state") != "OPEN":
+        failures.append(f"list pr: the open lane does not read as open: "
+                        f"{leases}")
+    listing = env.run("list")
+    if "MERGED" not in listing.stdout:
+        failures.append(f"list pr: the list does not show the pull request's "
+                        f"state: {listing.stdout!r}")
+    return failures
+
+
 CASES = [
     ("race", test_race),
     ("read-under-a-write-lock", test_read_under_a_write_lock),
@@ -1280,6 +1731,20 @@ CASES = [
     ("stopped", test_stopped),
     ("states", test_states),
     ("release-twice", test_release_twice),
+    ("finish-merged", test_finish_merged),
+    ("finish-tracking-ref", test_finish_tracking_ref),
+    ("finish-processes", test_finish_processes),
+    ("finish-open-pr", test_finish_open_pr),
+    ("finish-busy", test_finish_busy),
+    ("finish-dirty", test_finish_dirty),
+    ("finish-head-mismatch", test_finish_head_mismatch),
+    ("finish-no-pr", test_finish_no_pr),
+    ("finish-abandon", test_finish_abandon),
+    ("finish-abandon-ahead", test_finish_abandon_ahead),
+    ("finish-abandon-merged", test_finish_abandon_merged),
+    ("finish-prune-fails", test_finish_prune_fails),
+    ("finish-merged-lanes", test_finish_merged_lanes),
+    ("list-pr", test_list_pr),
 ]
 
 

@@ -4,6 +4,9 @@
     lane spawn --repo R --issue N --harness H --profile P
     lane list [--json]
     lane release LEASE
+    lane finish LEASE
+    lane finish --merged
+    lane finish --abandon LEASE
 
 A refusal exits 1 and names what refused.
 """
