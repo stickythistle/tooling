@@ -16,6 +16,11 @@ failure that simply happens to share the run. The fixture isolates
 each shape, and the test asserts the verdict on each in isolation,
 so a regression on one case cannot be hidden by another.
 
+A repository that runs no workflows reports no checks for every head,
+which is the shape a head that never reached GitHub reports too. The
+pushed head tells the two apart: a no-CI repository promotes a clean,
+pushed head and refuses every other one.
+
 No network. A stub `gh` answers every subcommand pr-ready invokes,
 reading from fixtures on disk so the canned JSON is the kind a real
 `gh` actually prints and not something this test only ever feeds
@@ -126,6 +131,20 @@ def write_stub_gh(bin_dir: Path, data_dir: Path) -> None:
         "  run)\n"
         "    # args: run view <RUN_ID> --json jobs\n"
         "    cat \"$STUB_DATA/run_$3.json\" 2>/dev/null || echo '{\"jobs\":[]}'\n"
+        "    ;;\n"
+        "  api)\n"
+        "    # args: api repos/{owner}/{repo}/actions/workflows --jq .total_count\n"
+        "    # The count comes from a file, so a scenario can say how\n"
+        "    # many workflows the repository runs. A scenario can also\n"
+        "    # ask the query to fail by creating\n"
+        "    # $STUB_DATA/gh_workflow_count_fail: pr-ready is then expected\n"
+        "    # to refuse, not to read the failure as a repository with no\n"
+        "    # workflows.\n"
+        "    if [ -e \"$STUB_DATA/gh_workflow_count_fail\" ]; then\n"
+        "      echo \"gh: could not count workflows (simulated)\" >&2\n"
+        "      exit 1\n"
+        "    fi\n"
+        "    cat \"$STUB_DATA/workflow_count\" 2>/dev/null || echo 0\n"
         "    ;;\n"
         "esac\n"
     )
@@ -254,6 +273,11 @@ def install_fixtures(data_dir: Path, scenario: str, oid: str,
                     data_dir / "pr_checks.json")
         shutil.copy(FIXTURES / "gh_run_view_never_started.json",
                     data_dir / "run_3001.json")
+    elif scenario == "no_checks":
+        # A head with no checks at all: what a repository that runs no
+        # CI reports for every head, and what a head that never reached
+        # GitHub reports too.
+        (data_dir / "pr_checks.json").write_text("[]")
     elif scenario == "mixed":
         shutil.copy(FIXTURES / "gh_pr_checks_mixed.json",
                     data_dir / "pr_checks.json")
@@ -989,6 +1013,179 @@ def main() -> int:
                 failures.append(f"diff_flagged should refuse: stderr={r.stderr.strip()!r}")
             elif "flagged 1 block(s)" not in r.stderr:
                 failures.append(f"diff_flagged did not count the block: {r.stderr!r}")
+
+            # Scenarios 19-24: a repository that runs no workflows, where
+            # every head reports no checks. The count is asked for only
+            # when there are no checks at all.
+            def no_ci(name, workflows=0, count_fails=False, prepare=None):
+                """A head with no checks, in a repository whose workflow
+                count the scenario sets."""
+                data = tmp / f"data_no_ci_{name}"
+                data.mkdir()
+                install_fixtures(data, "no_checks", oid, branch)
+                if count_fails:
+                    (data / "gh_workflow_count_fail").write_text("")
+                else:
+                    (data / "workflow_count").write_text(str(workflows))
+                if prepare is not None:
+                    prepare(data)
+                return data, run_pr_ready(worktree, bin_dir, data)
+
+            def stale_head(data):
+                """The PR's pushed head differs from the local head."""
+                pv = json.loads((data / "pr_view.json").read_text())
+                pv["headRefOid"] = "0" * 40
+                (data / "pr_view.json").write_text(json.dumps(pv))
+
+            def dirty_tree(data):
+                """The worktree has an uncommitted change."""
+                (worktree / "README").write_text("test\nuncommitted\n")
+
+            # Scenario 19: no workflows, no checks, clean tree, local head
+            # is the pushed head. The PR is promoted, and stderr says that
+            # no CI applies.
+            data, r = no_ci("no_workflows")
+            if r.returncode != 0:
+                failures.append(
+                    f"no_ci (no workflows) should promote: rc={r.returncode} "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "no_ci (no workflows) did not call `gh pr ready`"
+                    )
+                if "note: this repository has no workflows; no CI applies" not in r.stderr:
+                    failures.append(
+                        "no_ci (no workflows) did not say that no CI "
+                        f"applies: {r.stderr!r}"
+                    )
+
+            # Scenario 20: no workflows, and the local head differs from
+            # the pushed head. The head never reached GitHub, so it is
+            # refused.
+            data, r = no_ci("stale_head", prepare=stale_head)
+            if r.returncode == 0:
+                failures.append(
+                    "no_ci (stale head) should refuse: "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if "not the pushed head" not in r.stderr:
+                    failures.append(
+                        "no_ci (stale head) did not name the pushed head: "
+                        f"{r.stderr!r}"
+                    )
+                if "no CI checks reported" in r.stderr:
+                    failures.append(
+                        "no_ci (stale head) refused for the checks: "
+                        f"{r.stderr!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "no_ci (stale head) promoted after refusing"
+                    )
+
+            # Scenario 21: no workflows, and the worktree is dirty. The
+            # refusal names the dirty tree.
+            data, r = no_ci("dirty_tree", prepare=dirty_tree)
+            subprocess.run(["git", "-C", str(worktree), "checkout", "--",
+                            "README"], check=True)
+            if r.returncode == 0:
+                failures.append(
+                    "no_ci (dirty tree) should refuse: "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if "uncommitted changes" not in r.stderr:
+                    failures.append(
+                        "no_ci (dirty tree) did not name the uncommitted "
+                        f"changes: {r.stderr!r}"
+                    )
+                if "no CI checks reported" in r.stderr:
+                    failures.append(
+                        "no_ci (dirty tree) refused for the checks: "
+                        f"{r.stderr!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "no_ci (dirty tree) promoted after refusing"
+                    )
+
+            # Scenario 22: the repository runs two workflows and reports
+            # no checks for this head. The head's checks have not
+            # registered yet, so it is refused.
+            data, r = no_ci("with_workflows", workflows=2)
+            if r.returncode == 0:
+                failures.append(
+                    "no_ci (repository has workflows) should refuse: "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if "no CI checks reported" not in r.stderr:
+                    failures.append(
+                        "no_ci (repository has workflows) did not name the "
+                        f"missing checks: {r.stderr!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "no_ci (repository has workflows) promoted after "
+                        "refusing"
+                    )
+
+            # Scenario 23: the workflow count could not be read. A failed
+            # count refuses.
+            data, r = no_ci("count_fails", count_fails=True)
+            if r.returncode == 0:
+                failures.append(
+                    "no_ci (count fails) should refuse: "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if "could not count the repository's workflows" not in r.stderr:
+                    failures.append(
+                        "no_ci (count fails) did not name the workflow "
+                        f"count: {r.stderr!r}"
+                    )
+                if "could not count workflows (simulated)" not in r.stderr:
+                    failures.append(
+                        "no_ci (count fails) did not surface the gh "
+                        f"error: {r.stderr!r}"
+                    )
+                if (data / "ready_called").exists():
+                    failures.append(
+                        "no_ci (count fails) promoted after refusing"
+                    )
+
+            # Scenario 24: a PR whose checks have passed. The workflow
+            # count is skipped: the repository's CI has already answered
+            # it.
+            data = tmp / "data_no_api_call"
+            data.mkdir()
+            install_fixtures(data, "all_pass", oid, branch)
+            r = run_pr_ready(worktree, bin_dir, data)
+            if r.returncode != 0:
+                failures.append(
+                    f"no_api_call should promote: rc={r.returncode} "
+                    f"stderr={r.stderr.strip()!r}"
+                )
+            else:
+                if not (data / "ready_called").exists():
+                    failures.append(
+                        "no_api_call did not call `gh pr ready`"
+                    )
+                log = data / "gh.log"
+                api_calls = []
+                if log.exists():
+                    api_calls = [
+                        ln for ln in log.read_text().splitlines()
+                        if ln.startswith("api")
+                    ]
+                if api_calls:
+                    failures.append(
+                        "no_api_call asked for the workflow count on a PR "
+                        f"with checks: {api_calls!r}"
+                    )
 
         except AssertionError as e:
             failures.append(f"unexpected assertion error: {e}")
