@@ -1,0 +1,4 @@
+[[gates]]
+name = "find_prose tests"
+when = '^(skills/condense-prose/find_prose\.py|tests/test_find_prose\.py)$'
+run = "python3 tests/test_find_prose.py"

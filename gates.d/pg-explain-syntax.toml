@@ -1,0 +1,4 @@
+[[gates]]
+name = "pg-explain syntax"
+when = '^(bin/pg-explain)$'
+run = "bash -n bin/pg-explain"

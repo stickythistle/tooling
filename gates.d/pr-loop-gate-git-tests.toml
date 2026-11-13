@@ -1,0 +1,10 @@
+# The same gate, over patches that real git produced. The suite above
+# writes its patches by hand, and a hand-written patch can be written
+# to agree with whatever the code under test does; this one builds the
+# commits and reads the diffs back out of git. The `when` names the code
+# under test as well as the suite (see tests/test_gate_coverage.py).
+
+[[gates]]
+name = "pr-loop-gate git tests"
+when = '^(bin/pr-loop-gate|lib/pr_gate\.py|lib/roles\.py|tests/test_pr_loop_gate_git\.py)$'
+run = "python3 tests/test_pr_loop_gate_git.py"

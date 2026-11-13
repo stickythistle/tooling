@@ -1,0 +1,8 @@
+# The proxy that meters one harness's provider tokens. The gate names
+# the driver as well as the suite, so a change to the proxy runs the
+# suite that pins it.
+
+[[gates]]
+name = "bakeoff proxy tests"
+when = '^(bin/bakeoff-proxy|tests/test_bakeoff_proxy\.py)$'
+run = "python3 tests/test_bakeoff_proxy.py"

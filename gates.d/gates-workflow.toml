@@ -1,0 +1,4 @@
+[[gates]]
+name = "gates workflow"
+when = '^(\.github/workflows/gates\.yaml|lib/workflow_steps\.py|tests/test_gates_workflow\.py)$'
+run = "python3 tests/test_gates_workflow.py"

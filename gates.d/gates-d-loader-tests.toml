@@ -1,0 +1,7 @@
+# The loader that reads the gates: the manifest's own and every gates.d/
+# file beside it. The gate names the suite, the module it pins and the
+# directory holding the gates, so a change to any runs the suite.
+[[gates]]
+name = "gates.d loader tests"
+when = '^(lib/manifest\.py|tests/test_gates_d\.py|gates\.d/)'
+run = "python3 tests/test_gates_d.py"

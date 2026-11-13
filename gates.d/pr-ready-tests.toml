@@ -1,0 +1,4 @@
+[[gates]]
+name = "pr-ready tests"
+when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
+run = "python3 tests/test_pr_ready.py"

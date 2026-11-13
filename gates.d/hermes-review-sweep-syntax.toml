@@ -1,0 +1,4 @@
+[[gates]]
+name = "hermes-review-sweep syntax"
+when = '^(bin/hermes-review-sweep)$'
+run = "bash -n bin/hermes-review-sweep"

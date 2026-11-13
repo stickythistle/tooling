@@ -1,0 +1,9 @@
+# The verification pass between finding-check and the decider. The suite
+# exercises the allow-list, the known-answer control and every way a model
+# can answer badly; a stub stands in for the model, so the gate never calls
+# one.
+
+[[gates]]
+name = "finding-verify tests"
+when = '^(bin/finding-verify|tests/test_finding_verify\.py)$'
+run = "python3 tests/test_finding_verify.py"

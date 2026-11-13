@@ -1,0 +1,8 @@
+# The sync's own suite. Named with the tool it drives, so a change to
+# the sync's flags runs the suite that pins them -- a gate naming only
+# the test file would leave the suite inert exactly when it is needed.
+
+[[gates]]
+name = "remote-task sync tests"
+when = '^(bin/remote-task|tests/test_remote_task_sync\.py)$'
+run = "python3 tests/test_remote_task_sync.py"

@@ -1,0 +1,7 @@
+# The gate that decides what a PR needs. `lib/pr_gate.py` is in the
+# `when` because moving the decision moves what the suite pins.
+
+[[gates]]
+name = "pr-loop-gate tests"
+when = '^(bin/pr-loop-gate|lib/pr_gate\.py|lib/roles\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
+run = "python3 tests/test_pr_loop_gate.py"

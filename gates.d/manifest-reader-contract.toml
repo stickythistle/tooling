@@ -1,0 +1,12 @@
+# A gate that always runs when the manifest reader or any bin/ tool moves.
+# The reader is the foundation every other tool builds on; a change to a
+# bin/ script can regress the way its output reaches bash, even when the
+# script itself never touched the reader. We pin the refusal contract
+# (missing field -> named error that survives `set -e`) rather than parsing
+# the manifest's shape -- a parse is green against a manifest the reader
+# would still reject.
+
+[[gates]]
+name = "manifest reader contract"
+when = '^(lib/manifest\.py|tests/test_manifest\.py|bin/)'
+run = "python3 tests/test_manifest.py"

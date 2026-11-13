@@ -11,6 +11,7 @@ import tomllib
 from pathlib import Path
 
 MANIFEST = "gates.toml"
+GATES_DIR = "gates.d"
 
 
 def find(start: Path) -> Path:
@@ -21,6 +22,45 @@ def find(start: Path) -> Path:
         if p.is_file():
             return p
     sys.exit(f"no {MANIFEST} found in {start} or any parent")
+
+
+def gates(path: Path) -> list[dict]:
+    """Every gate the manifest declares: its own, then the ones in each file
+    under gates.d/ beside it, in name order.
+
+    One gate per file lets two branches that each add a gate merge without
+    a conflict."""
+    with path.open("rb") as fh:
+        doc = tomllib.load(fh)
+    found = list(doc.get("gates", []))
+    where = {}
+    for g in found:
+        name = g.get("name")
+        if name:
+            where[name] = MANIFEST
+    # Name order is the only order a merge leaves alone: a modification time
+    # or a directory listing says nothing about which file came first.
+    for f in sorted((path.parent / GATES_DIR).glob("*.toml")):
+        label = f"{GATES_DIR}/{f.name}"
+        with f.open("rb") as fh:
+            sub = tomllib.load(fh)
+        for key, value in sub.items():
+            if key == "gates":
+                continue
+            kind = f"[[{key}]]" if isinstance(value, list) else f"[{key}]"
+            sys.exit(f"{label}: holds a {kind}; a {GATES_DIR} file holds "
+                     "[[gates]] entries only")
+        for g in sub.get("gates", []):
+            name = g.get("name")
+            # A name is how a caller picks a gate, so two of them is a
+            # manifest that cannot say which one was meant.
+            if name and name in where:
+                sys.exit(f"{label}: declares gate {name!r}, which "
+                         f"{where[name]} also declares")
+            if name:
+                where[name] = label
+            found.append(g)
+    return found
 
 
 def bash_array(name: str, values) -> str:
@@ -47,7 +87,8 @@ def main() -> None:
     repo, query = Path(sys.argv[1]).resolve(), sys.argv[2]
     default = sys.argv[3] if len(sys.argv) > 3 else None
 
-    with find(repo).open("rb") as fh:
+    path = find(repo)
+    with path.open("rb") as fh:
         doc = tomllib.load(fh)
 
     if query == "--remote":
@@ -108,12 +149,14 @@ def main() -> None:
         return
 
     if query == "gates":
+        # The gates live in the manifest and in the files under gates.d/
+        # beside it, so the loader answers for them.
+        found = gates(path)
         # Three parallel arrays because bash has no array of records. Order is
         # the file's, so the manifest decides what runs first.
-        gates = doc.get("gates", [])
-        names = [g.get("name", f"gate{i}") for i, g in enumerate(gates)]
-        whens = [g.get("when", "") for g in gates]
-        runs = [g.get("run", "") for g in gates]
+        names = [g.get("name", f"gate{i}") for i, g in enumerate(found)]
+        whens = [g.get("when", "") for g in found]
+        runs = [g.get("run", "") for g in found]
         if any(not r for r in runs):
             sys.exit(f"{MANIFEST}: every [[gates]] entry needs a `run`")
         print(bash_array("GATE_NAMES", names))

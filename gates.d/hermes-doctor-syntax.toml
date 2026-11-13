@@ -1,0 +1,4 @@
+[[gates]]
+name = "hermes-doctor syntax"
+when = '^(bin/hermes-doctor)$'
+run = "python3 -m py_compile bin/hermes-doctor"

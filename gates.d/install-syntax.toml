@@ -1,0 +1,8 @@
+# install/ and pipeline/ ship shell with no suite. `bash -n` parses; it does not
+# run, so a host that refuses to clone is unseen. `xargs -n1` is not incidental:
+# test_gate_coverage.py rejects the forms that check one file or none.
+
+[[gates]]
+name = "install syntax"
+when = '^install/.*\.sh$'
+run = "find install -name '*.sh' -print0 | xargs -0 -n1 bash -n"

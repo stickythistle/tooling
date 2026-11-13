@@ -1,0 +1,4 @@
+[[gates]]
+name = "remote-prune tests"
+when = '^(bin/remote-prune|tests/test_remote_prune\.py)$'
+run = "python3 tests/test_remote_prune.py"

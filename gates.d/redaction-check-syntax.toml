@@ -1,0 +1,4 @@
+[[gates]]
+name = "redaction-check syntax"
+when = '^(bin/redaction-check)$'
+run = "bash -n bin/redaction-check"

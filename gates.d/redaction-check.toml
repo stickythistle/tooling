@@ -1,0 +1,6 @@
+# Runs on every branch, and only added lines count, so a redaction
+# already on main passes.
+
+[[gates]]
+name = "redaction check"
+run = "bin/redaction-check $REPO"

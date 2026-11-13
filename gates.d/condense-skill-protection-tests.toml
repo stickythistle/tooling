@@ -1,0 +1,11 @@
+# The condense pass's protection of skill files: the finder marks them, the
+# skill says what cannot be cut, and the coordinator checks the pass before
+# approving.
+#
+# The gate names the suite and the files it pins: the finder, and the two
+# skills whose prose the protection is about.
+
+[[gates]]
+name = "condense skill protection tests"
+when = '^(tests/test_condense_skill_protection\.py|skills/condense-prose/find_prose\.py|skills/condense-prose/SKILL\.md|skills/pr-review-coordinator/SKILL\.md)$'
+run = "python3 tests/test_condense_skill_protection.py"

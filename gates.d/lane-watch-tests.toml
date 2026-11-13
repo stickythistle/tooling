@@ -1,0 +1,4 @@
+[[gates]]
+name = "lane-watch tests"
+when = '^(bin/lane-watch|tests/test_lane_watch\.py)$'
+run = "python3 tests/test_lane_watch.py"

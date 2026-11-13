@@ -1,0 +1,8 @@
+# The repository's secret scan: the three fixture values pass it, and a real
+# token in the same files is still found. The gate names the config and the
+# suite, so a change to either runs the suite.
+
+[[gates]]
+name = "gitleaks config tests"
+when = '^(\.gitleaks\.toml|tests/test_gitleaks_config\.py)$'
+run = "python3 tests/test_gitleaks_config.py"

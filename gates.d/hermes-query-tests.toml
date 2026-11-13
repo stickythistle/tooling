@@ -1,0 +1,11 @@
+# hermes_query is the lib/common.sh helper every tool uses to hand hermes
+# its prompt as a file (`--query-file PATH`) instead of one argv string
+# (`-z "$prompt"`). The test pins: a 200 KB prompt with quotes/$()/
+# backticks reaches the agent byte-for-byte, the `session_id:` line that
+# `chat -Q` writes is dropped before callers see stdout, and fd 8 stays
+# open so the GPU lock spans retries.
+
+[[gates]]
+name = "hermes_query tests"
+when = '^(lib/common\.sh|tests/test_hermes_query\.py)$'
+run = "python3 tests/test_hermes_query.py"

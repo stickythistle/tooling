@@ -1,0 +1,11 @@
+# Syntax floor for the eight bin/ tools that have no suite. Each gate names
+# exactly the one file it parses: `bash -n a.sh b.sh` parses only the first
+# and treats the rest as positional args, and `find -exec` does not propagate
+# the exit status of what it runs, so the run has to be the per-file form.
+# This establishes the file parses and nothing more -- real coverage would
+# pin a behaviour, not a parse, and writing eight suites is a separate task.
+
+[[gates]]
+name = "findings-ledger tests"
+when = '^(bin/findings-ledger|tests/test_findings_ledger\.py)$'
+run = "python3 tests/test_findings_ledger.py"

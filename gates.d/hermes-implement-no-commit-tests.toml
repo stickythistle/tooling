@@ -1,0 +1,8 @@
+# A run that was meant to make no commit, and the count on the FAILED
+# line. The suite names the tool, because the verdict and the brief the
+# lane is handed are both the tool's.
+
+[[gates]]
+name = "hermes-implement no-commit tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_nocommit\.py)$'
+run = "python3 tests/test_hermes_implement_nocommit.py"

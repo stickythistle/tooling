@@ -1,0 +1,12 @@
+# The manifest and its checker, run on any diff that adds a tool or a suite.
+# That makes this `when` a catch-all over bin/ and tests/, which the PHONY
+# probe correctly declines to count as coverage for any one of them.
+
+# The gates live in gates.d/ and are read through lib/manifest.py, so a
+# change to either can change which gates run at all. The check that every
+# suite and tool is gated has to run when they do.
+
+[[gates]]
+name = "gate coverage"
+when = '^(gates\.toml|gates\.d/|lib/manifest\.py|tests/test_gate_coverage\.py|bin/|tests/test_[^/]*\.py)'
+run = "python3 tests/test_gate_coverage.py"

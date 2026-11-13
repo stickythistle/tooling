@@ -1,0 +1,4 @@
+[[gates]]
+name = "hermes-triage syntax"
+when = '^(bin/hermes-triage)$'
+run = "bash -n bin/hermes-triage"

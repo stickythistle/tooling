@@ -1,0 +1,8 @@
+# The GPU group lock and its three contracts: serialise on one group, run
+# across groups, no-op without one. Both common.sh's function and the
+# helpers in bin/ and pipeline/ that call it.
+
+[[gates]]
+name = "GPU group lock tests"
+when = '^(lib/common\.sh|tests/test_gpu_lock\.py|bin/hermes-implement|skills/hermes-review/scripts/hermes-scrutinize\.sh|pipeline/(common|triage|implement)\.sh)$'
+run = "python3 tests/test_gpu_lock.py"
