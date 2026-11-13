@@ -18,7 +18,8 @@ import time
 import tomllib
 import uuid
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from pathlib import Path
 
 # The label that says a lane is live on an issue.
@@ -499,8 +500,10 @@ def refuse_taken_places(conn: sqlite3.Connection, req: Request) -> None:
     if Path(req.worktree).exists() and not _leased(conn, "worktree",
                                                    req.worktree):
         raise Refusal("worktree", f"worktree {req.worktree} already exists")
-    if _branch_exists(req.clone, req.branch) and not _leased(conn, "branch",
-                                                              req.branch):
+    # A branch still to be named takes no place: the default carries the
+    # id of a lease not yet claimed.
+    if req.branch and _branch_exists(req.clone, req.branch) \
+            and not _leased(conn, "branch", req.branch):
         raise Refusal("branch",
                       f"branch {req.branch} already exists in {req.clone}")
     if window_exists_at(req.tmux_session, req.window) and not _leased(
@@ -533,12 +536,27 @@ def _branch_exists(clone: Path, branch: str) -> bool:
     return code == 0
 
 
-def claim(conn: sqlite3.Connection, req: Request, size: int) -> int:
-    """Take the lease, or refuse.
+def default_branch(issue: int, lease_id: int) -> str:
+    """The branch a lease works on, when none was given.
+
+    The lease id keeps the next lane on an issue off an earlier part's
+    branch, and off its pull request. A branch then names the lease that
+    owns it.
+    """
+    return f"lane/{issue}-{lease_id}"
+
+
+def claim(conn: sqlite3.Connection, req: Request,
+          size: int) -> tuple[int, str]:
+    """Take the lease, or refuse, and say which branch it works on.
 
     The claim is one transaction, taken before anything outside the
     database happens: a check that reads and then writes lets two callers
     pass it, and a unique index cannot sum a pool's costs.
+
+    The default branch carries the id the INSERT produces, so the row
+    goes in blank and is filled before the COMMIT: no reader sees a
+    lease without one.
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -598,8 +616,14 @@ def claim(conn: sqlite3.Connection, req: Request, size: int) -> int:
              str(req.clone), req.tmux_session, req.window, req.session,
              req.harness_session, "busy", time.time(), time.time()),
         )
+        lease_id = int(cursor.lastrowid)
+        branch = req.branch
+        if not branch:
+            branch = default_branch(req.issue, lease_id)
+            conn.execute("UPDATE leases SET branch = ? WHERE id = ?",
+                         (branch, lease_id))
         conn.execute("COMMIT")
-        return int(cursor.lastrowid)
+        return lease_id, branch
     except BaseException:
         if conn.in_transaction:
             conn.execute("ROLLBACK")
@@ -796,15 +820,35 @@ MERGED = "MERGED"
 CLOSED = "CLOSED"
 
 
-def find_pr(repo: str, branch: str) -> PullRequest | None:
+def pr_opened_at(record: dict) -> float | None:
+    """When a pull request record says it opened, in epoch seconds.
+
+    None when it says nothing, and an unknown age filters nothing out.
+    """
+    value = str(record.get("createdAt") or "")
+    try:
+        opened = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if opened.tzinfo is None:
+        opened = opened.replace(tzinfo=timezone.utc)
+    return opened.timestamp()
+
+
+def find_pr(repo: str, branch: str,
+            since: float | None = None) -> PullRequest | None:
     """The pull request whose head is the branch.
 
     None says there is none: the branch was never pushed, or its pull
     request was deleted.
+
+    `since` is when a lease began: a pull request opened before it
+    belongs to whoever held the branch name first.
     """
     code, out, err = run(["gh", "pr", "list", "-R", repo, "--head", branch,
                           "--state", "all", "--json",
-                          "number,state,headRefOid,mergedAt", "--limit", "1"])
+                          "number,state,headRefOid,mergedAt,createdAt",
+                          "--limit", "1"])
     if code != 0:
         raise StepFailure("pr", CommandError(["gh", "pr", "list"], code,
                                              err).detail())
@@ -816,6 +860,13 @@ def find_pr(repo: str, branch: str) -> PullRequest | None:
     if not records:
         return None
     record = records[0]
+    opened = pr_opened_at(record)
+    # `gh` lists newest first, so a record older than the lease leaves
+    # nothing newer. Its stamp is whole seconds, so the lease rounds
+    # down: a lane that pushed in the second it was claimed in pushed
+    # after the claim.
+    if since is not None and opened is not None and opened < int(since):
+        return None
     return PullRequest(number=int(record.get("number") or 0),
                        state=str(record.get("state") or ""),
                        head=str(record.get("headRefOid") or ""))
@@ -1401,7 +1452,9 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     if not session:
         raise Refusal("session",
                       "no claiming session: pass --session or set LANE_SESSION")
-    branch = args.branch or f"lane/{args.issue}"
+    # The default branch carries the lease id, so it stays blank until
+    # the claim names it.
+    branch = args.branch or ""
     base = args.base or "origin/main"
     window = args.window or f"{repo_name(repo.name)}-{args.issue}"
     if args.worktree:
@@ -1441,8 +1494,8 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         # something else holds is refused before anything is claimed.
         reconcile(conn)
         refuse_taken_places(conn, req)
-        lease_id = claim(conn, req, cfg.pools[profile.pool])
-        Spawn(conn, cfg, req, lease_id).run()
+        lease_id, branch = claim(conn, req, cfg.pools[profile.pool])
+        Spawn(conn, cfg, replace(req, branch=branch), lease_id).run()
     finally:
         conn.close()
     print(f"lease {lease_id}")
@@ -1467,7 +1520,8 @@ def cmd_list(args: argparse.Namespace) -> int:
                 # Asking again costs a call per finished lane, and the
                 # list grows without bound.
                 try:
-                    pr = find_pr(lease["repo"], lease["branch"])
+                    pr = find_pr(lease["repo"], lease["branch"],
+                                 lease["created_at"])
                 except StepFailure as exc:
                     print(f"ERR pr: lease {lease['id']}: {exc.detail}",
                           file=sys.stderr)
@@ -1599,7 +1653,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
                              (args.lease,)).fetchone()
         if lease is None:
             raise Refusal("lease", f"no lease {args.lease}")
-        pr = find_pr(lease["repo"], lease["branch"])
+        pr = find_pr(lease["repo"], lease["branch"], lease["created_at"])
         if pr is None:
             raise Refusal("pr", f"no pull request for branch {lease['branch']}")
         worktree = check_finished(lease, pr, args.abandon)
@@ -1618,7 +1672,7 @@ def finish_merged(conn: sqlite3.Connection) -> int:
     failures = 0
     for lease in live_leases(conn):
         try:
-            pr = find_pr(lease["repo"], lease["branch"])
+            pr = find_pr(lease["repo"], lease["branch"], lease["created_at"])
             if pr is None or pr.state != MERGED:
                 continue
             worktree = check_finished(lease, pr, False)
@@ -1642,7 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
     spawn.add_argument("--harness", required=True, help="harness to run")
     spawn.add_argument("--profile", required=True, help="profile to run it on")
     spawn.add_argument("--branch", default=None,
-                       help="branch to cut (default: lane/<issue>)")
+                       help="branch to cut (default: lane/<issue>-<lease>)")
     spawn.add_argument("--base", default=None,
                        help="ref to cut from (default: origin/main)")
     spawn.add_argument("--worktree", default=None,

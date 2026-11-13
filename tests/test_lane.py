@@ -22,6 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -475,12 +476,25 @@ def git_out(directory: Path, *args: str) -> str:
     return proc.stdout.strip()
 
 
-def set_pr(env: Env, branch: str, number: int, state: str, head: str) -> None:
-    """The pull request the stubbed gh answers with."""
+def set_pr(env: Env, branch: str, number: int, state: str, head: str,
+           created: float | None = None) -> None:
+    """The pull request the stubbed gh answers with.
+
+    `created` is when the pull request opened, in epoch seconds; left
+    out, the record carries no `createdAt` at all.
+    """
     name = branch.replace("/", "_")
-    (env.data / f"pr_{name}.json").write_text(json.dumps([
-        {"number": number, "state": state, "headRefOid": head,
-         "mergedAt": None}]))
+    record = {"number": number, "state": state, "headRefOid": head,
+              "mergedAt": None}
+    if created is not None:
+        record["createdAt"] = datetime.fromtimestamp(
+            created, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (env.data / f"pr_{name}.json").write_text(json.dumps([record]))
+
+
+def lease_branch(issue: int, lease_id: int) -> str:
+    """The branch a lease works on: its issue, and the lease that owns it."""
+    return f"lane/{issue}-{lease_id}"
 
 
 def lane_worktree(env: Env, issue: int) -> Path:
@@ -555,7 +569,9 @@ def spawn_merged(env: Env, issue: int, number: int = 12) -> str:
         return ""
     worktree = lane_worktree(env, issue)
     head = git_out(worktree, "rev-parse", "HEAD")
-    set_pr(env, f"lane/{issue}", number, "MERGED", head)
+    # The lease just taken is the highest id the database holds.
+    set_pr(env, lease_branch(issue, env.leases()[-1]["id"]), number, "MERGED",
+           head)
     env.set_pane(f"tooling-{issue}", HERMES_IDLE)
     return head
 
@@ -1264,7 +1280,7 @@ def test_interrupted(env: Env) -> list[str]:
                         f"{world.leases()}")
     if (world.worktree_root / "tooling-1").exists():
         failures.append("interrupted: the worktree was left behind")
-    if branch_exists(world, "lane/1"):
+    if branch_exists(world, lease_branch(1, 1)):
         failures.append("interrupted: the branch was left behind")
     if "--remove-label" not in world.log("gh.log"):
         failures.append(f"interrupted: the label was not taken back off: "
@@ -1284,7 +1300,7 @@ def test_interrupted(env: Env) -> list[str]:
                         f"{world.leases()}")
     if (world.worktree_root / "tooling-1").exists():
         failures.append("interrupted: the worktree was left behind")
-    if branch_exists(world, "lane/1"):
+    if branch_exists(world, lease_branch(1, 1)):
         failures.append("interrupted: the branch was left behind")
     if "--remove-label" not in world.log("gh.log"):
         failures.append(f"interrupted: the label was not taken back off: "
@@ -1307,7 +1323,7 @@ def test_interrupted(env: Env) -> list[str]:
         failures.append("interrupted: the window was left open")
     if (world.worktree_root / "tooling-1").exists():
         failures.append("interrupted: the worktree was left behind")
-    if branch_exists(world, "lane/1"):
+    if branch_exists(world, lease_branch(1, 1)):
         failures.append("interrupted: the branch was left behind")
     if "--remove-label" not in world.log("gh.log"):
         failures.append(f"interrupted: the label was not taken back off: "
@@ -1353,10 +1369,13 @@ def test_refuses_taken_places(env: Env) -> list[str]:
     if not (taken / "notes").exists():
         failures.append("taken places: the worktree path was touched")
 
+    # A default branch names a lease not yet taken, so only a named
+    # branch runs into one cut by hand.
     world = env.sibling("branch")
-    subprocess.run(["git", "-C", str(world.clone), "branch", "lane/1"],
+    hand = "lane/hand-cut"
+    subprocess.run(["git", "-C", str(world.clone), "branch", hand],
                    check=True, capture_output=True)
-    result = world.spawn(1)
+    result = world.spawn(1, extra=("--branch", hand))
     if result.returncode == 0:
         failures.append("taken places: a spawn took a branch that was "
                         "already there")
@@ -1370,7 +1389,7 @@ def test_refuses_taken_places(env: Env) -> list[str]:
         failures.append("taken places: the refused spawn added the label")
     if "new-window" in world.log("tmux.log"):
         failures.append("taken places: the refused spawn opened a window")
-    if not branch_exists(world, "lane/1"):
+    if not branch_exists(world, hand):
         failures.append("taken places: the branch was touched")
 
     world = env.sibling("window")
@@ -1410,16 +1429,72 @@ def test_undo_leaves_a_leased_branch(env: Env) -> list[str]:
     subprocess.run(["git", "-C", str(env.clone), "worktree", "remove",
                     "--force", str(env.worktree_root / "tooling-1")],
                    check=True, capture_output=True)
-    second = env.spawn(2, extra=("--branch", "lane/1"))
+    second = env.spawn(2, extra=("--branch", lease_branch(1, 1)))
     if second.returncode == 0:
         failures.append("leased branch: a second lane took a branch that "
                         "was already there")
-    if not branch_exists(env, "lane/1"):
+    if not branch_exists(env, lease_branch(1, 1)):
         failures.append("leased branch: the branch of the first lane was "
                         "deleted")
     leases = env.leases()
     if len(leases) != 1 or leases[0]["issue"] != 1:
         failures.append(f"leased branch: the leases are {leases}")
+    return failures
+
+
+def test_branch_names_the_lease(env: Env) -> list[str]:
+    """Each lease on an issue cuts its own branch, named for itself.
+
+    An issue with several parts is normal: one lane merges, the next
+    part starts. Sharing the first part's branch would share its pull
+    request, and the second lane would report a merge it never made.
+    """
+    failures = []
+    first = env.spawn(5)
+    if first.returncode != 0:
+        return [f"branch per lease: the first spawn failed: "
+                f"{first.stderr.strip()!r}"]
+    if lease_row(env, 1).get("branch") != lease_branch(5, 1):
+        failures.append(f"branch per lease: lease 1 holds "
+                        f"{lease_row(env, 1).get('branch')!r}, not "
+                        f"{lease_branch(5, 1)!r}")
+    if not branch_exists(env, lease_branch(5, 1)):
+        failures.append(f"branch per lease: {lease_branch(5, 1)} was not cut")
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"branch per lease: the release failed: "
+                        f"{released.stderr.strip()!r}")
+        return failures
+    second = env.spawn(5, extra=("--worktree",
+                                 str(env.worktree_root / "tooling-5-part-2")))
+    if second.returncode != 0:
+        failures.append(f"branch per lease: the second lease did not start, "
+                        f"so the worktree add failed on the branch that was "
+                        f"there: {second.stderr.strip()!r}")
+        return failures
+    if lease_row(env, 2).get("branch") != lease_branch(5, 2):
+        failures.append(f"branch per lease: lease 2 holds "
+                        f"{lease_row(env, 2).get('branch')!r}, not "
+                        f"{lease_branch(5, 2)!r}")
+    if not branch_exists(env, lease_branch(5, 2)):
+        failures.append(f"branch per lease: {lease_branch(5, 2)} was not cut")
+    return failures
+
+
+def test_explicit_branch_is_kept(env: Env) -> list[str]:
+    """A branch given on the command line is the branch the lane works on."""
+    failures = []
+    result = env.spawn(5, extra=("--branch", "custom"))
+    if result.returncode != 0:
+        return [f"explicit branch: the spawn failed: "
+                f"{result.stderr.strip()!r}"]
+    if lease_row(env, 1).get("branch") != "custom":
+        failures.append(f"explicit branch: the lease holds "
+                        f"{lease_row(env, 1).get('branch')!r}, not 'custom'")
+    if not branch_exists(env, "custom"):
+        failures.append("explicit branch: custom was not cut")
+    if branch_exists(env, lease_branch(5, 1)):
+        failures.append("explicit branch: the default was cut as well")
     return failures
 
 
@@ -1436,7 +1511,7 @@ def test_finish_merged(env: Env) -> list[str]:
         failures.append("finish merged: the window is still open")
     if worktree.exists():
         failures.append("finish merged: the worktree is still there")
-    if branch_exists(env, "lane/5"):
+    if branch_exists(env, lease_branch(5, 1)):
         failures.append("finish merged: the branch is still there")
     if "remote-prune --prune --tree tooling_5" not in env.log("calls.log"):
         failures.append(f"finish merged: the builder caches were not pruned "
@@ -1459,16 +1534,17 @@ def test_finish_tracking_ref(env: Env) -> list[str]:
     head = spawn_merged(env, 5)
     if not head:
         return ["finish tracking ref: the spawn failed"]
+    branch = lease_branch(5, 1)
     subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
-                    "lane/5"], check=True, capture_output=True)
+                    branch], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(env.origin), "update-ref", "-d",
-                    "refs/heads/lane/5"], check=True, capture_output=True)
+                    f"refs/heads/{branch}"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(env.clone), "update-ref",
                     "refs/remotes/origin/other", head], check=True,
                    capture_output=True)
     refs = git_out(env.clone, "for-each-ref", "--format=%(refname)",
                    "refs/remotes/origin")
-    if "refs/remotes/origin/lane/5" not in refs:
+    if f"refs/remotes/origin/{branch}" not in refs:
         return [f"finish tracking ref: the clone carries no tracking ref: "
                 f"{refs}"]
     result = env.run("finish", "1")
@@ -1477,7 +1553,7 @@ def test_finish_tracking_ref(env: Env) -> list[str]:
                 f"{result.stderr.strip()!r}"]
     refs = git_out(env.clone, "for-each-ref", "--format=%(refname)",
                    "refs/remotes/origin")
-    if "refs/remotes/origin/lane/5" in refs:
+    if f"refs/remotes/origin/{branch}" in refs:
         failures.append("finish tracking ref: the tracking ref of the "
                         "finished branch is still there")
     if "refs/remotes/origin/other" not in refs:
@@ -1520,7 +1596,7 @@ def untouched(env: Env, issue: int, failures: list[str], why: str) -> None:
     """Nothing about the lane was touched."""
     if not lane_worktree(env, issue).exists():
         failures.append(f"{why}: the worktree is gone")
-    if not branch_exists(env, f"lane/{issue}"):
+    if not branch_exists(env, lease_branch(issue, 1)):
         failures.append(f"{why}: the branch is gone")
     if f"tooling-{issue}" not in (env.data / "windows").read_text():
         failures.append(f"{why}: the window was closed")
@@ -1540,7 +1616,7 @@ def test_finish_open_pr(env: Env) -> list[str]:
     if spawn.returncode != 0:
         return ["finish open pr: the spawn failed"]
     head = git_out(lane_worktree(env, 5), "rev-parse", "HEAD")
-    set_pr(env, "lane/5", 12, "OPEN", head)
+    set_pr(env, lease_branch(5, 1), 12, "OPEN", head)
     env.set_pane("tooling-5", HERMES_IDLE)
     result = env.run("finish", "1")
     if result.returncode == 0:
@@ -1620,7 +1696,7 @@ def test_finish_no_pr(env: Env) -> list[str]:
     if result.returncode == 0:
         failures.append("finish no pr: the lane was taken down with no pull "
                         "request")
-    elif "lane/5" not in result.stderr:
+    elif lease_branch(5, 1) not in result.stderr:
         failures.append(f"finish no pr: the refusal did not name the branch: "
                         f"{result.stderr.strip()!r}")
     untouched(env, 5, failures, "finish no pr")
@@ -1635,18 +1711,19 @@ def test_finish_abandon(env: Env) -> list[str]:
         return ["finish abandon: the spawn failed"]
     worktree = lane_worktree(env, 5)
     head = git_out(worktree, "rev-parse", "HEAD")
+    branch = lease_branch(5, 1)
     subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
-                    "lane/5"], check=True, capture_output=True)
-    set_pr(env, "lane/5", 13, "CLOSED", head)
+                    branch], check=True, capture_output=True)
+    set_pr(env, branch, 13, "CLOSED", head)
     env.set_pane("tooling-5", HERMES_IDLE)
     result = env.run("finish", "--abandon", "1")
     if result.returncode != 0:
         return [f"finish abandon: the finish failed: {result.stderr.strip()!r}"]
     if worktree.exists():
         failures.append("finish abandon: the worktree is still there")
-    if branch_exists(env, "lane/5"):
+    if branch_exists(env, branch):
         failures.append("finish abandon: the local branch is still there")
-    if not git_out(env.clone, "ls-remote", "origin", "refs/heads/lane/5"):
+    if not git_out(env.clone, "ls-remote", "origin", f"refs/heads/{branch}"):
         failures.append("finish abandon: the remote branch was deleted")
     leases = env.leases()
     if not leases or leases[0]["state"] != "released":
@@ -1662,13 +1739,14 @@ def test_finish_abandon_ahead(env: Env) -> list[str]:
         return ["finish abandon ahead: the spawn failed"]
     worktree = lane_worktree(env, 5)
     head = git_out(worktree, "rev-parse", "HEAD")
+    branch = lease_branch(5, 1)
     subprocess.run(["git", "-C", str(env.clone), "push", "-q", "origin",
-                    "lane/5"], check=True, capture_output=True)
+                    branch], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(worktree), "-c", "user.email=t@example.com",
                     "-c", "user.name=T", "commit", "--allow-empty", "-q",
                     "-m", "wip"], check=True, capture_output=True)
     ahead = git_out(worktree, "rev-parse", "HEAD")
-    set_pr(env, "lane/5", 13, "CLOSED", head)
+    set_pr(env, branch, 13, "CLOSED", head)
     env.set_pane("tooling-5", HERMES_IDLE)
     result = env.run("finish", "--abandon", "1")
     if result.returncode == 0:
@@ -1760,7 +1838,7 @@ def test_finish_merged_prunes_each_clone(env: Env) -> list[str]:
                 f"{spawn.stderr.strip()!r}"]
     other_worktree = env.worktree_root / "other-9"
     head = git_out(other_worktree, "rev-parse", "HEAD")
-    set_pr(env, "lane/9", 19, "MERGED", head)
+    set_pr(env, lease_branch(9, 2), 19, "MERGED", head)
     env.set_pane("other-9", HERMES_IDLE)
     result = env.run("finish", "--merged")
     if result.returncode != 0:
@@ -1782,22 +1860,22 @@ def test_finish_merged_lanes(env: Env) -> list[str]:
     for issue in (5, 6, 7):
         if not spawn_merged(env, issue, number=10 + issue):
             return [f"finish merged lanes: the spawn for {issue} failed"]
-    set_pr(env, "lane/7", 17, "OPEN",
+    set_pr(env, lease_branch(7, 3), 17, "OPEN",
            git_out(lane_worktree(env, 7), "rev-parse", "HEAD"))
     result = env.run("finish", "--merged")
     if result.returncode != 0:
         failures.append(f"finish merged lanes: the finish failed: "
                         f"{result.stderr.strip()!r}")
-    for issue in (5, 6):
+    for number, issue in enumerate((5, 6), start=1):
         if lane_worktree(env, issue).exists():
             failures.append(f"finish merged lanes: the worktree for {issue} "
                             f"is still there")
-        if branch_exists(env, f"lane/{issue}"):
+        if branch_exists(env, lease_branch(issue, number)):
             failures.append(f"finish merged lanes: the branch for {issue} is "
                             f"still there")
     if not lane_worktree(env, 7).exists():
         failures.append("finish merged lanes: the open lane's worktree is gone")
-    if not branch_exists(env, "lane/7"):
+    if not branch_exists(env, lease_branch(7, 3)):
         failures.append("finish merged lanes: the open lane's branch is gone")
     leases = {lease["id"]: lease for lease in env.leases()}
     for number in (1, 2):
@@ -1817,7 +1895,7 @@ def test_list_pr(env: Env) -> list[str]:
     spawn = env.spawn(6)
     if spawn.returncode != 0:
         return ["list pr: the second spawn failed"]
-    set_pr(env, "lane/6", 21, "OPEN",
+    set_pr(env, lease_branch(6, 2), 21, "OPEN",
            git_out(lane_worktree(env, 6), "rev-parse", "HEAD"))
     env.set_pane("tooling-6", HERMES_IDLE)
     leases = {lease["id"]: lease for lease in env.leases()}
@@ -1837,6 +1915,46 @@ def test_list_pr(env: Env) -> list[str]:
     if "MERGED" not in listing.stdout:
         failures.append(f"list pr: the list does not show the pull request's "
                         f"state: {listing.stdout!r}")
+    return failures
+
+
+def test_pr_created_before_the_lease(env: Env) -> list[str]:
+    """A lease reports only a pull request opened after it.
+
+    A lease that takes up a branch name an earlier lane used would
+    otherwise report that lane's pull request as its own, a merged one
+    included.
+    """
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["pr before lease: the first spawn failed"]
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        return [f"pr before lease: the release failed: "
+                f"{released.stderr.strip()!r}"]
+    # The lane is handed a branch an earlier lane used, which the
+    # default stopped handing out: the lookup still has to see past the
+    # pull request that came with it.
+    second = env.spawn(5, extra=("--branch", "lane/5", "--worktree",
+                                 str(env.worktree_root / "tooling-5-part-2")))
+    if second.returncode != 0:
+        return [f"pr before lease: the second spawn failed: "
+                f"{second.stderr.strip()!r}"]
+    opened = lease_row(env, 2)["created_at"]
+    head = git_out(env.clone, "rev-parse", "HEAD")
+    set_pr(env, "lane/5", 12, "MERGED", head, created=opened - 3600)
+    leases = {lease["id"]: lease for lease in env.leases()}
+    if leases.get(2, {}).get("pr") is not None:
+        failures.append(f"pr before lease: lease 2 reports a pull request "
+                        f"opened before it: {leases.get(2)}")
+    set_pr(env, "lane/5", 12, "MERGED", head, created=opened + 60)
+    leases = {lease["id"]: lease for lease in env.leases()}
+    if leases.get(2, {}).get("pr") != 12:
+        failures.append(f"pr before lease: the pull request opened after the "
+                        f"lease is not reported: {leases.get(2)}")
+    if "createdAt" not in env.log("gh.log"):
+        failures.append("pr before lease: the tool never asked gh for the "
+                        "createdAt it filters on")
     return failures
 
 
@@ -2249,6 +2367,8 @@ CASES = [
     ("interrupted", test_interrupted),
     ("taken-places", test_refuses_taken_places),
     ("leased-branch", test_undo_leaves_a_leased_branch),
+    ("branch-names-the-lease", test_branch_names_the_lease),
+    ("explicit-branch-is-kept", test_explicit_branch_is_kept),
     ("step-failure", test_step_failure),
     ("label-failure", test_label_failure),
     ("config", test_config),
@@ -2272,6 +2392,7 @@ CASES = [
     ("finish-merged-prunes-each-clone", test_finish_merged_prunes_each_clone),
     ("finish-merged-lanes", test_finish_merged_lanes),
     ("list-pr", test_list_pr),
+    ("pr-created-before-the-lease", test_pr_created_before_the_lease),
     ("spawn-session", test_spawn_session),
     ("harness-without-session", test_harness_without_session),
     ("old-database-session", test_old_database_session),
