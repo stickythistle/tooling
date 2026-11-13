@@ -1465,6 +1465,106 @@ def case_config_in_the_environment_does_not_silence(failures):
                   "github-pat", r.stderr, failures)
 
 
+def ignore_entry(sha, path, rule="github-pat", line=1):
+    """One .gitleaksignore entry: <commit>:<file>:<rule>:<line>."""
+    return f"{sha}:{path}:{rule}:{line}\n"
+
+
+def case_untracked_ignore_does_not_silence(failures):
+    """An untracked .gitleaksignore silences nothing: the list the scan
+    reads is the pushed commit's, so a fingerprint nobody reviewed cannot
+    drop a finding."""
+    with tempfile.TemporaryDirectory() as t:
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(Path(t))
+
+        (repo / ".gitleaksignore").write_text(
+            ignore_entry(tip, "config/credentials.txt"))
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("untracked ignore refused", 1, r, failures)
+        assert_in("untracked ignore names the rule",
+                  "github-pat", r.stderr, failures)
+
+
+def case_committed_ignore_silences(failures):
+    """A .gitleaksignore in the pushed commit is the list the scan reads,
+    even with no copy in the working tree: the finding it names is in the
+    reviewed diff."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "config").mkdir()
+        (repo / "config" / "credentials.txt").write_text(f"value = {pat()}\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add credentials")
+        secret_sha = head_of(repo)
+
+        (repo / ".gitleaksignore").write_text(
+            ignore_entry(secret_sha, "config/credentials.txt"))
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "ignore that finding")
+        tip = head_of(repo)
+
+        # Only the committed list can be read from here on.
+        (repo / ".gitleaksignore").unlink()
+
+        line = push_line("refs/heads/feat", tip, "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("committed ignore passes", 0, r, failures)
+        assert_not_in("committed ignore is not named",
+                      "github-pat", r.stderr, failures)
+
+
+def case_inline_allow_comment_passes(failures):
+    """An inline gitleaks:allow is a decision carried in the pushed diff,
+    so it stands without any ignore file."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = init_repo(tmp)
+        setup_remote(repo)
+
+        git(repo, "checkout", "-q", "-b", "feat")
+        (repo / "cfg.py").write_text(f"token = {pat()} # gitleaks:allow\n")
+        git(repo, "add", "-A")
+        git(repo, "commit", "-q", "-m", "add config")
+        tip = head_of(repo)
+
+        line = push_line("refs/heads/feat", tip, "refs/heads/feat", "0" * 40)
+        r = run_guard(line, cwd=repo)
+
+        assert_rc("inline gitleaks:allow passes", 0, r, failures)
+        assert_not_in("inline allow is not named",
+                      "github-pat", r.stderr, failures)
+
+
+def case_working_tree_ignore_unchanged(failures):
+    """Refusing on an unreviewed ignore list leaves the lane's file alone:
+    the guard works from a copy, never by moving what the lane wrote."""
+    with tempfile.TemporaryDirectory() as t:
+        repo, pushed_sha, tip = scenario_with_secret_on_branch(Path(t))
+
+        wt_ignore = repo / ".gitleaksignore"
+        wt_ignore.write_text(ignore_entry(tip, "config/credentials.txt"))
+        before = wt_ignore.read_bytes()
+
+        line = push_line("refs/heads/feat", tip,
+                         "refs/heads/feat", pushed_sha)
+        run_guard(line, cwd=repo)
+
+        assert_eq("working tree ignore still there", True, wt_ignore.is_file(),
+                  failures)
+        if wt_ignore.is_file():
+            assert_eq("working tree ignore bytes unchanged",
+                      before, wt_ignore.read_bytes(), failures)
+
+
 def case_committed_allowlist_silences(failures):
     """A .gitleaks.toml committed with the secret is the config the scan
     reads, so the push proceeds."""
@@ -1860,6 +1960,11 @@ def main():
     case_uncommitted_allowlist_edit_does_not_silence(failures)
     case_config_in_the_environment_does_not_silence(failures)
     case_committed_allowlist_silences(failures)
+    # The ignore list the scan reads is the one in the pushed commit.
+    case_untracked_ignore_does_not_silence(failures)
+    case_committed_ignore_silences(failures)
+    case_inline_allow_comment_passes(failures)
+    case_working_tree_ignore_unchanged(failures)
     case_clean_push_passes(failures)
     case_missing_scanner_refused(failures)
     case_wrong_scanner_version_refused(failures)
@@ -1885,7 +1990,8 @@ def main():
           "ack overrides; rebase passes; intended-deletion passes; "
           "harmless refs pass; e2e push refused; "
           "base regression refused; duplicate patch refused; "
-          "a secret in the pushed commits refused on every ref")
+          "a secret in the pushed commits refused on every ref; "
+          "the ignore list read from the pushed commit")
     return 0
 
 

@@ -25,8 +25,9 @@
 # and tags included. PUSH_GUARD_ACK stops at it: a false positive is
 # fixed in the repository's .gitleaks.toml, where review sees it.
 
-# The scan reads the allowlist from the pushed commit, so an untracked
-# .gitleaks.toml, or one in the environment, cannot silence the scan.
+# The scan reads its allowlist and its ignore list from the pushed
+# commit: an untracked .gitleaks.toml or .gitleaksignore, or one in the
+# environment, cannot silence it.
 set -euo pipefail
 
 REMOTE=${1:-}
@@ -79,7 +80,12 @@ CONFIG_FILE=$(mktemp "${TMPDIR:-/tmp}/push-guard-gitleaks-config.XXXXXX") || {
 	note "could not create a config file; the push would go unscanned."
 	exit 1
 }
-trap 'rm -f "$REPORT" "$CONFIG_FILE"' EXIT
+# The ignore list gitleaks reads is written here, for the same reason.
+IGNORE_FILE=$(mktemp "${TMPDIR:-/tmp}/push-guard-gitleaks-ignore.XXXXXX") || {
+	note "could not create an ignore file; the push would go unscanned."
+	exit 1
+}
+trap 'rm -f "$REPORT" "$CONFIG_FILE" "$IGNORE_FILE"' EXIT
 
 # The pinned version, read from the pin file.
 pinned_version() {
@@ -190,7 +196,7 @@ PY
 # added in one commit and removed in the next is still in it.
 scan_commits_for_secrets() {
 	local local_sha=$1 remote_sha=$2 remote_ref=$3
-	local log_opts resolved findings rc=0 parse_rc=0
+	local log_opts resolved findings scan_dir rc=0 parse_rc=0
 
 	gitleaks_ready || return 1
 
@@ -209,6 +215,22 @@ scan_commits_for_secrets() {
 		printf '[extend]\nuseDefault = true\n' >"$CONFIG_FILE"
 	fi
 
+	# The ignore list comes from the pushed commit the same way.
+	if git show "$resolved:.gitleaksignore" >"$IGNORE_FILE" 2>/dev/null; then
+		:
+	else
+		: >"$IGNORE_FILE"
+	fi
+
+	# The source moves as well: gitleaks reads {source}/.gitleaksignore on
+	# top of --gitleaks-ignore-path, and {source} is the working tree. The
+	# object store gives up the same `git log -p` diff with no lane file
+	# beside it.
+	if ! scan_dir=$(git rev-parse --absolute-git-dir 2>/dev/null); then
+		note "$remote_ref: cannot locate the object store to scan; refusing rather than scanning the working tree."
+		return 1
+	fi
+
 	if [ "$remote_sha" = "$ZERO" ]; then
 		log_opts="$resolved --not --remotes=$REMOTE"
 	elif git rev-parse --verify --quiet "$remote_sha^{commit}" >/dev/null; then
@@ -221,7 +243,8 @@ scan_commits_for_secrets() {
 	env -u GITLEAKS_CONFIG -u GITLEAKS_CONFIG_TOML \
 		"$GITLEAKS_BIN" git --log-opts="$log_opts" --redact --no-banner \
 		--exit-code 3 --report-format json --report-path "$REPORT" \
-		--config "$CONFIG_FILE" . >/dev/null 2>&1 || rc=$?
+		--config "$CONFIG_FILE" --gitleaks-ignore-path "$IGNORE_FILE" \
+		"$scan_dir" >/dev/null 2>&1 || rc=$?
 
 	case "$rc" in
 	0)
