@@ -1,0 +1,7 @@
+# Syntax floor for the two review drivers; their shared logic is in
+# lib/common.sh and the review script, which the suite above pins.
+
+[[gates]]
+name = "hermes-review-pr syntax"
+when = '^(bin/hermes-review-pr)$'
+run = "bash -n bin/hermes-review-pr"

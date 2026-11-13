@@ -1,0 +1,8 @@
+# The brief: a written brief reaches the lane as a file, whole, and the
+# run keeps it. The gate names the driver, because the brief is the
+# driver's own option and the run directory it lands in.
+
+[[gates]]
+name = "hermes-implement brief tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_brief\.py)$'
+run = "python3 tests/test_hermes_implement_brief.py"

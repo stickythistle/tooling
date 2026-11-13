@@ -99,6 +99,10 @@ role = "cluster"
 send = ["deploy/terraform", "justfile"]
 command = "just terraform-check"
 
+# The gates may live in `gates.d/` beside this file instead: one gate per
+# file, read in name order. A file there holds `[[gates]]` entries and
+# nothing else, so two branches that each add a gate never conflict.
+#
 # `gate-verify` runs every gate whose `when` matches the diff, in this order.
 # A gate that exercises something the diff did not touch is worse than no gate,
 # because it is green.

@@ -1,0 +1,10 @@
+# A behaviour pin for pipeline/triage.sh: the prompt reaches the
+# agent via --query-file (so a 200 KB triage prompt does not hit
+# MAX_ARG_STRLEN), a non-zero agent exit is reported on stdout, and
+# a multi-word $PIPELINE_AGENT starts and runs end-to-end. `bash -n`
+# parses; the suite proves behaviour.
+
+[[gates]]
+name = "triage phase tests"
+when = '^(pipeline/(triage|common|pick_lane)\.(sh|py)|lib/common\.sh|tests/test_triage_phase\.py)$'
+run = "python3 tests/test_triage_phase.py"

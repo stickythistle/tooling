@@ -1,0 +1,4 @@
+[[gates]]
+name = "hermes-skills-sync syntax"
+when = '^(bin/hermes-skills-sync)$'
+run = "bash -n bin/hermes-skills-sync"

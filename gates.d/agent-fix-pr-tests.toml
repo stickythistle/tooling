@@ -1,0 +1,4 @@
+[[gates]]
+name = "agent-fix-pr tests"
+when = '^(bin/agent-fix-pr|tests/test_agent_fix_pr\.py)$'
+run = "python3 tests/test_agent_fix_pr.py"

@@ -1,0 +1,4 @@
+[[gates]]
+name = "pick_lane tests"
+when = '^(pipeline/pick_lane\.py|tests/test_pick_lane\.py)$'
+run = "python3 tests/test_pick_lane.py"

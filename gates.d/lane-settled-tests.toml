@@ -1,0 +1,4 @@
+[[gates]]
+name = "lane-settled tests"
+when = '^(bin/lane-settled|bin/hermes-implement|bin/gate-verify|tests/test_lane_settled\.py)$'
+run = "python3 tests/test_lane_settled.py"

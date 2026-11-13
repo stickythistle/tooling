@@ -23,13 +23,17 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 GATES = REPO_ROOT / "gates.toml"
 TESTS = REPO_ROOT / "tests"
 BIN = REPO_ROOT / "bin"
+
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+# The gates come from the reader every tool uses, so this suite checks the
+# way the gates are selected.
+import manifest  # noqa: E402
 
 # Pins the manifest, not a tool, so no `when` should select it.
 EXEMPT = {"test_gate_coverage.py"}
@@ -139,10 +143,9 @@ def suite_pins(suite: str) -> list[str]:
 
 
 def main() -> int:
-    doc = tomllib.loads(GATES.read_text())
-    gates = doc.get("gates", [])
+    gates = manifest.gates(GATES)
     if not gates:
-        print("FAIL gates.toml declares no gates")
+        print("FAIL the manifest declares no gates")
         return 1
 
     failures, suites = check_suites(gates, TESTS)
@@ -204,10 +207,11 @@ def main() -> int:
                     f"script in {target}/; its command checks fewer files than "
                     f"its `when` selects")
 
-    # The manifest itself. Every other gate is read from this file, so a `when`
-    # broken here breaks gate selection everywhere -- and a change to it selected
-    # nothing, including this check. It has to gate itself.
-    for rel in ("gates.toml", "tests/test_gate_coverage.py"):
+    # The manifest itself. Every other gate is read from it and from the files
+    # beside it, so a `when` broken here breaks gate selection everywhere -- and
+    # a change to it selected nothing, including this check. It has to gate
+    # itself.
+    for rel in ("gates.toml", "gates.d/", "tests/test_gate_coverage.py"):
         if not any(g.get("when") and re.search(g["when"], rel) for g in gates):
             failures.append(
                 f"{rel} is named by no gate, so breaking gate selection runs nothing")
@@ -232,7 +236,7 @@ def main() -> int:
         for f in failures:
             print(f"FAIL {f}")
         return 1
-    print(f"PASS gates.toml covers {len(suites)} suite(s) and every bin/ tool")
+    print(f"PASS the gates cover {len(suites)} suite(s) and every bin/ tool")
     return 0
 
 
@@ -440,7 +444,7 @@ def self_tests() -> int:
 
     # The real manifest's audit fires on bin/ and tests/test_*.py paths. The
     # probes name no file the `when` lists literally, so each exercises its arm.
-    real_gates = tomllib.loads(GATES.read_text()).get("gates", [])
+    real_gates = manifest.gates(GATES)
     coverage_gates = [g for g in real_gates
                       if g.get("name") == "gate coverage"]
     if not coverage_gates:

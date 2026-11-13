@@ -1,0 +1,4 @@
+[[gates]]
+name = "gate-untested syntax"
+when = '^(bin/gate-untested)$'
+run = "bash -n bin/gate-untested"

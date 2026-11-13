@@ -1,0 +1,7 @@
+# The stack review: the driver, its two helper tools, the locating tool the
+# attribution reads, and the attribution library the suite pins.
+
+[[gates]]
+name = "stack review tests"
+when = '^(bin/hermes-review-pr|bin/stack-attrib|bin/stack-plan|bin/finding-check|lib/stack_attrib\.py|tests/test_review_stack\.py)$'
+run = "python3 tests/test_review_stack.py"

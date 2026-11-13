@@ -1,0 +1,8 @@
+# The execution review lane: a reviewer that runs the code, and every
+# finding it reports carries the command that reproduces it. The gate names
+# the driver, the module it drives and the driver that owns the phase.
+
+[[gates]]
+name = "review-execute tests"
+when = '^(bin/review-execute|lib/review_execute\.py|bin/hermes-review-pr|tests/test_review_execute\.py)$'
+run = "python3 tests/test_review_execute.py"

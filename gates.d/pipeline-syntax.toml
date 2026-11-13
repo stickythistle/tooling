@@ -1,0 +1,4 @@
+[[gates]]
+name = "pipeline syntax"
+when = '^pipeline/.*\.sh$'
+run = "find pipeline -name '*.sh' -print0 | xargs -0 -n1 bash -n"

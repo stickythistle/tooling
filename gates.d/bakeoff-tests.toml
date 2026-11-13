@@ -1,0 +1,8 @@
+# The bake-off runner: the workspace it builds, the gates it scores and
+# the report it renders. The gate names the suite and every file the
+# suite pins, so a change to any of them runs the suite.
+
+[[gates]]
+name = "bakeoff tests"
+when = '^(bin/bakeoff-run|bin/bakeoff-report|lib/bakeoff\.py|tests/test_bakeoff\.py)$'
+run = "python3 tests/test_bakeoff.py"

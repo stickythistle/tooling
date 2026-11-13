@@ -1,0 +1,4 @@
+[[gates]]
+name = "lane identity scope tests"
+when = '^(lib/common\.sh|bin/hermes-implement|bin/agent-fix-pr|pipeline/implement\.sh|tests/test_lane_identity_scope\.py)$'
+run = "python3 tests/test_lane_identity_scope.py"

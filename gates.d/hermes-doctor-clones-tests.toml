@@ -1,0 +1,7 @@
+# Whether every clone a lane pushes from runs push-guard, and whether one
+# deployed checkout is behind the tools on PATH. The gate names the tool, the
+# suite, and the config loader the clone list comes from.
+[[gates]]
+name = "hermes-doctor clones tests"
+when = '^(bin/hermes-doctor|lib/lane\.py|tests/test_hermes_doctor_clones\.py)$'
+run = "python3 tests/test_hermes_doctor_clones.py"

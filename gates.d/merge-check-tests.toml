@@ -1,0 +1,14 @@
+# The merge gate and its test. `merge-check` is the reviewer's last gate:
+# the head sits on the current base, the change is the change that was
+# reviewed, the commits are signed the way the repository asks, and CI
+# has finished.
+
+# It prints the command that merges the pull request. The decision is
+# tested against recorded facts, so the suite needs no pull request.
+# `lib/pr_gate.py` is in the `when` because the suite imports it, so a
+# change to the decision the merge gate reads has to run the suite.
+
+[[gates]]
+name = "merge-check tests"
+when = '^(bin/merge-check|lib/merge_check\.py|lib/pr_gate\.py|lib/roles\.py|tests/test_merge_check\.py)$'
+run = "python3 tests/test_merge_check.py"

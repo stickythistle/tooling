@@ -1,0 +1,4 @@
+[[gates]]
+name = "gate-verify tests"
+when = '^(bin/gate-verify|tests/test_gate_verify\.py)$'
+run = "python3 tests/test_gate_verify.py"

@@ -1,0 +1,4 @@
+[[gates]]
+name = "remote lane tests"
+when = '^(bin/remote-task|lib/common\.sh|hosts\.env\.example|tests/test_remote_lane\.py)$'
+run = "python3 tests/test_remote_lane.py"

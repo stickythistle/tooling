@@ -1,0 +1,4 @@
+[[gates]]
+name = "finding-check tests"
+when = '^(bin/finding-check|tests/test_finding_check\.py)$'
+run = "python3 tests/test_finding_check.py"

@@ -1,0 +1,4 @@
+[[gates]]
+name = "task-mirror-check tests"
+when = '^(bin/task-mirror-check|lib/workflow_steps\.py|tests/test_task_mirror_check\.py|lib/manifest\.py)$'
+run = "python3 tests/test_task_mirror_check.py"

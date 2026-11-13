@@ -1,0 +1,11 @@
+# Pins that hermes-implement gives each lane a private directory under
+# AGENT_STATE_DIR (not /tmp) and exports it as TMPDIR/TMP/TEMP. The test
+# runs the script end-to-end against a stub agent that reports where
+# mktemp, tempfile, and the shell's tmpdir resolve, so the assertion is
+# over what the lane actually saw, not over what the script's source
+# looked like on paper.
+
+[[gates]]
+name = "hermes-implement tmpdir tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_tmp\.py)$'
+run = "python3 tests/test_hermes_implement_tmp.py"

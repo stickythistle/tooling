@@ -1,0 +1,4 @@
+[[gates]]
+name = "tools-live-run tests"
+when = '^(bin/tools-live-run|tests/test_tools_live_run\.py)$'
+run = "python3 tests/test_tools_live_run.py"

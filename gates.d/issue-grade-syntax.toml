@@ -1,0 +1,4 @@
+[[gates]]
+name = "issue-grade syntax"
+when = '^(bin/issue-grade)$'
+run = "python3 -m py_compile bin/issue-grade"

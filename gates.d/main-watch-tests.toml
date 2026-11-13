@@ -1,0 +1,8 @@
+# The parent-green comparison: whether a commit broke the branch it
+# landed on. `lib/main_watch.py` is in the `when` because the decision is
+# what the suite pins, and a change to it alone has to run the suite.
+
+[[gates]]
+name = "main watch tests"
+when = '^(bin/main-watch|lib/main_watch\.py|tests/test_main_watch\.py)$'
+run = "python3 tests/test_main_watch.py"

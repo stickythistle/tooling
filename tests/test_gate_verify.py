@@ -24,6 +24,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 GATE_VERIFY = REPO_ROOT / "bin" / "gate-verify"
 REDACTION_CHECK = REPO_ROOT / "bin" / "redaction-check"
 GATES_TOML = REPO_ROOT / "gates.toml"
+GATES_D = REPO_ROOT / "gates.d"
+
+sys.path.insert(0, str(REPO_ROOT / "lib"))
+# The gate list comes from the reader the tool under test uses, so the
+# expectation cannot drift from the selection it checks.
+import manifest  # noqa: E402
 
 
 def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -35,8 +41,8 @@ def git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
 def make_repo(tmpdir: Path, with_gates: bool = True) -> Path:
     """Stand up a throwaway repo with one commit on a branch off main.
 
-    The project's gates.toml is copied in (when `with_gates`) so the
-    test exercises the same manifest shape gate-verify sees in
+    The project's gates.toml and gates.d/ are copied in (when `with_gates`)
+    so the test exercises the same manifest shape gate-verify sees in
     production. Initial files give `git diff --name-only` something to
     show; the diff under test is what each case appends on top.
     """
@@ -49,9 +55,10 @@ def make_repo(tmpdir: Path, with_gates: bool = True) -> Path:
     git(repo, "add", "README.md")
     if with_gates:
         shutil.copy(GATES_TOML, repo / "gates.toml")
+        shutil.copytree(GATES_D, repo / "gates.d")
     else:
         (repo / "gates.toml").write_text("")
-    git(repo, "add", "gates.toml")
+    git(repo, "add", "-A")
     git(repo, "commit", "-q", "-m", "init")
     # Set up a remote so `origin/main` resolves; gate-verify's default
     # VERIFY_BASE is origin/main and the test passes the repo as a path,
@@ -190,8 +197,7 @@ def case_gated_code_selects(tmp: Path) -> list[str]:
         failures.append(
             f"pr-ready diff did not select 'pr-ready tests': got {names!r}")
     # No gate whose `when` does not match bin/pr-ready should fire.
-    import tomllib
-    manifest_gates = tomllib.loads((repo / "gates.toml").read_text())["gates"]
+    manifest_gates = manifest.gates(repo / "gates.toml")
     import re as _re
     expected = [g["name"] for g in manifest_gates
                 if g.get("when") and _re.search(g["when"], "bin/pr-ready")]

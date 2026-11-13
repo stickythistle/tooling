@@ -1,0 +1,4 @@
+[[gates]]
+name = "hermes-implement tmux tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement_tmux\.py)$'
+run = "python3 tests/test_hermes_implement_tmux.py"

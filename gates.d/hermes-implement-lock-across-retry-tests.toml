@@ -1,0 +1,10 @@
+# hermes-implement takes the GPU group lock once and holds it across every
+# retry, so a flapping model cannot race itself across GPUs. The suite
+# also pins the resume policy (retry until clean + HANDOVER.md; the
+# resume prompt names the committed and uncommitted work; a 124 leaves
+# the run unfinished).
+
+[[gates]]
+name = "hermes-implement lock-across-retry tests"
+when = '^(bin/hermes-implement|tests/test_hermes_implement\.py)$'
+run = "python3 tests/test_hermes_implement.py"

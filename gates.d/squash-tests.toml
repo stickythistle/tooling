@@ -1,0 +1,9 @@
+# The squash tool and its test. The test exercises the bug from
+# issue #68 directly: a base ref that has moved between fork and squash
+# must leave the branch's tree unchanged. `bash -n` parses; the suite
+# proves behaviour.
+
+[[gates]]
+name = "squash tests"
+when = '^(bin/squash|tests/test_squash\.py)$'
+run = "python3 tests/test_squash.py"

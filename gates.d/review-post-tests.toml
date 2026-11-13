@@ -1,0 +1,4 @@
+[[gates]]
+name = "review-post tests"
+when = '^(bin/review-post|lib/review_post\.py|tests/test_review_post\.py)$'
+run = "python3 tests/test_review_post.py"

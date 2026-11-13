@@ -1,0 +1,4 @@
+[[gates]]
+name = "review phase tests"
+when = '^(pipeline/(review|common|pick_lane)\.(sh|py)|lib/common\.sh|tests/test_review_phase\.py)$'
+run = "python3 tests/test_review_phase.py"

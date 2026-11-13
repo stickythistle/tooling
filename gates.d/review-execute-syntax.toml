@@ -1,0 +1,4 @@
+[[gates]]
+name = "review-execute syntax"
+when = '^(bin/review-execute)$'
+run = "bash -n bin/review-execute"

@@ -1,0 +1,4 @@
+[[gates]]
+name = "triage-on-merge tests"
+when = '^(pipeline/triage-on-merge\.sh|bin/hermes-triage|tests/test_triage_on_merge\.py)$'
+run = "python3 tests/test_triage_on_merge.py"

@@ -1,0 +1,10 @@
+# The role binding: who reviews, who implements, and the identity a
+# lane's commits must carry. One file, one module, every tool asks it.
+
+# The gate names the module, the suite that pins it and the tools that
+# ask it, so a change to any of them runs the suite.
+
+[[gates]]
+name = "role binding tests"
+when = '^(lib/roles\.py|tests/test_roles\.py|roles\.toml\.example|lib/common\.sh|bin/merge-check|bin/pr-loop-gate)$'
+run = "python3 tests/test_roles.py"
