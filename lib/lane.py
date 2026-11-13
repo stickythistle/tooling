@@ -60,6 +60,9 @@ DEFAULT_READY_SECONDS = 8
 # with: one capture cannot tell a spinner between frames from an idle lane.
 DEFAULT_PI_SETTLE = 5.0
 
+# How long a signalled process group has to go before it is killed.
+KILL_GRACE = 10.0
+
 
 class Refusal(Exception):
     """A condition the tool cannot honor.
@@ -726,6 +729,134 @@ def read_states(conn: sqlite3.Connection, leases: list[sqlite3.Row]) -> None:
         set_state(conn, lease["id"], state)
 
 
+# ----- the pull request ----------------------------------------------------
+
+@dataclass(frozen=True)
+class PullRequest:
+    """The pull request a branch carries."""
+
+    number: int
+    state: str
+    head: str
+
+
+# The states a pull request is in.
+MERGED = "MERGED"
+CLOSED = "CLOSED"
+
+
+def find_pr(repo: str, branch: str) -> PullRequest | None:
+    """The pull request whose head is the branch.
+
+    None says there is none: the branch was never pushed, or its pull
+    request was deleted.
+    """
+    code, out, err = run(["gh", "pr", "list", "-R", repo, "--head", branch,
+                          "--state", "all", "--json",
+                          "number,state,headRefOid,mergedAt", "--limit", "1"])
+    if code != 0:
+        raise StepFailure("pr", CommandError(["gh", "pr", "list"], code,
+                                             err).detail())
+    try:
+        records = json.loads(out or "[]")
+    except json.JSONDecodeError as exc:
+        raise StepFailure("pr", f"gh pr list answered with something that is "
+                                 f"not JSON: {exc}")
+    if not records:
+        return None
+    record = records[0]
+    return PullRequest(number=int(record.get("number") or 0),
+                       state=str(record.get("state") or ""),
+                       head=str(record.get("headRefOid") or ""))
+
+
+# ----- the processes a lane leaves behind -----------------------------------
+
+def process_alive(pid: int) -> bool:
+    """Whether a process is still running.
+
+    A zombie has exited and is only waiting to be reaped, and it holds
+    nothing.
+    """
+    try:
+        with open(f"/proc/{pid}/stat", "r", encoding="utf-8") as handle:
+            data = handle.read()
+    except OSError:
+        return False
+    end = data.rfind(")")
+    if end < 0:
+        return False
+    fields = data[end + 2:].split()
+    return bool(fields) and fields[0] != "Z"
+
+
+def lane_processes(worktree: Path) -> list[tuple[int, int]]:
+    """The processes working inside the worktree, with their groups.
+
+    The working directory is the fact. A pattern over command lines
+    matches this tool's own command and every process that merely names
+    the path.
+    """
+    root = os.path.realpath(str(worktree))
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        pid = int(entry)
+        if pid == os.getpid():
+            continue
+        try:
+            if os.stat(f"/proc/{pid}").st_uid != os.getuid():
+                continue
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            continue
+        real = os.path.realpath(cwd)
+        if real != root and not real.startswith(root + os.sep):
+            continue
+        try:
+            group = os.getpgid(pid)
+        except OSError:
+            continue
+        found.append((pid, group))
+    return found
+
+
+def stop_lane_processes(worktree: Path) -> list[str]:
+    """Stop the processes the lane left running, and say which.
+
+    The group goes, not the process: a reparented `gate-verify` holds
+    the builder's bench lock, and a TERM to the gate takes its group
+    down.
+    """
+    groups: dict[int, list[int]] = {}
+    mine = os.getpgrp()
+    for pid, group in lane_processes(worktree):
+        # This tool's own group is skipped: signalling it kills this tool.
+        if group <= 1 or group == mine:
+            continue
+        groups.setdefault(group, []).append(pid)
+    for group in groups:
+        try:
+            os.killpg(group, signal.SIGTERM)
+        except OSError:
+            pass
+    deadline = time.time() + KILL_GRACE
+    while time.time() < deadline:
+        if not any(process_alive(pid)
+                   for pids in groups.values() for pid in pids):
+            break
+        time.sleep(0.1)
+    for group, pids in groups.items():
+        if any(process_alive(pid) for pid in pids):
+            try:
+                os.killpg(group, signal.SIGKILL)
+            except OSError:
+                pass
+    return [f"stopped pid {pid} in group {group}"
+            for group, pids in groups.items() for pid in pids]
+
+
 # ----- the side effects of a spawn ------------------------------------------
 
 class Spawn:
@@ -945,6 +1076,163 @@ class Spawn:
             raise StepFailure(exc.step, detail) from exc
 
 
+# ----- taking a lane down --------------------------------------------------
+
+# The states a lane may be in when it is taken down: it is waiting for
+# an instruction, or its window is gone.
+FINISHABLE = ("idle", STOPPED)
+
+
+def tree_name(path: Path) -> str:
+    """The builder's name for a worktree.
+
+    The name `lib/common.sh`'s tree_name gives, so the tree the builder
+    holds is the tree this asks to prune.
+    """
+    name = re.sub(r"[^A-Za-z0-9_]", "_", os.path.basename(str(path)))
+    name = re.sub(r"_+", "_", name)
+    return name[:-1] if name.endswith("_") else name
+
+
+def prune_tool() -> Path:
+    """The prune, beside this tool.
+
+    The sibling, not one on PATH: the PATH copy may be another
+    checkout's, and the prune it does is on that checkout's builder.
+    """
+    return Path(__file__).resolve().parent.parent / "bin" / "remote-prune"
+
+
+def worktree_status(worktree: Path) -> str:
+    """What the worktree has changed."""
+    code, out, err = run(["git", "-C", str(worktree), "status", "--porcelain"])
+    if code != 0:
+        raise Refusal("worktree",
+                      f"{worktree} is not a worktree any more: "
+                      f"{CommandError(['git', 'status'], code, err).detail()}; "
+                      f"release the lease instead")
+    return out
+
+
+def worktree_head(worktree: Path) -> str:
+    """The commit the worktree is at."""
+    code, out, err = run(["git", "-C", str(worktree), "rev-parse", "HEAD"])
+    if code != 0:
+        raise Refusal("worktree",
+                      f"{worktree} has no HEAD: "
+                      f"{CommandError(['git', 'rev-parse'], code, err).detail()}")
+    return out.strip()
+
+
+def remote_head(clone: Path, branch: str) -> str:
+    """The commit the remote branch is at, or empty when it is gone."""
+    code, out, err = run(["git", "-C", str(clone), "ls-remote", "origin",
+                          f"refs/heads/{branch}"])
+    if code != 0:
+        raise StepFailure("git", CommandError(["git", "ls-remote"], code,
+                                              err).detail())
+    words = out.split()
+    return words[0] if words else ""
+
+
+def check_finished(lease: sqlite3.Row, pr: PullRequest,
+                   abandon: bool) -> Path:
+    """Refuse unless the lane can be taken down.
+
+    Everything that can refuse is asked before anything is removed.
+    """
+    if abandon:
+        if pr.state != CLOSED:
+            raise Refusal("pr", f"pull request {pr.number} is {pr.state}, not "
+                                f"CLOSED; a merged pull request is finished "
+                                f"with `lane finish`")
+    elif pr.state != MERGED:
+        hint = ("; a closed pull request is taken down with `lane finish "
+                "--abandon`" if pr.state == CLOSED else "")
+        raise Refusal("pr", f"pull request {pr.number} is {pr.state}, not "
+                            f"MERGED{hint}")
+    if lease["state"] not in FINISHABLE:
+        raise Refusal("state", f"lease {lease['id']} is {lease['state']}; "
+                                f"only an idle or a stopped lane can be "
+                                f"taken down")
+    worktree = Path(lease["worktree"])
+    status = worktree_status(worktree)
+    if status.strip():
+        raise Refusal("worktree", f"{worktree} is dirty:\n{status.strip()}")
+    head = worktree_head(worktree)
+    if abandon:
+        remote = remote_head(Path(lease["clone"]), lease["branch"])
+        if not remote:
+            raise Refusal("head", f"the remote branch {lease['branch']} is "
+                                  f"gone, so there is no head to match")
+        if head != remote:
+            raise Refusal("head", f"the worktree is at {head} and the remote "
+                                  f"branch {lease['branch']} at {remote}")
+    else:
+        if not pr.head:
+            raise Refusal("head", f"pull request {pr.number} records no head")
+        if head != pr.head:
+            raise Refusal("head", f"the worktree is at {head} and pull request "
+                                  f"{pr.number}'s head is {pr.head}")
+    return worktree
+
+
+def take_down(conn: sqlite3.Connection, lease: sqlite3.Row,
+              worktree: Path) -> None:
+    """The steps, in order, stopping at the first one that fails. Each step
+    says what it did, so a failure leaves the account of what already
+    went.
+
+    The window goes first, then the processes it left running.
+    """
+    clone = Path(lease["clone"])
+    branch = lease["branch"]
+    if window_exists(lease):
+        code, _, err = run(["tmux", "kill-window", "-t",
+                            window_target(lease)], env=tmux_env())
+        if code != 0:
+            raise StepFailure("window", CommandError(["tmux", "kill-window"],
+                                                      code, err).detail())
+        print(f"closed window {window_target(lease)}")
+    for line in stop_lane_processes(worktree):
+        print(line)
+    code, _, err = run(["git", "-C", str(clone), "worktree", "remove",
+                        str(worktree)])
+    if code != 0:
+        raise StepFailure("worktree", CommandError(["git", "worktree",
+                                                     "remove"], code,
+                                                    err).detail())
+    print(f"removed worktree {worktree}")
+    code, _, err = run(["git", "-C", str(clone), "branch", "-D", branch])
+    if code != 0:
+        raise StepFailure("branch", CommandError(["git", "branch", "-D"], code,
+                                                  err).detail())
+    print(f"deleted branch {branch}")
+    if not remote_head(clone, branch):
+        # The remote branch is gone, so this tracking ref is stale. Only
+        # this one: a prune that dropped every stale ref in the clone
+        # would take other lanes' work with it.
+        code, _, err = run(["git", "-C", str(clone), "update-ref", "-d",
+                            f"refs/remotes/origin/{branch}"])
+        if code != 0:
+            raise StepFailure("branch", CommandError(["git", "update-ref",
+                                                      "-d"], code, err).detail())
+        print(f"deleted refs/remotes/origin/{branch}")
+    tree = tree_name(worktree)
+    code, _, err = run([str(prune_tool()), "--prune", "--tree", tree])
+    if code != 0:
+        # The lane is gone either way, so a prune that failed is
+        # reported and not fatal.
+        print(f"WARN caches: "
+              f"{CommandError(['remote-prune'], code, err).detail()}",
+              file=sys.stderr)
+        print(f"the builder caches for {tree} were not pruned")
+    else:
+        print(f"pruned the builder caches for {tree}")
+    release_lease(conn, lease)
+    print(f"released lease {lease['id']}")
+
+
 # ----- the commands ---------------------------------------------------------
 
 def repo_name(repo: str) -> str:
@@ -1019,27 +1307,71 @@ def cmd_list(args: argparse.Namespace) -> int:
         read_states(conn, leases)
         leases = conn.execute("SELECT * FROM leases ORDER BY id").fetchall()
         now = time.time()
+        records = []
+        for lease in leases:
+            pr = None
+            if lease["state"] != RELEASED:
+                # A released lease holds no branch and no pull request.
+                # Asking again costs a call per finished lane, and the
+                # list grows without bound.
+                try:
+                    pr = find_pr(lease["repo"], lease["branch"])
+                except StepFailure as exc:
+                    print(f"ERR pr: lease {lease['id']}: {exc.detail}",
+                          file=sys.stderr)
+            records.append((lease, lease_record(lease, now, pr)))
         if args.as_json:
-            for lease in leases:
-                print(json.dumps(lease_record(lease, now)))
+            for _, record in records:
+                print(json.dumps(record))
             return 0
         print(f"{'ID':>3}  {'REPO#ISSUE':<28} {'WINDOW':<20} "
-              f"{'SESSION':<12} {'STATE':<9} AGE")
-        for lease in leases:
+              f"{'SESSION':<12} {'STATE':<9} {'PR':>5} {'PRSTATE':<8} AGE")
+        for lease, record in records:
             age = int(max(0.0, now - lease["state_since"]))
             label = f"{lease['repo']}#{lease['issue']}"
+            number = str(record["pr"]) if record["pr"] else "-"
+            state = record["pr_state"] or "-"
             print(f"{lease['id']:>3}  {label:<28} {lease['window']:<20} "
-                  f"{lease['session']:<12} {lease['state']:<9} {age}s")
+                  f"{lease['session']:<12} {lease['state']:<9} {number:>5} "
+                  f"{state:<8} {age}s")
     finally:
         conn.close()
     return 0
 
 
-def lease_record(lease: sqlite3.Row, now: float) -> dict:
+def lease_record(lease: sqlite3.Row, now: float,
+                 pr: PullRequest | None) -> dict:
     """One lease, as it is recorded."""
     record = {key: lease[key] for key in lease.keys()}
     record["state_age_seconds"] = int(max(0.0, now - lease["state_since"]))
+    record["pr"] = pr.number if pr else None
+    record["pr_state"] = pr.state if pr else None
     return record
+
+
+def release_lease(conn: sqlite3.Connection, lease: sqlite3.Row) -> None:
+    """End a lease: close its window, mark it released, take the label off.
+
+    The label goes even for a released lease: a label left on one is the
+    operator's to clean up, and releasing again is how they ask.
+    """
+    if lease["state"] != RELEASED:
+        if window_exists(lease):
+            code, _, err = run(
+                ["tmux", "kill-window", "-t", window_target(lease)],
+                env=tmux_env(),
+            )
+            if code != 0:
+                raise StepFailure("window", CommandError(
+                    ["tmux", "kill-window"], code, err).detail())
+        set_state(conn, lease["id"], RELEASED)
+    code, _, err = run(
+        ["gh", "issue", "edit", str(lease["issue"]), "--repo",
+         lease["repo"], "--remove-label", LABEL],
+    )
+    if code != 0:
+        raise StepFailure("label", CommandError(
+            ["gh", "issue", "edit"], code, err).detail())
 
 
 def cmd_release(args: argparse.Namespace) -> int:
@@ -1051,30 +1383,59 @@ def cmd_release(args: argparse.Namespace) -> int:
                              (args.lease,)).fetchone()
         if lease is None:
             raise Refusal("lease", f"no lease {args.lease}")
-        if lease["state"] != RELEASED:
-            if window_exists(lease):
-                code, _, err = run(
-                    ["tmux", "kill-window", "-t", window_target(lease)],
-                    env=tmux_env(),
-                )
-                if code != 0:
-                    raise StepFailure("window", CommandError(
-                        ["tmux", "kill-window"], code, err).detail())
-            set_state(conn, lease["id"], RELEASED)
-        # The label goes whether the lease was live or already released: a
-        # released lease whose issue still carries the label is the state
-        # the operator has to clean up, and releasing again is how they
-        # ask for it.
-        code, _, err = run(
-            ["gh", "issue", "edit", str(lease["issue"]), "--repo",
-             lease["repo"], "--remove-label", LABEL],
-        )
-        if code != 0:
-            raise StepFailure("label", CommandError(
-                ["gh", "issue", "edit"], code, err).detail())
+        release_lease(conn, lease)
     finally:
         conn.close()
     return 0
+
+
+def cmd_finish(args: argparse.Namespace) -> int:
+    """Take a finished lane down."""
+    if args.abandon and args.merged:
+        raise Refusal("usage", "--abandon and --merged cannot be combined")
+    conn = open_db()
+    try:
+        reconcile(conn)
+        read_states(conn, conn.execute(
+            "SELECT * FROM leases ORDER BY id").fetchall())
+        if args.merged:
+            return finish_merged(conn)
+        if args.lease is None:
+            raise Refusal("usage", "which lease? give a lease number, or "
+                                   "--merged for every lane whose pull "
+                                   "request merged")
+        lease = conn.execute("SELECT * FROM leases WHERE id = ?",
+                             (args.lease,)).fetchone()
+        if lease is None:
+            raise Refusal("lease", f"no lease {args.lease}")
+        pr = find_pr(lease["repo"], lease["branch"])
+        if pr is None:
+            raise Refusal("pr", f"no pull request for branch {lease['branch']}")
+        worktree = check_finished(lease, pr, args.abandon)
+        take_down(conn, lease, worktree)
+    finally:
+        conn.close()
+    return 0
+
+
+def finish_merged(conn: sqlite3.Connection) -> int:
+    """Take down every live lane whose pull request merged.
+
+    Each lane stands on its own: one that refuses is reported, and the
+    rest still go.
+    """
+    failures = 0
+    for lease in live_leases(conn):
+        try:
+            pr = find_pr(lease["repo"], lease["branch"])
+            if pr is None or pr.state != MERGED:
+                continue
+            worktree = check_finished(lease, pr, False)
+            take_down(conn, lease, worktree)
+        except (Refusal, StepFailure) as exc:
+            failures += 1
+            print(f"ERR lease {lease['id']}: {exc.detail}", file=sys.stderr)
+    return 1 if failures else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1107,12 +1468,21 @@ def main(argv: list[str] | None = None) -> int:
     release = commands.add_parser("release", help="end a lease")
     release.add_argument("lease", type=int, help="the lease number")
 
+    finish = commands.add_parser("finish", help="take a finished lane down")
+    finish.add_argument("lease", type=int, nargs="?", help="the lease number")
+    finish.add_argument("--merged", action="store_true",
+                        help="take down every lane whose pull request merged")
+    finish.add_argument("--abandon", action="store_true",
+                        help="take down a lane whose pull request was closed")
+
     args = parser.parse_args(argv)
     try:
         if args.command == "spawn":
             return cmd_spawn(args)
         if args.command == "list":
             return cmd_list(args)
+        if args.command == "finish":
+            return cmd_finish(args)
         return cmd_release(args)
     except Refusal as exc:
         print(f"ERR {exc.key}: {exc.detail}", file=sys.stderr)
