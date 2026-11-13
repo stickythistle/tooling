@@ -39,6 +39,10 @@ FIXTURES = Path(__file__).resolve().parent / "fixtures" / "main_watch_run"
 TEST_TOKEN = "test-token-main-watch-run-0c7e1f9a4b2d"
 TEST_CHAT = "123456789"
 
+# The token the stub relay is given. It is the host's own client
+# token, so it is a secret of the same kind as the bot token.
+TEST_RELAY_TOKEN = "test-token-main-watch-relay-3f9a1c7e5b2d"
+
 
 def check(label: str, condition: bool, detail: str = "") -> None:
     if not condition:
@@ -104,6 +108,99 @@ class TelegramStub:
     @property
     def messages(self) -> list[str]:
         return [r["text"] for r in self.requests]
+
+
+# ----- the relay stub -------------------------------------------------------
+
+class RelayStub:
+    """A local http.server that stands in for a notify relay.
+
+    `statuses` is the list of statuses it answers with, one per
+    request, so a relay that is scripted to fail once and then work
+    answers 500 and then 202. The last status repeats when there are
+    more requests than statuses, and `default` answers the requests
+    past the end of the list.
+
+    Every request is recorded with its URL, its authorization header
+    and its body, so a test can check where the token went.
+    """
+
+    def __init__(self, statuses: list[int] | None = None,
+                 default: int = 202) -> None:
+        self.statuses = list(statuses or [])
+        self.default = default
+        self.requests: list[dict] = []
+        self._server: HTTPServer | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> str:
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_a: object, **_k: object) -> None:
+                return  # silence stderr noise during tests
+
+            def do_POST(self) -> None:  # noqa: N802 -- http.server contract
+                length = int(self.headers.get("Content-Length", "0") or 0)
+                raw = self.rfile.read(length) if length else b""
+                host = self.headers.get("Host", "")
+                outer.requests.append({
+                    "url": f"http://{host}{self.path}",
+                    "path": self.path,
+                    "authorization": self.headers.get("Authorization", ""),
+                    "content_type": self.headers.get("Content-Type", ""),
+                    "body": raw.decode("utf-8", "replace"),
+                })
+                index = len(outer.requests) - 1
+                if index < len(outer.statuses):
+                    status = outer.statuses[index]
+                else:
+                    status = outer.default
+                body = b'{"accepted": true}'
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+        sock.close()
+        self._server = HTTPServer(("127.0.0.1", port), Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever,
+                                        daemon=True)
+        self._thread.start()
+        self.port = port
+        return f"http://127.0.0.1:{port}"
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+
+    @property
+    def texts(self) -> list[str]:
+        """The text of every message that came in."""
+        out = []
+        for request in self.requests:
+            try:
+                payload = json.loads(request["body"])
+            except json.JSONDecodeError:
+                out.append("")
+                continue
+            out.append(payload.get("text", "")
+                       if isinstance(payload, dict) else "")
+        return out
+
+
+def closed_port_url() -> str:
+    """A URL on a port with nothing listening on it."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
+    sock.close()
+    return f"http://127.0.0.1:{port}"
 
 
 # ----- the gh and main-watch stubs ------------------------------------------
@@ -386,6 +483,21 @@ def write_env(tmp: Path, *, token: str = TEST_TOKEN, chat: str = TEST_CHAT,
     return str(env_path)
 
 
+def write_relay_env(tmp: Path, urls: list[str], token: str | None,
+                    path: str = "relay-env") -> str:
+    """The env file that selects the relay path, and the path to it.
+
+    `token` is None when the file carries the URLs and no token, which
+    is a configuration the tool has to refuse.
+    """
+    lines = [f"NOTIFY_RELAY_URLS={' '.join(urls)}"]
+    if token is not None:
+        lines.append(f"NOTIFY_RELAY_TOKEN={token}")
+    env_path = tmp / path
+    env_path.write_text("\n".join(lines) + "\n")
+    return str(env_path)
+
+
 def run_runner(tmp: Path, bin_dir: Path, telegram_url: str,
                env_file: str | None, *args: str):
     """Run the tool with the stubs in place."""
@@ -407,6 +519,15 @@ def run_runner(tmp: Path, bin_dir: Path, telegram_url: str,
         [str(RUNNER), *args], capture_output=True, text=True, check=False,
         env=env,
     )
+
+
+def run_relay_runner(tmp: Path, bin_dir: Path, env_file: str | None,
+                     *args: str):
+    """Run the tool with a relay in the env file.
+
+    The relay path skips the Telegram API, so no stub is named.
+    """
+    return run_runner(tmp, bin_dir, "", env_file, *args)
 
 
 def state_file(tmp: Path, repo: str = "owner/repo") -> Path:
@@ -1296,6 +1417,314 @@ def test_the_checkouts_own_main_watch_wins_over_the_path() -> None:
             stub.stop()
 
 
+def test_the_relay_delivers_the_message() -> None:
+    """A 202 from the first relay delivers, and the second is left alone.
+
+    The relay delivers the message itself, so an accepted message ends
+    this tool's part.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        first = RelayStub()
+        second = RelayStub()
+        first_url = first.start()
+        second_url = second.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [first_url, second_url],
+                                       TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run succeeded", result.returncode == 0,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the first relay was asked", len(first.requests) == 1,
+                  str(first.requests))
+            check("the second relay was not asked", second.requests == [],
+                  str(second.requests))
+            check("one message was delivered", len(first.texts) == 1,
+                  str(first.texts))
+            text = first.texts[0]
+            check("the repository is named", "owner/repo" in text, text)
+            check("the failing check is named", "Gates" in text, text)
+            # The position moved: the message went out.
+            check("the position moved",
+                  state_file(tmp).read_text().strip() == "sha-new",
+                  state_file(tmp).read_text())
+        finally:
+            first.stop()
+            second.stop()
+
+
+def test_a_failing_relay_falls_through_to_the_next() -> None:
+    """A 500 from the first relay falls through to the second.
+
+    A relay that is down is the relay's problem, so the next URL is
+    tried and the message is delivered there.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        first = RelayStub(statuses=[500])
+        second = RelayStub()
+        first_url = first.start()
+        second_url = second.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [first_url, second_url],
+                                       TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run succeeded", result.returncode == 0,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the first relay was asked", len(first.requests) == 1,
+                  str(first.requests))
+            check("the second relay was asked", len(second.requests) == 1,
+                  str(second.requests))
+            check("the message reached the second relay",
+                  len(second.texts) == 1, str(second.texts))
+            check("the token is in no output",
+                  TEST_RELAY_TOKEN not in result.stdout
+                  and TEST_RELAY_TOKEN not in result.stderr,
+                  f"{result.stdout!r} {result.stderr!r}")
+        finally:
+            first.stop()
+            second.stop()
+
+
+def test_an_unreachable_relay_falls_through_to_the_next() -> None:
+    """A relay that cannot be reached falls through to the next.
+
+    A closed port is the relay being down, not the client being
+    refused, so the next URL is tried.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        second = RelayStub()
+        second_url = second.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(
+                tmp, [closed_port_url(), second_url], TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run succeeded", result.returncode == 0,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the second relay was asked", len(second.requests) == 1,
+                  str(second.requests))
+            check("the message reached the second relay",
+                  len(second.texts) == 1, str(second.texts))
+        finally:
+            second.stop()
+
+
+def test_a_refused_relay_fails_the_run_and_names_it() -> None:
+    """A 4xx fails the run, naming the relay and its status.
+
+    The relay refused this client: a revoked or a mistyped token. That
+    is a fault in this host's configuration, so it stays loud, and no
+    other relay is tried -- a working fallback would hide a revoked
+    token behind it.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        first = RelayStub(statuses=[401])
+        second = RelayStub()
+        first_url = first.start()
+        second_url = second.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [first_url, second_url],
+                                       TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run failed", result.returncode == 1,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the failure names the relay", first_url in result.stderr,
+                  result.stderr)
+            check("the failure names the status", "401" in result.stderr,
+                  result.stderr)
+            check("the second relay was not asked", second.requests == [],
+                  str(second.requests))
+            check("the position did not move", not state_file(tmp).exists(),
+                  state_file(tmp).read_text()
+                  if state_file(tmp).exists() else "")
+            check("the token is in no output",
+                  TEST_RELAY_TOKEN not in result.stdout
+                  and TEST_RELAY_TOKEN not in result.stderr,
+                  f"{result.stdout!r} {result.stderr!r}")
+        finally:
+            first.stop()
+            second.stop()
+
+
+def test_every_relay_failing_names_each_of_them() -> None:
+    """When every relay has failed, the failure names each one.
+
+    The operator has to know which relays were tried and what each of
+    them said, or the fix is a guess.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        first = RelayStub(statuses=[500])
+        second = RelayStub(statuses=[503])
+        first_url = first.start()
+        second_url = second.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [first_url, second_url],
+                                       TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run failed", result.returncode == 1,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the first relay is named", first_url in result.stderr,
+                  result.stderr)
+            check("the second relay is named", second_url in result.stderr,
+                  result.stderr)
+            check("the first status is named", "500" in result.stderr,
+                  result.stderr)
+            check("the second status is named", "503" in result.stderr,
+                  result.stderr)
+        finally:
+            first.stop()
+            second.stop()
+
+
+def test_the_relay_token_is_in_the_header_and_nowhere_else() -> None:
+    """The token rides in the authorization header, and nowhere else.
+
+    The relay reads the token from the header. A token in the URL or
+    in the body would be written down somewhere the relay keeps, and
+    a log is a place a token must not be.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        relay = RelayStub()
+        url = relay.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [url], TEST_RELAY_TOKEN)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run succeeded", result.returncode == 0,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the relay was asked", len(relay.requests) == 1,
+                  str(relay.requests))
+            request = relay.requests[0]
+            check("the token is in the header",
+                  request["authorization"] == f"Bearer {TEST_RELAY_TOKEN}",
+                  str(request))
+            check("the token is not in the URL",
+                  TEST_RELAY_TOKEN not in request["url"], str(request))
+            check("the token is not in the body",
+                  TEST_RELAY_TOKEN not in request["body"], str(request))
+            check("the send is at the relay's send path",
+                  request["path"] == "/send", str(request))
+            check("the body is json",
+                  request["content_type"] == "application/json",
+                  str(request))
+            body = json.loads(request["body"])
+            check("the body carries the text", "text" in body, str(body))
+            check("the body carries nothing else", list(body) == ["text"],
+                  str(body))
+        finally:
+            relay.stop()
+
+
+def test_an_env_file_with_only_the_relay_variables_loads() -> None:
+    """The relay path needs no Telegram credentials.
+
+    The point of the relay is that this host holds no bot token, so an
+    env file with the relay variables alone is a complete
+    configuration.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        relay = RelayStub()
+        url = relay.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [url], TEST_RELAY_TOKEN)
+            check("the env file carries no Telegram key",
+                  "TELEGRAM" not in Path(env_file).read_text(),
+                  Path(env_file).read_text())
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run succeeded", result.returncode == 0,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            check("the message was delivered", len(relay.texts) == 1,
+                  str(relay.texts))
+        finally:
+            relay.stop()
+
+
+def test_relay_urls_without_a_token_are_refused_by_name() -> None:
+    """The relay URLs without a token are refused, naming the variable.
+
+    A relay path with no token would post a message the relay refuses,
+    once per run. The refusal names the variable, so the operator
+    knows which one to write.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        relay = RelayStub()
+        url = relay.start()
+        try:
+            bin_dir = write_stubs(
+                tmp,
+                commits=["sha-new", "sha-old"],
+                verdicts={"sha-new": verdict("broke", ["Gates"])},
+                pulls={},
+            )
+            env_file = write_relay_env(tmp, [url], None)
+
+            result = run_relay_runner(tmp, bin_dir, env_file, "owner/repo")
+            check("the run refused", result.returncode == 2,
+                  f"exit {result.returncode}: {result.stderr!r}")
+            lines = [ln for ln in result.stderr.splitlines() if ln.strip()]
+            check("one line was printed", len(lines) == 1, str(lines))
+            check("the line names the variable",
+                  bool(lines) and "NOTIFY_RELAY_TOKEN" in lines[0], str(lines))
+            check("nothing was sent", relay.requests == [],
+                  str(relay.requests))
+        finally:
+            relay.stop()
+
+
 def main() -> int:
     failures: list[str] = []
     for name, fn in [
@@ -1339,6 +1768,22 @@ def main() -> int:
          test_the_scrub_takes_the_token_out_of_a_message),
         ("the checkout's own main-watch wins over the path",
          test_the_checkouts_own_main_watch_wins_over_the_path),
+        ("the relay delivers the message",
+         test_the_relay_delivers_the_message),
+        ("a failing relay falls through to the next",
+         test_a_failing_relay_falls_through_to_the_next),
+        ("an unreachable relay falls through to the next",
+         test_an_unreachable_relay_falls_through_to_the_next),
+        ("a refused relay fails the run and names it",
+         test_a_refused_relay_fails_the_run_and_names_it),
+        ("every relay failing names each of them",
+         test_every_relay_failing_names_each_of_them),
+        ("the relay token is in the header and nowhere else",
+         test_the_relay_token_is_in_the_header_and_nowhere_else),
+        ("an env file with only the relay variables loads",
+         test_an_env_file_with_only_the_relay_variables_loads),
+        ("relay urls without a token are refused by name",
+         test_relay_urls_without_a_token_are_refused_by_name),
     ]:
         try:
             fn()

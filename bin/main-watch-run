@@ -5,14 +5,18 @@
 
 Run from a timer. For each repository it walks the commits on `main`
 since the commit it last judged, asks `main-watch` about each one, and
-sends a Telegram message when a commit broke `main`.
+sends a message when a commit broke `main`.
 
 The position is kept per repository, under `$XDG_STATE_HOME`, so a
 second run over the same commits judges nothing and says nothing.
 
-The bot token and the chat id come from the env file `MAIN_WATCH_ENV`
-names. The token is in the Telegram URL, so every message that leaves
-here is scrubbed of it first.
+Where the message goes comes from the env file `MAIN_WATCH_ENV`
+names, which holds either the relay settings or the Telegram ones.
+When `NOTIFY_RELAY_URLS` is not empty, the message goes to a notify
+relay, which holds the bot token and gives the host a client token
+of its own that can be cut off without touching the other hosts.
+Otherwise it goes to Telegram, whose URL carries the bot token, so
+every message that leaves here is scrubbed of it first.
 """
 from __future__ import annotations
 
@@ -20,6 +24,7 @@ import argparse
 import json
 import os
 import re
+import ssl
 import subprocess
 import sys
 import urllib.error
@@ -58,6 +63,9 @@ REPO_RE = re.compile(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$")
 # never runs again.
 TELEGRAM_TIMEOUT_S = 30
 
+# How long to wait for a relay, for the same reason.
+RELAY_TIMEOUT_S = 30
+
 
 class ConfigError(Exception):
     """The env file is missing something the run needs."""
@@ -65,6 +73,35 @@ class ConfigError(Exception):
 
 class RunError(Exception):
     """A step of the run failed. The position does not move."""
+
+
+class Notifier:
+    """Where a message goes.
+
+    The relay path posts to a notify relay with a client token of its
+    own, no bot token; the Telegram path posts to Telegram with the
+    bot token. One `send` picks the path.
+    """
+
+    def __init__(self, relay_urls: list[str] | None = None,
+                 relay_token: str = "", telegram_token: str = "",
+                 telegram_chat: str = "") -> None:
+        self.relay_urls = list(relay_urls or [])
+        self.relay_token = relay_token
+        self.telegram_token = telegram_token
+        self.telegram_chat = telegram_chat
+
+    @property
+    def secrets(self) -> tuple[str, ...]:
+        """The tokens that must not appear in any output."""
+        return tuple(t for t in (self.telegram_token, self.relay_token) if t)
+
+    def send(self, text: str) -> None:
+        """Send one message, whichever way this notifier was set up."""
+        if self.relay_urls:
+            send_to_relay(self.relay_urls, self.relay_token, text)
+        else:
+            send_message(self.telegram_token, self.telegram_chat, text)
 
 
 def read_env(path: Path) -> dict:
@@ -86,8 +123,11 @@ def read_env(path: Path) -> dict:
     return values
 
 
-def load_config() -> tuple[str, str]:
-    """The bot token and the chat id, or a refusal naming what is missing.
+def load_config() -> Notifier:
+    """Where the messages go, or a refusal naming what is missing.
+
+    The relay settings win when `NOTIFY_RELAY_URLS` is not empty;
+    without them the Telegram path is used.
 
     The token is never part of the refusal: a refusal is printed, and a
     printed token is a leaked token.
@@ -99,8 +139,15 @@ def load_config() -> tuple[str, str]:
     if not path.is_file():
         raise ConfigError(f"the env file {named} does not exist")
     values = read_env(path)
+    urls = values.get("NOTIFY_RELAY_URLS", "").split()
+    relay_token = values.get("NOTIFY_RELAY_TOKEN", "").strip()
     token = values.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat = values.get("TELEGRAM_CHAT_ID", "").strip()
+    if urls:
+        if not relay_token:
+            raise ConfigError(f"{named} is missing NOTIFY_RELAY_TOKEN")
+        return Notifier(relay_urls=urls, relay_token=relay_token,
+                        telegram_token=token, telegram_chat=chat)
     missing = []
     if not token:
         missing.append("TELEGRAM_BOT_TOKEN")
@@ -108,7 +155,7 @@ def load_config() -> tuple[str, str]:
         missing.append("TELEGRAM_CHAT_ID")
     if missing:
         raise ConfigError(f"{named} is missing {', '.join(missing)}")
-    return token, chat
+    return Notifier(telegram_token=token, telegram_chat=chat)
 
 
 def state_dir() -> Path:
@@ -140,14 +187,19 @@ def write_state(repo: str, sha: str) -> None:
     path.write_text(sha + "\n")
 
 
-def redact(text: str, token: str) -> str:
-    """Take the bot token out of a message before it is printed.
+def redact(text: str, *tokens: str) -> str:
+    """Take the tokens out of a message before it is printed.
 
-    The token is in the Telegram URL. Text the tool did not write
-    itself may carry that URL, so the token is taken out of every
-    message that leaves here.
+    The bot token is in the Telegram URL and the relay token is in an
+    authorization header, so a message the tool did not write itself
+    can carry either.
     """
-    return text.replace(token, "[redacted]")
+    # An empty token is not a token: replacing it would put the marker
+    # between every character of the text.
+    for token in tokens:
+        if token:
+            text = text.replace(token, "[redacted]")
+    return text
 
 
 def gh(endpoint: str, *args: str) -> str:
@@ -306,6 +358,54 @@ def send_message(token: str, chat: str, text: str) -> None:
         raise RunError(f"telegram: sendMessage did not succeed: {parsed!r}")
 
 
+def post_to_relay(endpoint: str, token: str, text: str) -> int:
+    """Post one message to a relay, and return the status it answered.
+
+    The token rides in the `Authorization` header and nowhere else.
+    """
+    body = json.dumps({"text": text}).encode("utf-8")
+    # In the URL or in the body it would reach a log the relay keeps.
+    request = urllib.request.Request(
+        endpoint, data=body, method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {token}"},
+    )
+    # The system trust store verifies the relay's certificate.
+    with urllib.request.urlopen(request, timeout=RELAY_TIMEOUT_S,
+                                context=ssl.create_default_context()) as resp:
+        return resp.status
+
+
+def send_to_relay(urls: list[str], token: str, text: str) -> None:
+    """Post one message to the first relay that takes it.
+
+    A 4xx means the relay refused this client, so no other relay is
+    tried; a 5xx or an unreachable relay falls through to the next URL.
+    """
+    failures = []
+    for url in urls:
+        endpoint = f"{url.rstrip('/')}/send"
+        try:
+            status = post_to_relay(endpoint, token, text)
+        except urllib.error.HTTPError as exc:
+            if 400 <= exc.code < 500:
+                # A working fallback would hide a revoked token.
+                raise RunError(
+                    f"relay {endpoint}: HTTP {exc.code}: "
+                    f"the relay refused this client") from exc
+            failures.append(f"{endpoint}: HTTP {exc.code}")
+        except (urllib.error.URLError, OSError) as exc:
+            # The relay is down, so the next URL is tried.
+            failures.append(f"{endpoint}: {exc}")
+        else:
+            if 200 <= status < 300:
+                # The relay spools the message and delivers it itself.
+                return
+            failures.append(f"{endpoint}: HTTP {status}")
+    raise RunError("relay: no relay took the message: "
+                   + "; ".join(failures))
+
+
 def short(sha: str) -> str:
     """The short form of a commit sha, for the message."""
     return sha[:7]
@@ -400,7 +500,7 @@ def commits_to_judge(repo: str, stored: str) -> tuple[list[str], bool]:
     return shas, False
 
 
-def run_repo(repo: str, token: str, chat: str) -> int:
+def run_repo(repo: str, notifier: Notifier) -> int:
     """Judge one repository's new commits. Returns the exit code."""
     stored = read_state(repo)
     todo, reset = commits_to_judge(repo, stored)
@@ -408,7 +508,7 @@ def run_repo(repo: str, token: str, chat: str) -> int:
         # The branch was rewritten under the position, so the commits
         # the position named are gone. The operator hears that once,
         # and the head is judged alone.
-        send_message(token, chat, reset_message(repo, stored))
+        notifier.send(reset_message(repo, stored))
     if not todo:
         # The head is the commit already judged: nothing new.
         return 0
@@ -425,7 +525,7 @@ def run_repo(repo: str, token: str, chat: str) -> int:
             # and a red that arrives later would never be reported.
             return 0
         if kind == KIND_BROKE:
-            send_message(token, chat, message_for(repo, sha, kind, payload))
+            notifier.send(message_for(repo, sha, kind, payload))
             write_state(repo, sha)
             reported_red = True
             continue
@@ -433,7 +533,7 @@ def run_repo(repo: str, token: str, chat: str) -> int:
             if not reported_red:
                 # The red run starts here. One message for the run, not
                 # one per commit.
-                send_message(token, chat, message_for(repo, sha, kind, payload))
+                notifier.send(message_for(repo, sha, kind, payload))
                 reported_red = True
             write_state(repo, sha)
             continue
@@ -459,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     try:
-        token, chat = load_config()
+        notifier = load_config()
     except ConfigError as exc:
         print(f"ERR config: {exc}", file=sys.stderr)
         return 2
@@ -471,10 +571,11 @@ def main(argv: list[str] | None = None) -> int:
     failures = []
     for repo in args.repos:
         try:
-            run_repo(repo, token, chat)
+            run_repo(repo, notifier)
         except RunError as exc:
             failures.append(repo)
-            print(f"ERR {repo}: {redact(str(exc), token)}", file=sys.stderr)
+            print(f"ERR {repo}: {redact(str(exc), *notifier.secrets)}",
+                  file=sys.stderr)
     return 1 if failures else 0
 
 
