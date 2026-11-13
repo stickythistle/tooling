@@ -1,0 +1,11 @@
+# The optional teammate check in pr-ready: the candidate the binding's
+# policy picks, the backend it runs, what it posts, and the refusal while
+# one of its findings is unanswered.
+
+# `lib/teammate.py` is in the `when`: the suite drives the check through
+# pr-ready, and the check is built from that module.
+
+[[gates]]
+name = "pr-ready teammate tests"
+when = '^(bin/pr-ready|lib/teammate\.py|tests/test_pr_ready_teammate\.py|tests/roles_fixture\.py)$'
+run = "python3 tests/test_pr_ready_teammate.py"

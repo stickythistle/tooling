@@ -29,6 +29,7 @@ set -euo pipefail
 usage() {
 	cat <<'EOF'
 usage: pr-ready <PR> [worktree] [--check] [--no-verify] [--no-condense]
+                 [--teammate[=BACKEND] --implementer-model MODEL]
 
 Marks PR ready for review, but only if all of these hold:
 
@@ -43,6 +44,16 @@ Marks PR ready for review, but only if all of these hold:
     no workflows, where no CI applies
   - gate-verify passes on the worktree
   - condense-prose flags nothing in the diff
+  - with --teammate: a model of another family than the implementer's has
+    read the head, and every finding it raised has been answered
+
+--teammate runs the optional teammate check: a second model reads the
+change, its findings are posted as a review, and the PR stays in draft
+until each of them is answered. --teammate=BACKEND names the backend to
+run (kind:arg); without it the role binding's candidates are taken by the
+binding's policy. --implementer-model names the model the implementer ran
+and is required with --teammate: the teammate has to be of another
+family than the implementer, and the ledger records both.
 
 --check reports the verdict and changes nothing; exit 1 if it would refuse.
 --no-verify skips the gate-verify run when CI has already covered it. It does
@@ -58,7 +69,12 @@ EOF
 PR="$1"; shift
 [[ "$PR" =~ ^[0-9]+$ ]] || usage
 
+# The tools this script runs beside its own: the teammate check, and the
+# library it reads the role binding through.
+LIB=$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib" && pwd)
+
 WORKTREE="" CHECK=0 VERIFY=1 CONDENSE=1
+TEAMMATE=0 TEAMMATE_BACKEND="" IMPLEMENTER_MODEL=""
 BASE_REF=${PR_READY_BASE:-origin/main}
 FIND_PROSE=${CONDENSE_PROSE:-$HOME/.claude/skills/condense-prose/find_prose.py}
 while [ $# -gt 0 ]; do
@@ -66,10 +82,23 @@ while [ $# -gt 0 ]; do
 	--check) CHECK=1; shift ;;
 	--no-verify) VERIFY=0; shift ;;
 	--no-condense) CONDENSE=0; shift ;;
+	--teammate) TEAMMATE=1; shift ;;
+	--teammate=*) TEAMMATE=1; TEAMMATE_BACKEND="${1#--teammate=}"; shift ;;
+	--implementer-model)
+		[ $# -ge 2 ] || usage
+		IMPLEMENTER_MODEL="$2"; shift 2 ;;
+	--implementer-model=*)
+		IMPLEMENTER_MODEL="${1#--implementer-model=}"; shift ;;
 	-h | --help) usage ;;
 	*) [ -z "$WORKTREE" ] || usage; WORKTREE="$1"; shift ;;
 	esac
 done
+# The teammate has to be of another family than the implementer's, and
+# the ledger records both, so the flag is required.
+if [ "$TEAMMATE" -eq 1 ] && [ -z "$IMPLEMENTER_MODEL" ]; then
+	echo "pr-ready: --teammate needs --implementer-model: the teammate has to be of another family than the implementer's" >&2
+	usage
+fi
 SRC=$(cd "${WORKTREE:-$PWD}" && git rev-parse --show-toplevel)
 # Everything below asks a question about that worktree: gh resolves the
 # repository from the directory it runs in, and the prose finder resolves --diff
@@ -290,6 +319,42 @@ if [ -x "$FIND_PROSE" ]; then
 	fi
 else
 	echo "note: condense-prose not installed at $FIND_PROSE, skipping body check" >&2
+fi
+
+# The teammate check: a second model, of another family than the
+# implementer's, reads the change before the PR leaves draft. It posts
+# what it finds where the implementer has to answer it.
+
+# It refuses while any of it is unanswered, and it runs last, after
+# everything else is green: the model it spends is the operator's.
+if [ "$TEAMMATE" -eq 1 ]; then
+	echo "==> teammate check" >&2
+	REPO=$(gh repo view --json nameWithOwner --jq .nameWithOwner) || {
+		refuse "could not tell which repository this pull request is in"
+		report
+	}
+	TEAM_ERR=$(mktemp -t pr-ready-teammate-err-XXXXXX)
+	TEAM_ARGS=(check --repo "$REPO" --pr "$PR" --worktree "$SRC"
+		--head "$HEAD_OID" --base "$BASE_REF"
+		--implementer-model "$IMPLEMENTER_MODEL")
+	if [ -n "$TEAMMATE_BACKEND" ]; then
+		TEAM_ARGS+=(--backend "$TEAMMATE_BACKEND")
+	fi
+	if [ "$CHECK" -eq 1 ]; then
+		TEAM_ARGS+=(--dry-run)
+	fi
+	if TEAM_OUT=$(python3 "$LIB/teammate.py" "${TEAM_ARGS[@]}" 2>"$TEAM_ERR"); then
+		printf '%s\n' "$TEAM_OUT" >&2
+		rm -f "$TEAM_ERR"
+	else
+		TEAM_MSG=$(cat "$TEAM_ERR")
+		rm -f "$TEAM_ERR"
+		# What the check said on its way out is reported either way: a
+		# finding it dropped is a finding the implementer never saw.
+		printf '%s\n' "$TEAM_OUT" >&2
+		refuse "teammate check: $TEAM_MSG"
+		report
+	fi
 fi
 
 if [ "$CHECK" -eq 1 ]; then
