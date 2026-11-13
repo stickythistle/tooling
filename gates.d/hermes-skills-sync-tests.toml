@@ -1,8 +1,11 @@
 # The install that puts the repository's skills into the trees a lane loads
 # them from. The check refuses a dispatch whose skill differs from the
 # repository's copy. The suite runs against an isolated HERMES_HOME.
+#
+# The `when` covers the whole tree, wider than the paths the suite opens: the
+# tool syncs every skill, so a bump to any can break a case.
 
 [[gates]]
 name = "hermes-skills-sync tests"
-when = '^(bin/hermes-skills-sync|lib/common\.sh|bin/hermes-implement|bin/agent-fix-pr|pipeline/review\.sh|install/live-checkout/setup\.sh|tests/test_hermes_skills_sync\.py)$'
+when = '^(bin/hermes-skills-sync|lib/common\.sh|bin/hermes-implement|bin/agent-fix-pr|pipeline/review\.sh|install/live-checkout/setup\.sh|tests/test_hermes_skills_sync\.py)$|^skills/'
 run = "python3 tests/test_hermes_skills_sync.py"
