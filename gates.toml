@@ -465,3 +465,11 @@ run = "python3 tests/test_bakeoff_proxy.py"
 name = "bakeoff tests"
 when = '^(bin/bakeoff-run|bin/bakeoff-report|lib/bakeoff\.py|tests/test_bakeoff\.py)$'
 run = "python3 tests/test_bakeoff.py"
+
+# The lane registry: one database that owns which lanes are running. The
+# gate names the tool and the library it is built from, because a change
+# to either is a change to the claim.
+[[gates]]
+name = "lane registry tests"
+when = '^(bin/lane|lib/lane\.py|tests/test_lane\.py)$'
+run = "python3 tests/test_lane.py"

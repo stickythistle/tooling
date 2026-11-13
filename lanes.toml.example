@@ -1,0 +1,31 @@
+# Copy to ~/.config/agent-tools/lanes.toml and fill in. The tool reads it
+# from there, or from $LANE_CONFIG, and refuses a key it cannot act on.
+# Every value here is a placeholder.
+
+tmux_session = "0"          # tmux target session
+worktree_root = "~/wt"      # default worktree: <root>/<repo name>-<issue>
+ready_seconds = 8           # wait after starting a harness, before it is used
+
+# A pool is a cap; a profile's cost is what it takes from its pool.
+[pools]
+minimax = 4
+logan = 2
+
+[profiles.minimax]
+pool = "minimax"
+cost = 1
+model = "MiniMax"           # regex the pane footer must match; else `fallback`
+
+[profiles.flashnext512]
+pool = "logan"
+cost = 2
+model = "flash-next-512k"
+
+[harnesses.hermes]
+launch = "~/.local/bin/hermes -p {profile}"
+
+[harnesses.pi]
+launch = "~/pi-lane/pi-lane.sh {window} {profile}"
+
+[repos."stickythistle/tooling"]
+clone = "~/tooling-fixpr"
