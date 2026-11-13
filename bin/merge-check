@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import roles  # noqa: E402
 from merge_check import MergeOutcome, decide  # noqa: E402
 from pr_gate import failed_check_names, pending_checks  # noqa: E402
 
@@ -233,34 +234,25 @@ def merge_outcome(repo_dir: str, base_tip: str, head: str) -> MergeOutcome:
     return MergeOutcome("error", detail=reason)
 
 
-def lane_identity(repo_dir: str) -> tuple[str, str]:
-    """The identity the commits must carry: the lane's, as the harness
-    pins it elsewhere.
+def lane_identity(binding, repo: str) -> tuple[str, str]:
+    """The identity the commits must carry: the binding's, for this
+    repository.
 
-    `LANE_GIT_NAME` and `LANE_GIT_EMAIL` are the only source, and one
-    alone refuses. The error message says why the checkout's git config
-    is never consulted.
+    A repository may bind an identity of its own -- a DCO sign-off has
+    to match the author -- and every other repository takes the default.
     """
-    name = os.environ.get("LANE_GIT_NAME", "").strip()
-    email = os.environ.get("LANE_GIT_EMAIL", "").strip()
-    if not name or not email:
-        raise FetchError(
-            "cannot pin the lane identity: set LANE_GIT_NAME and "
-            "LANE_GIT_EMAIL to the identity the commits must carry. The "
-            "checkout's git config is not used: it says what this "
-            "machine would commit as, not what the repository requires")
-    return name, email
+    identity = binding.lane_identity(repo)
+    return identity.name, identity.email
 
 
-def review_login(repo: str, reviewer: str | None) -> str:
+def review_login(binding, repo: str, reviewer: str | None) -> str:
     """The login whose review counts as the review.
 
-    The reviewer is the repository's owner unless told otherwise: the
-    same rule `pr-loop-gate` uses, so the two tools agree about whose
-    review is the review.
+    The reviewer is the login the role binding maps the repository's
+    owner to, unless told otherwise: the same rule `pr-loop-gate` uses,
+    so the two tools agree about whose review is the review.
     """
-    return (reviewer or os.environ.get("REVIEWER_LOGIN")
-            or repo.split("/", 1)[0])
+    return reviewer or binding.owner_login(repo)
 
 
 def latest_review_sha(reviews: list, reviewer: str) -> str:
@@ -434,7 +426,8 @@ def main(argv: list[str] | None = None) -> int:
                         help="the identity's email (default: the lane's)")
     parser.add_argument("--reviewer", default=None,
                         help="the login whose review counts as the review "
-                             "(default: the repository's owner)")
+                             "(default: the role binding's owner for this "
+                             "repository)")
     parser.add_argument("--implementer", action="append", default=None,
                         help="a login whose comments are the loop's own "
                              "rather than a third party's; may be repeated")
@@ -450,6 +443,14 @@ def main(argv: list[str] | None = None) -> int:
 
     repo_dir = args.worktree or os.getcwd()
     number = args.pr
+    # The role binding: who reviews, the implementer's logins, and the
+    # identity the commits must carry. Read before anything is fetched,
+    # so a binding that cannot be honored stops the run here.
+    try:
+        binding = roles.load()
+    except roles.Refusal as exc:
+        print(f"ERR {exc.detail}", file=sys.stderr)
+        return 1
     try:
         # The pull request's repository, from the checkout's origin
         # remote: the same read `hermes-review-pr` makes. A path remote
@@ -548,8 +549,9 @@ def main(argv: list[str] | None = None) -> int:
         # their mind.
 
         # Only the reviewer's own reviews count. The reviewer is the
-        # repository's owner unless told otherwise.
-        reviewer = review_login(repo, args.reviewer)
+        # login the role binding maps the repository's owner to, unless
+        # told otherwise.
+        reviewer = review_login(binding, repo, args.reviewer)
         reviews = gh_json(f"repos/{repo}/pulls/{number}/reviews")
         if not isinstance(reviews, list):
             reviews = []
@@ -601,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         issue_comments = gh_json(f"repos/{repo}/issues/{number}/comments")
         inline_comments = gh_json(f"repos/{repo}/pulls/{number}/comments")
         implementers = list(args.implementer or [])
-        implementers += (os.environ.get("IMPLEMENTER_LOGINS") or "").split()
+        implementers += binding.implementer_logins(repo)
         third_party = blocking_posts(
             reviews,
             (list(issue_comments) if isinstance(issue_comments, list) else [])
@@ -614,7 +616,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.name and args.email:
             expected_name, expected_email = args.name, args.email
         else:
-            expected_name, expected_email = lane_identity(repo_dir)
+            expected_name, expected_email = lane_identity(binding, repo)
 
         require_signoff = args.signoff
         if require_signoff is None:
@@ -643,6 +645,9 @@ def main(argv: list[str] | None = None) -> int:
         )
     except FetchError as exc:
         print(f"ERR {exc}", file=sys.stderr)
+        return 1
+    except roles.Refusal as exc:
+        print(f"ERR {exc.detail}", file=sys.stderr)
         return 1
 
     if not verdict.ok:

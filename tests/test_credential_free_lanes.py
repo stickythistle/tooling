@@ -32,6 +32,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 LIB = REPO_ROOT / "lib" / "common.sh"
 IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
@@ -52,14 +53,28 @@ GH_STUB = textwrap.dedent("""\
         echo "${STUB_LOGIN:-implementer-login}"
         exit 0
     fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
+        exit 0
+    fi
+    # The repository of the working directory, which is where a call that
+    # names none is answered from.
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
+        exit 0
+    fi
     echo "token=${GH_TOKEN:-<unset>}"
     echo "config_dir=${GH_CONFIG_DIR:-<unset>}"
     """)
 
 
 
-def gh_env(tmp: Path, **extra) -> dict:
-    """An environment whose `gh` is a stub reporting STUB_LOGIN."""
+def gh_env(tmp: Path, logins=("implementer-login",), **extra) -> dict:
+    """An environment whose `gh` is a stub reporting STUB_LOGIN.
+
+    The implementer's logins come from the role binding, the file every
+    tool reads.
+    """
     gh = tmp / "gh"
     gh.write_text(GH_STUB)
     gh.chmod(0o755)
@@ -76,6 +91,7 @@ def gh_env(tmp: Path, **extra) -> dict:
     env.pop("GH_IMPLEMENTER_TOKEN", None)
     env.pop("GH_IMPLEMENTER_CONFIG_DIR", None)
     env.pop("IMPLEMENTER_LOGINS", None)
+    env["ROLES_CONFIG"] = str(roles_file(tmp / "roles.toml", logins=logins))
     env.update(extra)
     return env
 
@@ -138,6 +154,7 @@ def test_gh_as_with_an_unset_token_refuses_and_names_the_variable():
             "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
             "GH_CONFIG_DIR": str(empty),
             "TOOLS_ENV": str(tmp / "no-env"),
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
         }
         for var in ("GH_TOKEN", "GITHUB_TOKEN", "GH_IMPLEMENTER_TOKEN",
                     "GH_IMPLEMENTER_CONFIG_DIR", "IMPLEMENTER_LOGINS"):
@@ -155,8 +172,7 @@ def test_gh_as_uses_the_roles_token():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         env = gh_env(tmp,
-                     GH_IMPLEMENTER_TOKEN="implementer-token-value",
-                     IMPLEMENTER_LOGINS="implementer-login")
+                     GH_IMPLEMENTER_TOKEN="implementer-token-value")
         result = bash("gh_as implementer api orgs", env=env)
         assert result.returncode == 0, result.stderr
         assert "token=implementer-token-value" in result.stdout, result.stdout
@@ -175,6 +191,10 @@ def test_gh_as_does_not_put_the_token_on_the_command_line():
                 echo "${STUB_LOGIN:-implementer-login}"
                 exit 0
             fi
+            if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                echo "${STUB_REPO-example-org/tooling}"
+                exit 0
+            fi
             echo "argv=$*"
         """))
         gh.chmod(0o755)
@@ -183,7 +203,7 @@ def test_gh_as_does_not_put_the_token_on_the_command_line():
             "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
             "TOOLS_ENV": str(tmp / "no-env"),
             "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
-            "IMPLEMENTER_LOGINS": "implementer-login",
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
         }
         result = bash("gh_as implementer api user --jq .login", env=env)
         assert result.returncode == 0, result.stderr
@@ -203,6 +223,10 @@ def test_gh_as_uses_the_roles_config_dir():
                 echo "${STUB_LOGIN:-implementer-login}"
                 exit 0
             fi
+            if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                echo "${STUB_REPO-example-org/tooling}"
+                exit 0
+            fi
             echo "config_dir=${GH_CONFIG_DIR:-<unset>}"
         """))
         gh.chmod(0o755)
@@ -213,7 +237,7 @@ def test_gh_as_uses_the_roles_config_dir():
             "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
             "TOOLS_ENV": str(tmp / "no-env"),
             "GH_IMPLEMENTER_CONFIG_DIR": str(cfg),
-            "IMPLEMENTER_LOGINS": "implementer-login",
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
         }
         env.pop("GH_IMPLEMENTER_TOKEN", None)
         result = bash("gh_as implementer api orgs", env=env)
@@ -229,7 +253,7 @@ def test_gh_as_refuses_a_login_that_is_not_an_implementer_login():
         tmp = Path(t)
         env = gh_env(tmp,
                      STUB_LOGIN="reviewer-login",
-                     IMPLEMENTER_LOGINS="implementer-login other-login")
+                     logins=("implementer-login", "other-login"))
         result = bash("gh_as implementer api user", env=env)
         assert result.returncode != 0, (
             f"gh_as acted as the wrong login: "
@@ -244,7 +268,7 @@ def test_gh_as_refuses_a_login_outside_the_allowed_set():
         tmp = Path(t)
         env = gh_env(tmp,
                      STUB_LOGIN="second-login",
-                     IMPLEMENTER_LOGINS="implementer-login second-login")
+                     logins=("implementer-login", "second-login"))
         result = bash("gh_as implementer api user", env=env)
         assert result.returncode == 0, (
             f"gh_as refused an allowed login: "
@@ -252,16 +276,15 @@ def test_gh_as_refuses_a_login_outside_the_allowed_set():
 
 
 def test_gh_as_refuses_when_no_implementer_login_is_configured():
-    # With no IMPLEMENTER_LOGINS there is no login the role may act as,
-    # so the call is refused.
+    # With no login bound, the call is refused.
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
-        env = gh_env(tmp, STUB_LOGIN="implementer-login")
+        env = gh_env(tmp, STUB_LOGIN="implementer-login", logins=())
         result = bash("gh_as implementer api user", env=env)
         assert result.returncode != 0, (
             f"gh_as ran with no implementer login configured: "
             f"stdout={result.stdout!r} stderr={result.stderr!r}")
-        assert "IMPLEMENTER_LOGINS" in result.stderr, result.stderr
+        assert "implementer login" in result.stderr, result.stderr
 
 
 def test_a_second_token_does_not_inherit_the_first_tokens_login():
@@ -278,6 +301,10 @@ def test_a_second_token_does_not_inherit_the_first_tokens_login():
                 echo "${STUB_LOGIN:-implementer-login}"
                 exit 0
             fi
+            if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                echo "${STUB_REPO-example-org/tooling}"
+                exit 0
+            fi
             echo "ran-as-${STUB_LOGIN:-implementer-login}"
             """))
         gh.chmod(0o755)
@@ -287,7 +314,8 @@ def test_a_second_token_does_not_inherit_the_first_tokens_login():
             "TOOLS_ENV": str(tmp / "no-env"),
             "TMPDIR": str(tmp),
             # Only one of the two logins is an implementer.
-            "IMPLEMENTER_LOGINS": "harbord-st",
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml",
+                                            logins=("harbord-st",))),
         }
         env.pop("GH_TOKEN", None)
         env.pop("GITHUB_TOKEN", None)
@@ -313,6 +341,42 @@ def test_a_second_token_does_not_inherit_the_first_tokens_login():
         assert "stickythistle" in probe.stderr, probe.stderr
 
 
+def test_gh_as_refuses_the_owner_of_the_repository_it_acts_for():
+    # The owner of a repository reviews that one and implements on the
+    # others. Acting as the owner on the repository it owns is refused,
+    # and the refusal names the owner.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        binding = roles_file(tmp / "owner-binding.toml",
+                             owners={"Jerhaad": "Jerhaad"},
+                             logins=("harbord-st", "Jerhaad"))
+        env = gh_env(tmp, STUB_LOGIN="Jerhaad", ROLES_CONFIG=str(binding))
+        result = bash(
+            "gh_as implementer issue view 5 -R Jerhaad/harbord-infra",
+            env=env)
+        assert result.returncode != 0, (
+            f"gh_as acted as the owner of the repository: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        # The refusal names the repository and the owner role: the login
+        # may implement on the others, and not on the one it reviews.
+        assert "Jerhaad/harbord-infra" in result.stderr, result.stderr
+        assert "owner" in result.stderr, result.stderr
+
+
+def test_gh_as_refuses_a_call_that_names_no_repository():
+    # The implementer's logins are per repository. A call that resolves
+    # no repository is refused; the unscoped list would let the owner
+    # implement on the repository it reviews.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        env = gh_env(tmp, STUB_REPO="")
+        result = bash("gh_as implementer api orgs", env=env)
+        assert result.returncode != 0, (
+            f"gh_as ran with no repository: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+        assert "repository" in result.stderr, result.stderr
+
+
 def test_the_login_cache_is_not_shared_between_users():
     # The cache lives in a directory this process created with mktemp -d.
     # A fixed path under TMPDIR would be shared between users and left
@@ -322,7 +386,7 @@ def test_the_login_cache_is_not_shared_between_users():
         gh = tmp / "gh"
         gh.write_text(GH_STUB)
         gh.chmod(0o755)
-        env = gh_env(tmp, IMPLEMENTER_LOGINS="implementer-login")
+        env = gh_env(tmp)
         result = bash(
             'gh_as implementer api orgs >/dev/null; '
             'gh_as implementer api orgs >/dev/null',
@@ -354,6 +418,10 @@ def test_gh_as_resolves_the_login_only_once_per_process():
                 echo "${{STUB_LOGIN:-implementer-login}}"
                 exit 0
             fi
+            if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                echo "${{STUB_REPO-example-org/tooling}}"
+                exit 0
+            fi
             exit 0
         """))
         gh.chmod(0o755)
@@ -361,7 +429,7 @@ def test_gh_as_resolves_the_login_only_once_per_process():
             **os.environ,
             "PATH": f"{tmp}:{os.environ.get('PATH', '')}",
             "TOOLS_ENV": str(tmp / "no-env"),
-            "IMPLEMENTER_LOGINS": "implementer-login",
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
             # The cache lives under TMPDIR, so each test gets its own.
             "TMPDIR": str(tmp),
         }
@@ -381,8 +449,7 @@ def test_the_implementer_token_and_the_ambient_login_are_different():
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         env = gh_env(tmp,
-                     GH_IMPLEMENTER_TOKEN="implementer-token-value",
-                     IMPLEMENTER_LOGINS="implementer-login")
+                     GH_IMPLEMENTER_TOKEN="implementer-token-value")
         result = bash("gh_as implementer api orgs", env=env)
         assert result.returncode == 0, result.stderr
         assert "token=implementer-token-value" in result.stdout, result.stdout
@@ -410,6 +477,10 @@ FAKE_GH = textwrap.dedent("""\
         echo "${STUB_LOGIN:-implementer-login}"
         exit 0
     fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
+        exit 0
+    fi
     if [[ "$1" == "issue" && "$2" == "view" ]]; then
         echo "title: a work item"
         exit 0
@@ -428,6 +499,10 @@ FAKE_GH_LOGGED_IN = textwrap.dedent("""\
     fi
     if [[ "$1" == "api" && "$2" == "user" ]]; then
         echo "${STUB_LOGIN:-implementer-login}"
+        exit 0
+    fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
         exit 0
     fi
     if [[ "$1" == "issue" && "$2" == "view" ]]; then
@@ -568,11 +643,9 @@ def run_lane(tmp: Path, repo: Path, *, extra_env: dict | None = None):
         "GPU_GROUP_DEFAULT": "",
         # The implementer role's credentials, and the login they give.
         "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
-        "IMPLEMENTER_LOGINS": "implementer-login",
-        # The lane identity is configuration; the lane refuses
-        # without it.
-        "LANE_GIT_NAME": "Lane",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
+        # The implementer's logins and the lane's identity are the
+        # binding's; the lane refuses without them.
+        "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
     }
     # A token in the parent's environment: the lane must not inherit it.
     env["GH_TOKEN"] = "parent-token-value"
@@ -692,11 +765,9 @@ def test_the_prompt_says_what_is_enforced():
             "HERMES_IMPLEMENT_ATTEMPTS": "1",
             "HERMES_IMPLEMENT_TIMEOUT": "60",
             "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
-            "IMPLEMENTER_LOGINS": "implementer-login",
-            # The lane identity is configuration; the lane refuses
-            # without it.
-            "LANE_GIT_NAME": "Lane",
-            "LANE_GIT_EMAIL": "lane@example.invalid",
+            # The implementer's logins and the lane's identity are the
+            # binding's; the lane refuses without them.
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
         }
         result = subprocess.run(
             [str(IMPLEMENT), "--issue", "1", "--worktree", str(repo),
@@ -908,6 +979,10 @@ def test_the_script_itself_keeps_its_own_github_access():
                 echo "${{STUB_LOGIN:-implementer-login}}"
                 exit 0
             fi
+            if [[ "$1" == "repo" && "$2" == "view" ]]; then
+                echo "${{STUB_REPO-example-org/tooling}}"
+                exit 0
+            fi
             if [[ "$1" == "issue" && "$2" == "view" ]]; then
                 echo "token=${{GH_TOKEN:-<unset>}}" >> "{seen}"
                 echo "title: a work item"
@@ -941,11 +1016,9 @@ def test_the_script_itself_keeps_its_own_github_access():
             "HERMES_IMPLEMENT_ATTEMPTS": "1",
             "HERMES_IMPLEMENT_TIMEOUT": "60",
             "GH_IMPLEMENTER_TOKEN": "implementer-token-value",
-            "IMPLEMENTER_LOGINS": "implementer-login",
-            # The lane identity is configuration; the lane refuses
-            # without it.
-            "LANE_GIT_NAME": "Lane",
-            "LANE_GIT_EMAIL": "lane@example.invalid",
+            # The implementer's logins and the lane's identity are the
+            # binding's; the lane refuses without them.
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml")),
         }
         result = subprocess.run(
             [str(IMPLEMENT), "--issue", "1", "--worktree", str(repo),

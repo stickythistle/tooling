@@ -21,6 +21,7 @@ PIPELINE_IMPLEMENT = REPO_ROOT / "pipeline" / "implement.sh"
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_hermes_implement_tmp import (  # noqa: E402
     HERMES_IMPLEMENT, git, make_worktree, write_stub_gh)
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills  # noqa: E402
 
 STUB_HERMES = """#!/usr/bin/env python3
@@ -64,13 +65,10 @@ def lane_wrapper(root: Path, role: str, stub: Path, gh_dir: Path) -> str:
              "AGENT_STATE_DIR": str(state),
              "HERMES_HOME": str(home),
              "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
-             "IMPLEMENTER_LOGINS": "test-implementer",
              "HERMES_IMPLEMENT_ATTEMPTS": "1",
              "HERMES_IMPLEMENT_TIMEOUT": "30",
-             # The lane identity is configuration: hermes-implement
-             # refuses without LANE_GIT_NAME / LANE_GIT_EMAIL.
-             "LANE_GIT_NAME": "Lane",
-             "LANE_GIT_EMAIL": "lane@example.invalid"})
+             "ROLES_CONFIG": str(roles_file(root / "roles.toml",
+                                             logins=("test-implementer",)))})
     out = proc.stdout.strip().splitlines()
     report = Path(out[-1]) / "attempt1.stdout" if out else None
     if not report or not report.exists():
@@ -367,7 +365,7 @@ def _setup_nightly_repo(tmp: Path) -> tuple[Path, Path, Path]:
                    check=True)
     # The lane commit's identity -- a real agent that bypassed the
     # pinned env vars (`--author`, `-c user.name=...`). The verifier
-    # compares it against LANE_GIT_NAME / LANE_GIT_EMAIL.
+    # compares it against the role binding's identity.
     subprocess.run(["git", "-C", str(wt), "config", "user.email",
                   "wrong@example.invalid"], check=True)
     subprocess.run(["git", "-C", str(wt), "config", "user.name",
@@ -437,10 +435,12 @@ def _nightly_env(tmp: Path, repo: Path, *, refuse: bool = False
            "PIPELINE_VERIFY": str(verify),
            "PIPELINE_AGENT": str(noop),
            "PIPELINE_LOCK": str(tmp / "pipeline.lock"),
-           # The verifier's expected identity. Refuse mode is set
-           # per-case via LANE_GIT_IDENTITY.
-           "LANE_GIT_NAME": "Expected",
-           "LANE_GIT_EMAIL": "expected@example.invalid",
+           # The role binding: the identity the verifier expects.
+           # Refuse mode is set per-case via LANE_GIT_IDENTITY.
+           "ROLES_CONFIG": str(roles_file(tmp / "roles.toml",
+                                           owners={tmp.name: "the-owner"},
+                                           identity=("Expected",
+                                                     "expected@example.invalid"))),
            "PIPELINE_RESUME_MAX": "1",
            "HERMES_HOME": str(home)}
     if refuse:
@@ -609,12 +609,10 @@ def test_nightly_pipeline_verifier_paths() -> list[str]:
                 f"message did not surface: "
                 f"stderr={proc.stderr[-400:]!r}")
 
-    # ----- Case 4: no configured identity, the repair is skipped.
+    # ----- Case 4: no role binding, the repair is skipped.
     #
-    # With LANE_GIT_NAME / LANE_GIT_EMAIL unset the repair agent must
-    # not start, and the refusal must skip this lane rather than end
-    # the run: one lane missing its configuration must not take the
-    # whole pipeline down with it.
+    # The refusal skips this lane; the run carries on. One lane missing
+    # its configuration must not take the whole pipeline down.
     #
     # The repair path is entered when the gate fails, so the verify
     # command here exits non-zero.
@@ -628,8 +626,7 @@ def test_nightly_pipeline_verifier_paths() -> list[str]:
         failing.write_text("#!/usr/bin/env bash\\nexit 1\\n")
         failing.chmod(0o755)
         env["PIPELINE_VERIFY"] = str(failing)
-        env.pop("LANE_GIT_NAME", None)
-        env.pop("LANE_GIT_EMAIL", None)
+        env["ROLES_CONFIG"] = str(tmp / "absent.toml")
         proc = subprocess.run(
             [str(PIPELINE_IMPLEMENT)], env=env,
             capture_output=True, text=True, timeout=60)

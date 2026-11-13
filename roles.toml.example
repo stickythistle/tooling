@@ -1,0 +1,47 @@
+# Copy to ~/.config/agent-tools/roles.toml and fill in, or point
+# $ROLES_CONFIG at the file. Every tool that needs a role reads this file:
+# the owner who reviews, the implementer's logins, and the identity a lane's
+# commits must carry.
+
+# Every value here is a placeholder. A missing key and an unknown policy are
+# refusals naming what to change.
+
+# Who reviews a repository: by repository owner. The key is the owner half
+# of owner/name, and the value is the login that reviews for it, so an
+# organisation whose reviewer is another account still works.
+[owners]
+"example-org" = "example-owner"
+
+# The implementer: the logins it may act as, and the identity its commits
+# carry. An owner implements on every repository but the one it owns, which
+# it reviews.
+[implementer]
+logins = ["example-lane"]
+identity = { name = "example-lane", email = "lane@example.invalid" }
+
+# A repository whose commits must carry another identity. A repository that
+# asks for a DCO sign-off needs the sign-off to match the author, so the
+# human who signs it is named here.
+[implementer.identity_by_repo."example-org/dco-repo"]
+name = "Example Human"
+email = "human@example.invalid"
+
+# Model name (as a lane footer or a ledger records it) -> family. The
+# separation rule is about families, so a model with no family here cannot
+# be told apart from any other.
+[models]
+"MiniMax-M3" = "minimax"
+"qwen3.8-flash-next-tri" = "qwen"
+
+# The teammate: the candidates, and how one of them is picked.
+# "round-robin" takes the next one; "fixed" always takes the first.
+[teammate]
+policy = "round-robin"
+candidates = [
+  { backend = "pi:flashnext", model = "qwen3.8-flash-next-tri" },
+]
+
+# The owner's model, for the teammate's preference: a candidate whose family
+# differs from the owner's is preferred over one that shares it.
+[owner_model]
+model = "example-owner-model"

@@ -225,11 +225,23 @@ reproduction run there would be evidence about a commit nobody reviewed.
 
 ## Two identities, and a lane with neither
 
-The loop has two GitHub accounts and they are not the same person. The
-implementer authors the pull request; the reviewer is the repository's owner.
-One login cannot approve a pull request it authored, so a verdict can only
-exist as a real review state when the reviewer is somebody else — and a reply
-posted by the implementer has to be told apart from a person speaking.
+The loop has two GitHub accounts, and the two are different people: the
+implementer authors the pull request, and the reviewer is the login the
+operator's role binding maps the repository's owner to.
+
+One login cannot approve a pull request it authored, so a verdict is a
+review state only when the reviewer is somebody else — and a reply posted by
+the implementer has to be told apart from a person speaking.
+
+**The roles live in one file.** `roles.toml` — `~/.config/agent-tools/roles.toml`,
+or `$ROLES_CONFIG` — says who reviews, which logins the implementer may
+act as, and the identity a lane's commits must carry. Every tool reads it
+through one module.
+
+The implementer's logins are per repository: an owner reviews the one it
+owns, and implements on the others.
+
+`roles.toml.example` in the agent-tools checkout is the template.
 
 **Credentials per role.** `gh_as implementer ...` runs `gh` as the
 implementer, for one call, with that role's own credentials:
@@ -239,9 +251,9 @@ naming the variable to set**.
 
 **The login is checked, not the variable's presence.** `gh_as` resolves the
 login the call would act as — `gh api user` under the same credentials — and
-refuses unless it is one of `IMPLEMENTER_LOGINS`, naming both. On the
-coordinator host the ambient login is the reviewer, so an implementer call
-there would otherwise act as the reviewer with no error at all.
+refuses unless the binding names it, naming both. On the coordinator host
+the ambient login is the reviewer, so an implementer call there would
+otherwise act as the reviewer with no error at all.
 
 **A lane's `gh` is pointed at an empty config.** A lane dispatched by
 `hermes-implement` runs with a `gh` config directory that holds no hosts and

@@ -16,6 +16,8 @@ GATE = REPO_ROOT / "bin" / "pr-loop-gate"
 FIXTURES = REPO_ROOT / "tests" / "fixtures" / "pr_gate"
 
 sys.path.insert(0, str(REPO_ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file  # noqa: E402
 import pr_gate  # noqa: E402
 
 REVIEWER = "stickythistle"
@@ -624,14 +626,24 @@ def install(data_dir: Path, pr_obj, reviews, comments, checks, trees,
 def run_gate(data_dir: Path, bin_dir: Path, *extra: str,
              reviewer: str | None = REVIEWER,
              implementers: list | None = None,
-             env_extra: dict | None = None):
+             env_extra: dict | None = None,
+             owners: dict | None = None):
+    """Run the gate against a scenario.
+
+    The reviewer and the implementer's logins come from the role
+    binding, the file every tool reads: the repository's owner is
+    mapped to the login that reviews for it.
+    """
     env = os.environ.copy()
     env["PATH"] = f"{bin_dir}:{env['PATH']}"
     env["STUB_DATA"] = str(data_dir)
     env.pop("REVIEWER_LOGIN", None)
     env.pop("IMPLEMENTER_LOGINS", None)
-    if reviewer is not None:
-        env["REVIEWER_LOGIN"] = reviewer
+    binding = data_dir.parent / "roles.toml"
+    if owners is None:
+        owners = {"owner": reviewer} if reviewer is not None else {}
+    roles_file(binding, owners=owners, logins=("test-implementer",))
+    env["ROLES_CONFIG"] = str(binding)
     if implementers is not None:
         extra = (*extra, *(a for login in implementers
                            for a in ("--implementer", login)))
@@ -995,33 +1007,45 @@ def main() -> int:
                 f"malformed_commit: expected exit 1 with 'ERR malformed', got "
                 f"rc={r.returncode} stderr={r.stderr!r}")
 
-        # With no --reviewer and no $REVIEWER_LOGIN, the reviewer is the
-        # owner segment of the repo argument: the owner reviews their own
-        # repository. The stub's repo is owner/repo, so `owner` is V.
+        # With no --reviewer, the reviewer is the login the binding
+        # maps the repository's owner to. The stub's repo is owner/repo.
         data = tmp / "data_no_reviewer"
         data.mkdir()
         install(data, pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z",
                         login="owner")],
                 [], [check_run()], {})
-        r = run_gate(data, bin_dir, reviewer=None)
+        r = run_gate(data, bin_dir, owners={"owner": "owner"})
         if r.returncode != 0 or r.stdout.strip() != "AGREED " + HEAD:
             failures.append(
-                f"no_reviewer: expected 'AGREED {HEAD}' from the owner "
-                f"fallback, got rc={r.returncode} stdout={r.stdout.strip()!r} "
+                f"no_reviewer: expected 'AGREED {HEAD}' from the binding, got "
+                f"rc={r.returncode} stdout={r.stdout.strip()!r} "
                 f"stderr={r.stderr.strip()!r}")
 
-        # The reviewer can come from the environment, with no flag.
-        data = tmp / "data_env_reviewer"
+        # An owner the binding leaves unmapped is a refusal naming the
+        # repository.
+        data = tmp / "data_unmapped_owner"
+        data.mkdir()
+        install(data, pr(),
+                [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z",
+                        login="owner")],
+                [], [check_run()], {})
+        r = run_gate(data, bin_dir, owners={})
+        if r.returncode != 1 or "owner/repo" not in r.stderr:
+            failures.append(
+                f"unmapped_owner: expected exit 1 naming the repository, got "
+                f"rc={r.returncode} stderr={r.stderr.strip()!r}")
+
+        # The reviewer is a login the binding names, with no flag.
+        data = tmp / "data_bound_reviewer"
         data.mkdir()
         install(data, pr(),
                 [review(701, "APPROVED", HEAD, "2026-10-20T00:00:00Z")],
                 [], [check_run()], {})
-        r = run_gate(data, bin_dir, reviewer=None,
-                     env_extra={"REVIEWER_LOGIN": REVIEWER})
+        r = run_gate(data, bin_dir, owners={"owner": REVIEWER})
         if r.returncode != 0 or r.stdout.strip() != "AGREED " + HEAD:
             failures.append(
-                f"env_reviewer: expected 'AGREED {HEAD}', got rc={r.returncode} "
+                f"bound_reviewer: expected 'AGREED {HEAD}', got rc={r.returncode} "
                 f"stdout={r.stdout.strip()!r} stderr={r.stderr.strip()!r}")
 
         # The reviewer is a login, not a constant: a different login's

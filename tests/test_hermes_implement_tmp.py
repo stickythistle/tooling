@@ -17,6 +17,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 HERMES_IMPLEMENT = REPO_ROOT / "bin" / "hermes-implement"
 
@@ -126,6 +127,10 @@ def write_stub_gh(tmpdir: Path) -> Path:
             echo "test-implementer"
             exit 0
         fi
+        if [[ "$1" == "repo" && "$2" == "view" ]]; then
+            echo "${STUB_REPO-example-org/tooling}"
+            exit 0
+        fi
         echo 'stub issue'
         """))
     shim.chmod(0o755)
@@ -151,16 +156,13 @@ def run_lane(tmpdir: Path, worktree: Path, state_dir: Path | str,
         # Prepend the gh shim dir so the script's `gh issue view` resolves
         # to our stub before the system's gh.
         "PATH": f"{gh_dir}:{os.environ.get('PATH', '')}",
-        "IMPLEMENTER_LOGINS": "test-implementer",
         # Cap attempts at 2 so the failure case finishes promptly: each
         # attempt is otherwise bounded by the agent's timeout (90 minutes
         # by default). The stub exits 0 immediately either way.
         "HERMES_IMPLEMENT_ATTEMPTS": "2",
         "HERMES_IMPLEMENT_TIMEOUT": "30",
-        # The lane identity is configuration; the lane refuses
-        # without it.
-        "LANE_GIT_NAME": "Lane",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
+        "ROLES_CONFIG": str(roles_file(tmpdir / "roles.toml",
+                                            logins=("test-implementer",))),
     }
     if chdir:
         env["STUB_CHDIR"] = chdir

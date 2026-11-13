@@ -108,8 +108,8 @@ is a repair, not a second attempt at the feature.
 $(tail -60 "/tmp/nightly-resume-$n.log")"
 		# The lane identity is configuration, and the repair agent
 		# cannot start without it: `export_lane_identity_env` refuses
-		# when LANE_GIT_NAME / LANE_GIT_EMAIL are unset, and a repair
-		# that pins no identity commits as nobody.
+		# when the role binding cannot be read, and a repair that pins
+		# no identity commits as nobody.
 		#
 		# The check is outside the subshell below, so the refusal skips
 		# this lane and the run carries on to the next one. One lane
@@ -119,7 +119,9 @@ $(tail -60 "/tmp/nightly-resume-$n.log")"
 		#
 		# `lane_expected_identity` resolves without exporting, so this
 		# shell carries no pinned identity into the rest of the run.
-		if ! lane_expected_identity >/dev/null; then
+		# The repository is named, because the binding may give it an
+		# identity of its own.
+		if ! lane_expected_identity "$GH_REPO" >/dev/null; then
 			echo "  issue $n: no lane identity configured; skipping the repair" >&2
 			continue
 		fi
@@ -138,7 +140,7 @@ $(tail -60 "/tmp/nightly-resume-$n.log")"
 			# The check that resolved the identity sits outside this
 			# subshell: under `set -e` a refusal inside it ends the whole
 			# script.
-			export_lane_identity_env || exit 1
+			export_lane_identity_env "$GH_REPO" || exit 1
 			timeout "${PIPELINE_REPAIR_TIMEOUT:-3600}" "$BASH" -c '
 				. "$1/lib/common.sh"
 				shift

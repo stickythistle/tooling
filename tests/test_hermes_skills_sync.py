@@ -33,6 +33,18 @@ def run(cmd, cwd=None, env=None):
     )
 
 
+def repo_version() -> str:
+    """The version the repository's own copy of the skill carries.
+
+    Read from the file, so a version bump in the repository cannot stale
+    the suite.
+    """
+    for line in (REPO_ROOT / "skills" / "swe-updater" / "SKILL.md").read_text().splitlines():
+        if line.startswith("version:"):
+            return line.split(":", 1)[1].strip()
+    raise AssertionError("the repository's swe-updater names no version")
+
+
 def write_skill(directory: Path, name: str, body: str = SKILL) -> Path:
     """A skill directory in the layout a tree keeps: <category>/<name>/."""
     d = directory / "software-development" / name
@@ -135,7 +147,7 @@ def test_sync_replaces_a_copy_whose_version_differs():
         )
         r = sync(home)
         assert r.returncode == 0, r.stderr
-        assert "version: 3.3.0" in (stale / "SKILL.md").read_text()
+        assert f"version: {repo_version()}" in (stale / "SKILL.md").read_text()
 
 
 def test_sync_leaves_a_skill_the_repository_does_not_ship_alone():
@@ -164,7 +176,7 @@ def test_sync_updates_a_skill_in_place_where_the_tree_keeps_it():
         (archived / "SKILL.md").write_text("---\nname: swe-updater\nversion: 3.2.0\n---\n")
         r = sync(home)
         assert r.returncode == 0, r.stderr
-        assert "version: 3.3.0" in (archived / "SKILL.md").read_text()
+        assert f"version: {repo_version()}" in (archived / "SKILL.md").read_text()
         assert not (home / "profiles" / "minimax" / "skills" / "software-development" / "swe-updater").exists()
 
 
@@ -359,7 +371,7 @@ def test_sync_updates_the_live_copy_when_the_tree_carries_an_archive_too():
         )
         r = sync(home)
         assert r.returncode == 0, r.stderr
-        assert "version: 3.3.0" in (live / "SKILL.md").read_text(), r.stdout
+        assert f"version: {repo_version()}" in (live / "SKILL.md").read_text(), r.stdout
         assert "version: 3.2.0" in (archived / "SKILL.md").read_text(), (
             "the archived copy was updated instead of the live one"
         )

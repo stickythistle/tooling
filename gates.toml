@@ -30,11 +30,21 @@ name = "pr-ready tests"
 when = '^(bin/pr-ready|tests/test_pr_ready\.py|tests/fixtures/gh_.*\.json)$'
 run = "python3 tests/test_pr_ready.py"
 
+# The role binding: who reviews, who implements, and the identity a
+# lane's commits must carry. One file, one module, every tool asks it.
+
+# The gate names the module, the suite that pins it and the tools that
+# ask it, so a change to any of them runs the suite.
+[[gates]]
+name = "role binding tests"
+when = '^(lib/roles\.py|tests/test_roles\.py|roles\.toml\.example|lib/common\.sh|bin/merge-check|bin/pr-loop-gate)$'
+run = "python3 tests/test_roles.py"
+
 # The gate that decides what a PR needs. `lib/pr_gate.py` is in the
 # `when` because moving the decision moves what the suite pins.
 [[gates]]
 name = "pr-loop-gate tests"
-when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
+when = '^(bin/pr-loop-gate|lib/pr_gate\.py|lib/roles\.py|tests/test_pr_loop_gate\.py|tests/fixtures/pr_gate/.*)$'
 run = "python3 tests/test_pr_loop_gate.py"
 
 # The parent-green comparison: whether a commit broke the branch it
@@ -56,7 +66,7 @@ run = "python3 tests/test_main_watch.py"
 # change to the decision the merge gate reads has to run the suite.
 [[gates]]
 name = "merge-check tests"
-when = '^(bin/merge-check|lib/merge_check\.py|lib/pr_gate\.py|tests/test_merge_check\.py)$'
+when = '^(bin/merge-check|lib/merge_check\.py|lib/pr_gate\.py|lib/roles\.py|tests/test_merge_check\.py)$'
 run = "python3 tests/test_merge_check.py"
 
 # The same gate, over patches that real git produced. The suite above
@@ -66,7 +76,7 @@ run = "python3 tests/test_merge_check.py"
 # under test as well as the suite (see tests/test_gate_coverage.py).
 [[gates]]
 name = "pr-loop-gate git tests"
-when = '^(bin/pr-loop-gate|lib/pr_gate\.py|tests/test_pr_loop_gate_git\.py)$'
+when = '^(bin/pr-loop-gate|lib/pr_gate\.py|lib/roles\.py|tests/test_pr_loop_gate_git\.py)$'
 run = "python3 tests/test_pr_loop_gate_git.py"
 
 # The caller that watches `main`: it judges every commit since the one
@@ -345,8 +355,8 @@ run = "python3 tests/test_hermes_implement_session.py"
 # The implementer's identity, and the lane that must not use it.
 #
 # gh_as runs gh as the implementer, with that role's own credentials, and
-# refuses when the role has none or when the login it would act as is not
-# one of IMPLEMENTER_LOGINS. hermes-implement starts the lane with gh
+# refuses when the role has none or when the login it would act as is
+# absent from the binding. hermes-implement starts the lane with gh
 # pointed at an empty config, so an accidental gh call fails.
 #
 # The gate names the suite, the module that holds gh_as, and the driver that

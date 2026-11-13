@@ -17,9 +17,11 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 BIN = REPO_ROOT / "bin" / "merge-check"
 sys.path.insert(0, str(REPO_ROOT / "lib"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import merge_check as mc  # noqa: E402
 import pr_gate  # noqa: E402
+from roles_fixture import roles_file  # noqa: E402
 
 
 def fail(failures: list[str], msg: str, detail: str = "") -> None:
@@ -843,14 +845,20 @@ def setup(tmp: Path, *, labels=None, pending=False, reviews=None,
 
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("LANE_GIT_", "MERGE_CHECK_", "GH_",
-                                "REVIEWER_LOGIN", "IMPLEMENTER_LOGINS"))}
+                                "REVIEWER_LOGIN", "IMPLEMENTER_LOGINS",
+                                "ROLES_CONFIG"))}
     env.update({
         "PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
         "FAKE_GH_DATA": str(data),
         "FAKE_GH_LOG": str(tmp / "gh.log"),
-        "LANE_GIT_NAME": "Lane Bot",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
-        "REVIEWER_LOGIN": REVIEWER,
+        # The role binding: the owner who reviews, the implementer's
+        # logins, and the identity the commits must carry. The
+        # repository's owner is the temporary directory's name here.
+        "ROLES_CONFIG": str(roles_file(
+            tmp / "roles.toml",
+            owners={tmp.name: REVIEWER},
+            logins=(IMPLEMENTER,),
+            identity=("Lane Bot", "lane@example.invalid"))),
     })
     return clone, head, main, env
 
@@ -895,14 +903,20 @@ def setup_multi_commit(tmp: Path, oldest_author: dict, **kwargs):
 
     env = {k: v for k, v in os.environ.items()
            if not k.startswith(("LANE_GIT_", "MERGE_CHECK_", "GH_",
-                                "REVIEWER_LOGIN", "IMPLEMENTER_LOGINS"))}
+                                "REVIEWER_LOGIN", "IMPLEMENTER_LOGINS",
+                                "ROLES_CONFIG"))}
     env.update({
         "PATH": f"{fakebin}:{os.environ.get('PATH', '')}",
         "FAKE_GH_DATA": str(data),
         "FAKE_GH_LOG": str(tmp / "gh.log"),
-        "LANE_GIT_NAME": "Lane Bot",
-        "LANE_GIT_EMAIL": "lane@example.invalid",
-        "REVIEWER_LOGIN": REVIEWER,
+        # The role binding: the owner who reviews, the implementer's
+        # logins, and the identity the commits must carry. The
+        # repository's owner is the temporary directory's name here.
+        "ROLES_CONFIG": str(roles_file(
+            tmp / "roles.toml",
+            owners={tmp.name: REVIEWER},
+            logins=(IMPLEMENTER,),
+            identity=("Lane Bot", "lane@example.invalid"))),
     })
     return clone, head, main, env
 
@@ -1510,21 +1524,36 @@ def case_the_driver_ignores_an_approval_by_another_login(failures: list[str]) ->
                            "has not reviewed", r.stderr)
 
 
-def case_the_driver_refuses_without_a_lane_identity(failures: list[str]) -> None:
-    # The expected identity is the repository's rule. Without
-    # LANE_GIT_NAME and LANE_GIT_EMAIL no rule applies. The checkout's
-    # config is no one: it says what this machine would commit as.
+def case_the_driver_reads_the_identity_from_the_binding(
+        failures: list[str]) -> None:
+    # The expected identity is the binding's. Nothing in the environment
+    # says what it is: the checkout's own configuration is no one -- it
+    # says what this machine would commit as.
     with tempfile.TemporaryDirectory() as t:
         tmp = Path(t)
         clone, _head, _main, env = setup(tmp)
-        env.pop("LANE_GIT_NAME", None)
-        env.pop("LANE_GIT_EMAIL", None)
+        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
+            env.pop(var, None)
+        r = run(env, clone)
+        if r.returncode != 0:
+            fail(failures, "identity: the binding's identity was not used",
+                 f"rc={r.returncode} stderr={r.stderr}")
+
+
+def case_the_driver_refuses_a_binding_without_an_identity(
+        failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        clone, _head, _main, env = setup(tmp)
+        binding = tmp / "no-identity.toml"
+        binding.write_text('[implementer]\nlogins = ["the-implementer"]\n')
+        env["ROLES_CONFIG"] = str(binding)
         r = run(env, clone)
         if r.returncode == 0:
             fail(failures, "identity: a pull request was accepted with no "
                            "expected identity", r.stdout)
             return
-        if "LANE_GIT_NAME" not in r.stderr:
+        if "identity" not in r.stderr:
             fail(failures, "identity: the refusal does not name the "
                            "setting", r.stderr)
 
@@ -1554,7 +1583,6 @@ def case_the_driver_allows_the_loop_to_comment(failures: list[str]) -> None:
         clone, _head, _main, env = setup(tmp, issue_comments=[
             {"user": {"login": REVIEWER}, "body": "a comment"},
             {"user": {"login": IMPLEMENTER}, "body": "a comment"}])
-        env["IMPLEMENTER_LOGINS"] = IMPLEMENTER
         r = run(env, clone)
         if r.returncode != 0:
             fail(failures, "comments: the loop's own comments stopped the "
@@ -1849,7 +1877,8 @@ def main() -> int:
     case_the_driver_refuses_when_the_reviewer_has_not_reviewed(failures)
     case_the_driver_refuses_a_file_added_after_a_changes_requested(failures)
     case_the_driver_ignores_an_approval_by_another_login(failures)
-    case_the_driver_refuses_without_a_lane_identity(failures)
+    case_the_driver_reads_the_identity_from_the_binding(failures)
+    case_the_driver_refuses_a_binding_without_an_identity(failures)
     case_the_driver_refuses_a_third_party_comment(failures)
     case_an_answered_third_party_comment_passes(failures)
     case_an_unanswered_third_party_comment_is_refused(failures)

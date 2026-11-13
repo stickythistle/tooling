@@ -28,6 +28,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COMMON = REPO_ROOT / "lib" / "common.sh"
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file  # noqa: E402
+
 
 def fail(failures, msg, detail=None):
     failures.append(f"{msg}: {detail}" if detail is not None else msg)
@@ -42,22 +45,29 @@ def git_out(cwd, *args):
     return git(cwd, *args).stdout.strip()
 
 
+def binding(tmp: Path, name: str = "Lane",
+            email: str = "lane@example.invalid") -> Path:
+    """A role binding naming the lane's identity."""
+    return roles_file(tmp / "roles.toml", identity=(name, email))
+
+
 def verify(worktree: Path, base: str, default: str = "main",
-           name: str = "Lane", email: str = "lane@example.invalid"):
+           roles: Path | None = None):
     """Run the real verifier over a worktree.
 
-    The identity is scoped to the call, the way the verifier scopes it
-    to its own rewrite: an exported identity would leak into every
-    later command in the shell.
+    The identity is the binding's, and the binding is named by the
+    environment: an exported identity would leak into every later
+    command in the shell.
     """
+    env = dict(os.environ)
+    if roles is not None:
+        env["ROLES_CONFIG"] = str(roles)
     script = f'''
 . "{COMMON}"
-LANE_GIT_NAME="{name}"
-LANE_GIT_EMAIL="{email}"
 verify_lane_identity "{worktree}" "{base}" "" "{default}"
 '''
     result = subprocess.run(["bash", "-c", script], capture_output=True,
-                            text=True)
+                            text=True, env=env)
     return result
 
 
@@ -114,7 +124,7 @@ def case_a_lane_that_rebased_onto_a_newer_main(failures):
         repo.commit("the lane's own commit", "w.md")
         lane_commit = repo.sha("HEAD")
 
-        result = verify(repo.path, lane_base)
+        result = verify(repo.path, lane_base, roles=binding(Path(t)))
         if result.returncode != 0:
             fail(failures, "rebase: exit", result.returncode)
             fail(failures, "rebase: stderr", result.stderr[-500:])
@@ -160,7 +170,7 @@ def case_a_lane_that_merged_a_branch_with_foreign_authors(failures):
             "-m", "Merge upstream/main")
         repo.commit("the lane's own commit", "w.md")
 
-        result = verify(repo.path, lane_base)
+        result = verify(repo.path, lane_base, roles=binding(Path(t)))
         if result.returncode != 0:
             fail(failures, "merge: exit", result.returncode)
             fail(failures, "merge: stderr", result.stderr[-500:])
@@ -198,7 +208,7 @@ def case_a_lane_that_merged_a_branch_with_foreign_authors(failures):
         # rewritten branch finds everything correct and re-authors
         # nothing. A rewrite that left a commit's parent unrewritten
         # would re-author the same commits on every run.
-        again = verify(repo.path, lane_base)
+        again = verify(repo.path, lane_base, roles=binding(Path(t)))
         if again.returncode != 0:
             fail(failures, "merge: the second run exited",
                  again.returncode)
@@ -217,7 +227,7 @@ def case_the_tree_is_unchanged(failures):
         lane_base = repo.sha("HEAD")
         repo.commit("the lane's own commit", "w.md")
         before = git_out(repo.path, "rev-parse", "HEAD^{tree}")
-        result = verify(repo.path, lane_base)
+        result = verify(repo.path, lane_base, roles=binding(Path(t)))
         if result.returncode != 0:
             fail(failures, "tree: exit", result.returncode)
             return
@@ -237,7 +247,7 @@ def case_a_lane_with_the_right_identity_is_left_alone(failures):
         git(repo.path, "config", "user.name", "Lane")
         repo.commit("the lane's own commit", "w.md")
         before = repo.sha("HEAD")
-        result = verify(repo.path, lane_base)
+        result = verify(repo.path, lane_base, roles=binding(Path(t)))
         if result.returncode != 0:
             fail(failures, "clean: exit", result.returncode)
             return
@@ -260,12 +270,12 @@ def case_the_refuse_mode_still_refuses(failures):
         script = f'''
 . "{COMMON}"
 export LANE_GIT_IDENTITY=refuse
-LANE_GIT_NAME="Lane"
-LANE_GIT_EMAIL="lane@example.invalid"
 verify_lane_identity "{repo.path}" "{lane_base}" "" main
 '''
+        env = dict(os.environ)
+        env["ROLES_CONFIG"] = str(binding(Path(t)))
         result = subprocess.run(["bash", "-c", script], capture_output=True,
-                                text=True)
+                                text=True, env=env)
         if result.returncode == 0:
             fail(failures, "refuse: exited 0")
             return
@@ -277,15 +287,13 @@ verify_lane_identity "{repo.path}" "{lane_base}" "" main
 def lane_env(env: dict, tmp: Path) -> dict:
     """The environment a lane-identity case runs under.
 
-    `common.sh` sources the operator's env file, and that file sets the
-    lane identity on a host that has one. A case that sets or clears
-    LANE_GIT_NAME would then be overruled by the file the shell sources
-    after the case's own environment is in place, so the case would
-    test the host rather than the function.
+    `common.sh` sources the operator's env file, which may pin an
+    identity on a host that has one, and it is sourced after the case's
+    own environment is in place -- so the case would test the host, not
+    the function.
 
-    TOOLS_ENV therefore names an empty file of the case's own: the
-    shell sources nothing, and the variables under test are the only
-    ones that can set the identity.
+    TOOLS_ENV therefore names an empty file of the case's own, and the
+    binding under test is the only thing that can set the identity.
     """
     clean = {k: v for k, v in os.environ.items()
              if not (k.startswith("GIT_AUTHOR_")
@@ -299,9 +307,9 @@ def lane_env(env: dict, tmp: Path) -> dict:
 def expected_identity(env: dict, tmp: Path) -> subprocess.CompletedProcess:
     """Run the real `lane_expected_identity` under `env`.
 
-    The env carries the LANE_GIT_* variables under test. Everything else
-    the shell would inherit is cleared, so a parent process that has a
-    lane identity pinned cannot leak one into the case.
+    The env carries the binding under test. Everything else the shell
+    would inherit is cleared, so a parent process that has a binding
+    cannot leak one into the case.
     """
     script = f'''
 . "{COMMON}"
@@ -326,111 +334,108 @@ printf 'AUTHOR=%s <%s>\\n' "$GIT_AUTHOR_NAME" "$GIT_AUTHOR_EMAIL"
                           capture_output=True, text=True)
 
 
-def case_both_variables_set(failures):
-    """Both set and non-empty: the identity resolves and is the
-    configured one."""
-    with tempfile.TemporaryDirectory() as t:
-        repo = Repo(Path(t))
-        env = {"LANE_GIT_NAME": "Lane",
-               "LANE_GIT_EMAIL": "lane@example.invalid"}
-        result = expected_identity(env, Path(t))
-        if result.returncode != 0:
-            fail(failures, "both set: exit", result.returncode)
-            fail(failures, "both set: stderr", result.stderr[-300:])
-            return
-        if result.stdout.strip() != "Lane|lane@example.invalid":
-            fail(failures, "both set: the identity", result.stdout.strip())
-            return
-        # The exporter pins it, and the lane starts with it.
-        pinned = export_identity(env, Path(t))
-        if pinned.returncode != 0:
-            fail(failures, "both set: export exit", pinned.returncode)
-            fail(failures, "both set: export stderr", pinned.stderr[-300:])
-            return
-        if "AUTHOR=Lane <lane@example.invalid>" not in pinned.stdout:
-            fail(failures, "both set: the pinned identity", pinned.stdout)
+def case_the_binding_names_the_identity(failures):
+    """The binding names the identity, and the identity resolves.
 
-
-def case_exactly_one_variable_set(failures):
-    """Exactly one set: refused, and the refusal names both variables."""
-    for set_name, set_email in (("LANE_GIT_NAME", ""),
-                                 ("", "LANE_GIT_EMAIL")):
-        env = {set_name: "Lane", set_email: "lane@example.invalid"}
-        with tempfile.TemporaryDirectory() as t:
-            repo = Repo(Path(t))
-            result = expected_identity(env, Path(t))
-            if result.returncode != 1:
-                fail(failures, f"one set ({set_name or set_email}): exit",
-                     result.returncode)
-                continue
-            for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-                if var not in result.stderr:
-                    fail(failures,
-                         f"one set ({set_name or set_email}): "
-                         f"the refusal does not name {var}",
-                         result.stderr[-300:])
-
-
-def case_both_variables_unset(failures):
-    """Both unset: refused, and the refusal names both variables."""
-    with tempfile.TemporaryDirectory() as t:
-        repo = Repo(Path(t))
-        result = expected_identity({}, Path(t))
-        if result.returncode != 1:
-            fail(failures, "both unset: exit", result.returncode)
-            return
-        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-            if var not in result.stderr:
-                fail(failures, f"both unset: the refusal does not name {var}",
-                     result.stderr[-300:])
-
-
-def case_both_variables_empty(failures):
-    """Both set but empty: refused, and the refusal names both
-    variables."""
-    with tempfile.TemporaryDirectory() as t:
-        repo = Repo(Path(t))
-        env = {"LANE_GIT_NAME": "", "LANE_GIT_EMAIL": ""}
-        result = expected_identity(env, Path(t))
-        if result.returncode != 1:
-            fail(failures, "both empty: exit", result.returncode)
-            return
-        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-            if var not in result.stderr:
-                fail(failures, f"both empty: the refusal does not name {var}",
-                     result.stderr[-300:])
-
-
-def case_the_worktree_config_is_not_the_identity(failures):
-    """The issue's acceptance row: with the variables unset and
-    `user.name` set in the worktree, the identity still refuses.
-
-    A wrong host config -- a scratch identity left behind by a CI
-    workflow -- must not pin every lane to itself and pass its own
-    check.
+    Nothing in the environment says what it is: the binding is the
+    operator's, and it is the only source.
     """
     with tempfile.TemporaryDirectory() as t:
-        repo = Repo(Path(t))
-        # The wrong host config, set in the worktree.
+        tmp = Path(t)
+        path = binding(tmp)
+        env = {"ROLES_CONFIG": str(path)}
+        result = expected_identity(env, tmp)
+        if result.returncode != 0:
+            fail(failures, "bound: exit", result.returncode)
+            fail(failures, "bound: stderr", result.stderr[-300:])
+            return
+        if result.stdout.strip() != "Lane|lane@example.invalid":
+            fail(failures, "bound: the identity", result.stdout.strip())
+            return
+        # The exporter pins it, and the lane starts with it.
+        pinned = export_identity(env, tmp)
+        if pinned.returncode != 0:
+            fail(failures, "bound: export exit", pinned.returncode)
+            fail(failures, "bound: export stderr", pinned.stderr[-300:])
+            return
+        if "AUTHOR=Lane <lane@example.invalid>" not in pinned.stdout:
+            fail(failures, "bound: the pinned identity", pinned.stdout)
+
+
+def case_a_binding_without_a_name_is_refused(failures):
+    """A binding that names no name is refused, and the refusal names
+    the key."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = tmp / "roles.toml"
+        path.write_text('[implementer]\nlogins = ["lane"]\n'
+                        'identity = { email = "lane@example.invalid" }\n')
+        result = expected_identity({"ROLES_CONFIG": str(path)}, tmp)
+        if result.returncode != 1:
+            fail(failures, "no name: exit", result.returncode)
+            return
+        if "name" not in result.stderr:
+            fail(failures, "no name: the refusal does not name the key",
+                 result.stderr[-300:])
+
+
+def case_a_binding_with_an_empty_name_is_refused(failures):
+    """A binding whose name is empty is refused, and the refusal names
+    the key."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = tmp / "roles.toml"
+        path.write_text('[implementer]\nlogins = ["lane"]\n'
+                        'identity = { name = "", email = "lane@example.invalid" }\n')
+        result = expected_identity({"ROLES_CONFIG": str(path)}, tmp)
+        if result.returncode != 1:
+            fail(failures, "empty name: exit", result.returncode)
+            return
+        if "name" not in result.stderr:
+            fail(failures, "empty name: the refusal does not name the key",
+                 result.stderr[-300:])
+
+
+def case_a_missing_binding_is_refused(failures):
+    """No binding: refused, and the refusal names the path."""
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = tmp / "absent.toml"
+        result = expected_identity({"ROLES_CONFIG": str(path)}, tmp)
+        if result.returncode != 1:
+            fail(failures, "no binding: exit", result.returncode)
+            return
+        if str(path) not in result.stderr:
+            fail(failures, "no binding: the refusal does not name the path",
+                 result.stderr[-300:])
+
+
+def case_the_checkouts_own_configuration_is_not_the_identity(failures):
+    """The issue's acceptance row: with no binding and the checkout's own
+    `user.name` set, the identity still refuses.
+
+    A wrong host configuration -- a scratch identity left behind by a CI
+    workflow -- must not pin every lane to itself and pass its own check.
+    """
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        repo = Repo(tmp)
+        # The wrong host configuration, set in the worktree.
         git(repo.path, "config", "user.name", "gates")
         git(repo.path, "config", "user.email", "gates@localhost")
-        result = expected_identity({}, Path(t))
+        result = expected_identity({"ROLES_CONFIG": str(tmp / "absent.toml")},
+                                   tmp)
         if result.returncode != 1:
             fail(failures, "worktree config: exit", result.returncode)
             fail(failures, "worktree config: stderr", result.stderr[-300:])
             return
-        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-            if var not in result.stderr:
-                fail(failures,
-                     f"worktree config: the refusal does not name {var}",
-                     result.stderr[-300:])
-        # The wrong config must not leak into stdout either: the
+        # The wrong configuration must not leak into stdout either: the
         # function refuses, so it prints no identity at all.
         if "gates" in result.stdout:
-            fail(failures, "worktree config: the wrong config was used",
+            fail(failures, "worktree config: the wrong configuration was used",
                  result.stdout)
         # And the exporter refuses too, so no lane starts with it.
-        pinned = export_identity({}, Path(t))
+        pinned = export_identity({"ROLES_CONFIG": str(tmp / "absent.toml")}, tmp)
         if pinned.returncode != 1:
             fail(failures, "worktree config: the export exit",
                  pinned.returncode)
@@ -441,21 +446,20 @@ def case_the_worktree_config_is_not_the_identity(failures):
 
 
 def case_the_refusal_starts_no_lane(failures):
-    """A refusal names both variables, and the caller stops on it: the
-    exporter returns non-zero and pins nothing, so a lane that would
-    have committed as the wrong host config never starts."""
+    """A refusal stops the caller: the exporter returns non-zero and pins
+    nothing, so a lane that would have committed as the wrong host
+    configuration never starts."""
     with tempfile.TemporaryDirectory() as t:
-        repo = Repo(Path(t))
+        tmp = Path(t)
+        repo = Repo(tmp)
         git(repo.path, "config", "user.name", "gates")
         git(repo.path, "config", "user.email", "gates@localhost")
-        pinned = export_identity({}, Path(t))
+        pinned = export_identity({"ROLES_CONFIG": str(tmp / "absent.toml")}, tmp)
         if pinned.returncode == 0:
             fail(failures, "no lane: the export exited 0")
             return
-        for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-            if var not in pinned.stderr:
-                fail(failures, f"no lane: the refusal does not name {var}",
-                     pinned.stderr[-300:])
+        if "AUTHOR=" in pinned.stdout:
+            fail(failures, "no lane: a lane was pinned anyway", pinned.stdout)
 
 
 def case_the_identity_functions_take_no_worktree(failures):
@@ -482,9 +486,10 @@ def case_the_identity_functions_take_no_worktree(failures):
                  line.strip())
 
     # Called with no argument, the identity still resolves.
-    env = {"LANE_GIT_NAME": "Lane", "LANE_GIT_EMAIL": "lane@example.invalid"}
     with tempfile.TemporaryDirectory() as t:
-        result = expected_identity(env, Path(t))
+        tmp = Path(t)
+        env = {"ROLES_CONFIG": str(binding(tmp))}
+        result = expected_identity(env, tmp)
     if result.returncode != 0:
         fail(failures, "no worktree: exit", result.returncode)
         fail(failures, "no worktree: stderr", result.stderr[-300:])
@@ -496,8 +501,10 @@ def case_the_identity_functions_take_no_worktree(failures):
 def case_no_caller_passes_a_worktree(failures):
     """No caller hands either function a worktree.
 
-    The functions take no argument, so a caller that still passes one is
-    calling a shape that is gone.
+    The functions take a repository -- a slug, never a path -- because
+    the binding names the identity per repository. A caller that passed
+    a worktree would be asking the identity where to come from, which is
+    the tree's business.
     """
     callers = {
         "lib/common.sh": ("lane_expected_identity", "export_lane_identity_env"),
@@ -505,6 +512,7 @@ def case_no_caller_passes_a_worktree(failures):
         "pipeline/implement.sh": ("lane_expected_identity",
                                   "export_lane_identity_env"),
     }
+    worktree_vars = ("wt", "WORKTREE", "worktree")
     for rel, fns in callers.items():
         path = REPO_ROOT / rel
         if not path.is_file():
@@ -526,10 +534,13 @@ def case_no_caller_passes_a_worktree(failures):
                         # A shell call passes its arguments after a
                         # space: `fn "$arg"`.
                         arg = rest.split(None, 1)
-                        if len(arg) == 2 and arg[0].startswith(('"', "$")):
-                            fail(failures,
-                                 f"no caller: {rel}:{lineno} passes an argument",
-                                 stripped)
+                        if len(arg) == 2:
+                            name = arg[0].strip('"\'')
+                            if name.startswith("$") and name[1:] in worktree_vars:
+                                fail(failures,
+                                     f"no caller: {rel}:{lineno} passes a "
+                                     "worktree",
+                                     stripped)
                         continue
                     # Take the argument list, which may hold a nested
                     # pair of brackets.
@@ -543,29 +554,33 @@ def case_no_caller_passes_a_worktree(failures):
                                 break
                             depth -= 1
                         args += ch
-                    if args.strip():
-                        fail(failures,
-                             f"no caller: {rel}:{lineno} passes an argument",
-                             stripped)
+                    for arg in args.split():
+                        name = arg.strip('"\'')
+                        if name.startswith("$") and name[1:] in worktree_vars:
+                            fail(failures,
+                                 f"no caller: {rel}:{lineno} passes a worktree",
+                                 stripped)
 
 
-def case_the_example_names_the_lane_identity(failures):
-    """`hosts.env.example` names both lane identity variables.
+def case_the_example_points_at_the_binding(failures):
+    """`hosts.env.example` points at the role binding.
 
-    After this change a lane refuses to start without them, so an
-    operator following the template has to be told which two to set.
+    The lane identity and the implementer's logins are the operator's
+    binding now, so an operator following the template has to be told
+    where to write them.
     """
     example = REPO_ROOT / "hosts.env.example"
     if not example.is_file():
         fail(failures, "example: hosts.env.example not found")
         return
     text = example.read_text()
-    for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL"):
-        if var not in text:
-            fail(failures, f"example: {var} is not named")
-    # The one fact a reader needs: what the two variables are for.
-    if "lane commit" not in text:
-        fail(failures, "example: the variables are not explained")
+    if "roles.toml.example" not in text:
+        fail(failures, "example: the binding's example is not named")
+    # The variables are gone: a tool that read one of them would be
+    # reading a second source of truth.
+    for var in ("LANE_GIT_NAME", "LANE_GIT_EMAIL", "IMPLEMENTER_LOGINS"):
+        if var in text:
+            fail(failures, f"example: {var} is still named")
 
 
 def main() -> int:
@@ -587,8 +602,9 @@ def main() -> int:
     print("PASS lane identity: a lane that rebased onto a newer main; a "
           "lane that merged a branch with foreign authors; the tree is "
           "unchanged; a clean lane is left alone; the refuse mode; the "
-          "identity is configuration and never inferred; the identity "
-          "functions take no worktree; the example names the variables")
+          "identity is the binding's and never inferred; a missing or "
+          "incomplete binding refuses; the identity functions take no "
+          "worktree; the example points at the binding")
     return 0
 
 
@@ -597,15 +613,15 @@ CASES = (case_a_lane_that_rebased_onto_a_newer_main,
          case_the_tree_is_unchanged,
          case_a_lane_with_the_right_identity_is_left_alone,
          case_the_refuse_mode_still_refuses,
-         case_both_variables_set,
-         case_exactly_one_variable_set,
-         case_both_variables_unset,
-         case_both_variables_empty,
-         case_the_worktree_config_is_not_the_identity,
+         case_the_binding_names_the_identity,
+         case_a_binding_without_a_name_is_refused,
+         case_a_binding_with_an_empty_name_is_refused,
+         case_a_missing_binding_is_refused,
+         case_the_checkouts_own_configuration_is_not_the_identity,
          case_the_refusal_starts_no_lane,
          case_the_identity_functions_take_no_worktree,
          case_no_caller_passes_a_worktree,
-         case_the_example_names_the_lane_identity)
+         case_the_example_points_at_the_binding)
 
 
 if __name__ == "__main__":

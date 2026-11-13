@@ -32,6 +32,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+from roles_fixture import roles_file
 from skill_install_fixture import install as install_skills
 BIN = REPO_ROOT / "bin" / "hermes-implement"
 
@@ -39,9 +40,13 @@ BIN = REPO_ROOT / "bin" / "hermes-implement"
 FAKE_GH = textwrap.dedent("""\
     #!/usr/bin/env bash
     # `gh api user` answers who the call would act as, which `gh_as`
-    # checks against IMPLEMENTER_LOGINS.
+    # checks against IMPLEMENTER_("test-implementer",).
     if [[ "$1" == "api" && "$2" == "user" ]]; then
         echo "test-implementer"
+        exit 0
+    fi
+    if [[ "$1" == "repo" && "$2" == "view" ]]; then
+        echo "${STUB_REPO-example-org/tooling}"
         exit 0
     fi
     if [[ "$1" == "issue" && "$2" == "view" ]]; then
@@ -177,15 +182,9 @@ def setup_env(tmp: Path, extra: dict | None = None) -> dict:
             "FAKE_HERMES_LOG": str(tmp / "fake_hermes.log"),
             "FAKE_HERMES_STATE": str(tmp / "fake_hermes.state"),
             "TOOLS_ENV": str(tmp / "fake.env"),
-            # The login the implementer role may act as. `gh_as` resolves
-            # the login the call would act as and refuses unless it is
-            # one of these.
-            "IMPLEMENTER_LOGINS": "test-implementer",
             "HERMES_HOME": str(tmp / "hermes_home"),
-            # The lane identity is configuration; the lane refuses
-            # without it.
-            "LANE_GIT_NAME": "Lane",
-            "LANE_GIT_EMAIL": "lane@example.invalid"}
+            "ROLES_CONFIG": str(roles_file(tmp / "roles.toml",
+                                            logins=("test-implementer",)))}
     base.update(extra or {})
     # The lane refuses to start when a dispatched skill differs from the
     # repository's copy. The install is the operator's own, so the suite
