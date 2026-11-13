@@ -248,13 +248,51 @@ def check_no_third_party(posts: list[dict]) -> list[Failure]:
     return [Failure("comments", f"commented by {names}")]
 
 
+def check_threads_answered(threads: list) -> list[Failure]:
+    """Every review thread is resolved or has a reply after its first comment.
+
+    No login is exempt: a thread's author never decides whether its
+    finding was addressed. An outdated thread waits, named at its
+    `originalLine` once `line` goes null.
+    """
+    failures = []
+    for thread in threads:
+        if not isinstance(thread, dict) or thread.get("isResolved"):
+            continue
+        comments = thread.get("comments")
+        comments = comments if isinstance(comments, dict) else {}
+        nodes = comments.get("nodes")
+        nodes = nodes if isinstance(nodes, list) else []
+        total = comments.get("totalCount")
+        if not isinstance(total, int):
+            total = len(nodes)
+        if total > 1:
+            continue
+        line = thread.get("line")
+        if not isinstance(line, int):
+            line = thread.get("originalLine")
+        if not isinstance(line, int):
+            line = "?"
+        author = "?"
+        first = nodes[0] if nodes else None
+        if isinstance(first, dict) and isinstance(first.get("author"), dict):
+            login = first["author"].get("login")
+            if isinstance(login, str) and login:
+                author = login
+        failures.append(Failure(
+            "threads",
+            f"{thread.get('path') or '?'}:{line} is unresolved and nobody has "
+            f"answered it; the thread was started by {author}"))
+    return failures
+
+
 def decide(*, base_tip: str, head: str, merge_base: str, head_parent: str | None,
            commit_count: int, merge: MergeOutcome | None,
            head_files: list[str], reviewed_files: list[str],
            reviewed_sha: str, commits: list[dict], expected_name: str,
            expected_email: str, require_signoff: bool, checks_pending: bool,
            pending_names: list[str], failing_names: list[str],
-           third_party: list[dict], labels: list[str]) -> Verdict:
+           third_party: list[dict], threads: list, labels: list[str]) -> Verdict:
     """Run every check, and report the ones that did not pass.
 
     Every check runs even after one fails, so a reader sees everything
@@ -269,6 +307,7 @@ def decide(*, base_tip: str, head: str, merge_base: str, head_parent: str | None
     failures += check_checks_finished(checks_pending, pending_names)
     failures += check_checks_passed(failing_names)
     failures += check_no_third_party(third_party)
+    failures += check_threads_answered(threads)
     failures += check_labels(labels)
     if failures:
         return Verdict(failures=failures)
