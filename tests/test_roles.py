@@ -244,6 +244,73 @@ def case_a_candidate_with_no_family_is_refused(failures: list[str]) -> None:
 
 
 # --------------------------------------------------------------------------
+# The teammate's backends.
+
+def case_the_backends_are_read_from_the_file(failures: list[str]) -> None:
+    # The command is the operator's setting, and the timeout is the
+    # budget it may take.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = roles_file(tmp / "roles.toml", models=FAMILIES,
+                          teammate=True, candidates=CANDIDATES,
+                          backends={"pi": {"command": "pi --model {arg}",
+                                           "timeout": 120}})
+        loaded = roles_module.load(path)
+        backend = loaded.backend("pi")
+        if backend.command != "pi --model {arg}":
+            fail(failures, "backends: the command", backend.command)
+        if backend.timeout != 120:
+            fail(failures, "backends: the timeout", str(backend.timeout))
+
+
+def case_a_backend_with_no_command_is_refused(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = roles_file(tmp / "roles.toml", models=FAMILIES,
+                          teammate=True, candidates=CANDIDATES,
+                          backends={"pi": {"timeout": 120}})
+        try:
+            roles_module.load(path)
+        except roles_module.Refusal as exc:
+            if "pi" not in exc.detail:
+                fail(failures, "backend without a command: the refusal "
+                     "does not name it", exc.detail)
+            return
+        fail(failures, "backend without a command: the binding loaded")
+
+
+def case_a_backend_with_no_timeout_takes_the_default(failures: list[str]) -> None:
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = roles_file(tmp / "roles.toml", models=FAMILIES,
+                          teammate=True, candidates=CANDIDATES,
+                          backends={"pi": {"command": "pi --model {arg}"}})
+        loaded = roles_module.load(path)
+        backend = loaded.backend("pi")
+        if backend.timeout != roles_module.DEFAULT_BACKEND_TIMEOUT:
+            fail(failures, "backend without a timeout: the timeout",
+                 str(backend.timeout))
+
+
+def case_a_kind_with_no_backend_is_refused(failures: list[str]) -> None:
+    # The tool cannot run a harness it was not told the command for.
+    with tempfile.TemporaryDirectory() as t:
+        tmp = Path(t)
+        path = roles_file(tmp / "roles.toml", models=FAMILIES,
+                          teammate=True, candidates=CANDIDATES,
+                          backends={"pi": {"command": "pi --model {arg}"}})
+        loaded = roles_module.load(path)
+        try:
+            loaded.backend("codex")
+        except roles_module.Refusal as exc:
+            if "codex" not in exc.detail:
+                fail(failures, "no backend: the refusal does not name the "
+                     "kind", exc.detail)
+            return
+        fail(failures, "no backend: it answered")
+
+
+# --------------------------------------------------------------------------
 # What the file must say.
 
 def case_a_missing_file_is_refused(failures: list[str]) -> None:
@@ -466,6 +533,10 @@ CASES = (
     case_the_candidates_are_ordered_by_family,
     case_every_candidate_in_the_implementers_family_is_refused,
     case_a_candidate_with_no_family_is_refused,
+    case_the_backends_are_read_from_the_file,
+    case_a_backend_with_no_command_is_refused,
+    case_a_backend_with_no_timeout_takes_the_default,
+    case_a_kind_with_no_backend_is_refused,
     case_a_missing_file_is_refused,
     case_a_file_without_an_implementer_is_refused,
     case_an_unknown_policy_is_refused,

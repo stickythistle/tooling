@@ -19,6 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
 
+import review_threads  # noqa: E402
 import roles  # noqa: E402
 from merge_check import MergeOutcome, decide  # noqa: E402
 from pr_gate import failed_check_names, pending_checks  # noqa: E402
@@ -84,77 +85,6 @@ def fetch_check_rollup(repo: str, number: str) -> list:
     if not isinstance(rollup, list):
         raise FetchError("statusCheckRollup: rollup was not an array")
     return rollup
-
-
-# The threads over the diff and whether each is resolved, read through
-# GraphQL: REST `pulls/N/comments` carries no resolution state. Two
-# comments per thread tell a finding from a finding with a reply, and
-# name the author of the first.
-REVIEW_THREADS_QUERY = (
-    "query($owner:String!,$name:String!,$number:Int!,$after:String){\n"
-    "  repository(owner:$owner,name:$name){pullRequest(number:$number){\n"
-    "    reviewThreads(first:100, after:$after){\n"
-    "      pageInfo{hasNextPage endCursor}\n"
-    "      nodes{isResolved isOutdated path line originalLine\n"
-    "        comments(first:2){totalCount nodes{author{login} createdAt}}}}}}}")
-
-
-def dig(payload, *keys):
-    """Walk a chain of JSON objects, answering None wherever the chain
-    stops being one."""
-    for key in keys:
-        if not isinstance(payload, dict):
-            return None
-        payload = payload.get(key)
-    return payload
-
-
-def fetch_review_threads(repo: str, number: str) -> list[dict]:
-    """Every review thread on the pull request, cursor followed to the end.
-
-    A failed page is a failed fetch: "could not check the threads" is
-    never "there was nothing to answer".
-    """
-    owner, _, name = repo.partition("/")
-    threads: list[dict] = []
-    cursor = None
-    # A hundred pages is ten thousand threads; a server that hands out a
-    # next page forever is a fault, not a pull request worth waiting on.
-    for _page in range(100):
-        args = ["-f", f"query={REVIEW_THREADS_QUERY}",
-                "-F", f"owner={owner}", "-F", f"name={name}",
-                "-F", f"number={number}"]
-        if cursor is not None:
-            args += ["-F", f"after={cursor}"]
-        try:
-            payload = gh_json("graphql", *args)
-        except FetchError as exc:
-            # The endpoint is named `graphql`, which says nothing about
-            # what the run lost; a reader needs to see the threads.
-            raise FetchError(f"review threads: {exc}") from exc
-        # GraphQL answers a failed query with HTTP 200 and an `errors`
-        # list, so a broken query would otherwise read as no threads.
-        errors = payload.get("errors") if isinstance(payload, dict) else None
-        if isinstance(errors, list) and errors:
-            raise FetchError(
-                f"review threads: {dig(errors[0], 'message') or 'the query failed'}")
-        page = dig(payload, "data", "repository", "pullRequest",
-                   "reviewThreads")
-        if not isinstance(page, dict):
-            raise FetchError("review threads: no reviewThreads in the response")
-        nodes = page.get("nodes")
-        if not isinstance(nodes, list):
-            raise FetchError("review threads: the page carried no nodes")
-        threads += [n for n in nodes if isinstance(n, dict)]
-        info = page.get("pageInfo")
-        if not isinstance(info, dict):
-            raise FetchError("review threads: the page carried no pageInfo")
-        if not info.get("hasNextPage"):
-            return threads
-        cursor = info.get("endCursor")
-        if not isinstance(cursor, str) or not cursor:
-            raise FetchError("review threads: the next page came with no cursor")
-    raise FetchError("review threads: pagination never ended")
 
 
 def git(repo_dir: str, *args: str) -> str:
@@ -611,7 +541,10 @@ def main(argv: list[str] | None = None) -> int:
             reviewer, implementers)
 
         # The threads over the diff, and whether anyone answered them.
-        threads = fetch_review_threads(repo, number)
+        try:
+            threads = review_threads.fetch(repo, number)
+        except review_threads.ThreadFetchError as exc:
+            raise FetchError(str(exc)) from exc
 
         if args.name and args.email:
             expected_name, expected_email = args.name, args.email

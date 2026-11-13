@@ -38,7 +38,7 @@ def quoted(value: str) -> str:
 def roles_file(path: Path, *, owners=DEFAULT_OWNERS, logins=DEFAULT_LOGINS,
                identity=DEFAULT_IDENTITY, identity_by_repo=None, models=None,
                teammate=False, policy="round-robin", candidates=None,
-               owner_model=None) -> Path:
+               backends=None, owner_model=None) -> Path:
     """Write a roles.toml, with every value the case names.
 
     A table a case leaves out is left out: the file under test is the one
@@ -78,6 +78,15 @@ def roles_file(path: Path, *, owners=DEFAULT_OWNERS, logins=DEFAULT_LOGINS,
                              f"model = {quoted(candidate['model'])} }},")
             lines.append("]")
         lines.append("")
+        # The backends are sub-tables of the teammate's, so they come
+        # after it and before the next top-level table.
+        for kind, body in (backends or {}).items():
+            lines.append(f"[teammate.backends.{quoted(kind)}]")
+            if "command" in body:
+                lines.append(f"command = {quoted(body['command'])}")
+            if "timeout" in body:
+                lines.append(f"timeout = {body['timeout']}")
+            lines.append("")
     if owner_model is not None:
         lines.append("[owner_model]")
         lines.append(f"model = {quoted(owner_model)}")

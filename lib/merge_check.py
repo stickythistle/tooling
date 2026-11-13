@@ -9,6 +9,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
+import review_threads
+
 # A DCO sign-off trailer: `Signed-off-by: Name <email>`.
 SIGNOFF_RE = re.compile(
     r"^Signed-off-by:\s*(?P<name>.+?)\s*<(?P<email>[^>]+)>\s*$",
@@ -257,32 +259,13 @@ def check_threads_answered(threads: list) -> list[Failure]:
     """
     failures = []
     for thread in threads:
-        if not isinstance(thread, dict) or thread.get("isResolved"):
+        if not review_threads.is_unanswered(thread):
             continue
-        comments = thread.get("comments")
-        comments = comments if isinstance(comments, dict) else {}
-        nodes = comments.get("nodes")
-        nodes = nodes if isinstance(nodes, list) else []
-        total = comments.get("totalCount")
-        if not isinstance(total, int):
-            total = len(nodes)
-        if total > 1:
-            continue
-        line = thread.get("line")
-        if not isinstance(line, int):
-            line = thread.get("originalLine")
-        if not isinstance(line, int):
-            line = "?"
-        author = "?"
-        first = nodes[0] if nodes else None
-        if isinstance(first, dict) and isinstance(first.get("author"), dict):
-            login = first["author"].get("login")
-            if isinstance(login, str) and login:
-                author = login
         failures.append(Failure(
             "threads",
-            f"{thread.get('path') or '?'}:{line} is unresolved and nobody has "
-            f"answered it; the thread was started by {author}"))
+            f"{review_threads.location(thread)} is unresolved and nobody has "
+            f"answered it; the thread was started by "
+            f"{review_threads.author(thread)}"))
     return failures
 
 

@@ -22,6 +22,10 @@ CONFIG = "roles.toml"
 # refusal: picking one for the operator would decide who reviews.
 POLICIES = ("round-robin", "fixed")
 
+# The budget a backend gets when its table names no timeout: fifteen
+# minutes, the same a review gets.
+DEFAULT_BACKEND_TIMEOUT = 900
+
 
 class Refusal(Exception):
     """A condition the tools cannot honor.
@@ -52,6 +56,19 @@ class Candidate:
 
 
 @dataclass(frozen=True)
+class Backend:
+    """One way to run a teammate: the command, and how long it may take.
+
+    The command is the operator's setting. The tool runs it as it is
+    written and names no harness of its own.
+    """
+
+    kind: str
+    command: str
+    timeout: int
+
+
+@dataclass(frozen=True)
 class Roles:
     """The operator's bindings, read from one file."""
 
@@ -64,6 +81,7 @@ class Roles:
     policy: str
     candidates: tuple[Candidate, ...]
     owner_model: str
+    backends: dict[str, Backend]
 
     def owner_login(self, repo: str) -> str:
         """The login that reviews for `repo`.
@@ -120,6 +138,20 @@ class Roles:
                 "models",
                 f"{self.path}: no family for model {model!r}: add one under "
                 "[models]")
+        return found
+
+    def backend(self, kind: str) -> Backend:
+        """The backend of a kind, or a refusal naming the kind.
+
+        A kind with no table is a refusal: the tool runs only the
+        commands the operator wrote.
+        """
+        found = self.backends.get(kind)
+        if found is None:
+            raise Refusal(
+                "teammate",
+                f"{self.path}: no teammate backend of kind {kind!r}: add "
+                f"one under [teammate.backends.{kind}]")
         return found
 
     def teammate_candidates(self, implementer_model: str) -> list[Candidate]:
@@ -261,6 +293,28 @@ def load(path: Path | None = None) -> Roles:
                 "one under [models]")
         candidates.append(Candidate(backend, model))
 
+    backends = {}
+    raw_backends = teammate.get("backends", {})
+    if not isinstance(raw_backends, dict):
+        raise Refusal("teammate", f"{path}: [teammate.backends] is not a table")
+    for kind, body in raw_backends.items():
+        if not isinstance(body, dict):
+            raise Refusal("teammate",
+                          f"{path}: [teammate.backends.{kind}] is not a table")
+        command = body.get("command")
+        if not isinstance(command, str) or not command.strip():
+            raise Refusal(
+                "teammate",
+                f"{path}: [teammate.backends.{kind}] does not name a command")
+        timeout = body.get("timeout", DEFAULT_BACKEND_TIMEOUT)
+        if isinstance(timeout, bool) or not isinstance(timeout, int) \
+                or timeout <= 0:
+            raise Refusal(
+                "teammate",
+                f"{path}: [teammate.backends.{kind}] timeout must be a "
+                "positive number of seconds")
+        backends[kind] = Backend(kind, command, timeout)
+
     owner_model = ""
     owner_table = _table(raw, "owner_model", path)
     if "model" in owner_table:
@@ -280,6 +334,7 @@ def load(path: Path | None = None) -> Roles:
         policy=policy,
         candidates=tuple(candidates),
         owner_model=owner_model,
+        backends=backends,
     )
 
 

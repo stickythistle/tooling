@@ -41,6 +41,24 @@ candidates = [
   { backend = "pi:flashnext", model = "qwen3.8-flash-next-tri" },
 ]
 
+# How each kind of harness is run. The kind is the part before the colon
+# in a candidate's backend and {arg} is the part after it, so
+# "pi:flashnext" runs the pi backend with the argument "flashnext".
+
+# {prompt} is the file the prompt is written to and {out} the file the
+# findings are read from: the command has to leave the findings JSON
+# there.
+
+# The command is a shell command line, run as written, in the worktree.
+# The timeout is in seconds and defaults to 900.
+[teammate.backends.pi]
+command = "pi --model {arg} --tools read,grep,find,ls --print \"@{prompt}\" > {out}"
+timeout = 900
+
+[teammate.backends.codex]
+command = "codex exec --ephemeral --model {arg} --sandbox read-only -o {out} - < {prompt}"
+timeout = 1200
+
 # The owner's model, for the teammate's preference: a candidate whose family
 # differs from the owner's is preferred over one that shares it.
 [owner_model]

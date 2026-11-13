@@ -1,0 +1,10 @@
+# The shared review-thread fetch and the rule for an unanswered thread.
+
+# `lib/review_threads.py` is in the `when` because the suite imports it,
+# and the two tools that read the threads through it are named beside it:
+# a change to the fetch has to run their suites too.
+
+[[gates]]
+name = "review threads tests"
+when = '^(lib/review_threads\.py|bin/merge-check|lib/merge_check\.py|lib/teammate\.py|tests/test_review_threads\.py)$'
+run = "python3 tests/test_review_threads.py"
