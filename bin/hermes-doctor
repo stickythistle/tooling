@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Health checks for the hermes agent's web stack, chat platforms and session logs.
+"""Health checks for the hermes agent's web stack, chat platforms, session logs,
+the clones lanes push from and the checkout the deployed tools come from.
 
 Each check probes the symptom, since these faults report success at the layer you would test.
 
@@ -17,6 +18,12 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The checkout this script runs out of: what "this tooling repository" means when
+# deciding whether a deployed link points at a copy of it.
+TOOLING_REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(TOOLING_REPO / "lib"))
+from lane import Refusal, load_config  # noqa: E402
 
 HERMES_HOME = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
 AGENT_DIR = HERMES_HOME / "hermes-agent"
@@ -459,6 +466,127 @@ def cmd_live(args, rep: Report) -> None:
         rep.line(OK, "at origin/main", head_sha[:12])
 
 
+# ----------------------------------------------------------------- lane clones
+
+
+def git(cwd, *args) -> subprocess.CompletedProcess:
+    """git run in *cwd*. Nothing is raised: a checkout that will not answer is a
+    fact to report, not a fault in the reporter."""
+    return subprocess.run(["git", "-C", str(cwd), *args],
+                          capture_output=True, text=True, timeout=15)
+
+
+def normalize_remote(url: str) -> str:
+    """A remote URL minus what cannot tell two clones of one repository apart: the
+    scheme, the ssh user, the host:path colon, the `.git`.
+    """
+    u = re.sub(r"^(?:ssh|git|https?)://", "", url.strip().rstrip("/"))
+    u = re.sub(r"^[^/@]*@", "", u)
+    host, slash, rest = u.partition("/")
+    if ":" in host:
+        u = host.replace(":", "/") + slash + rest
+    return u.removesuffix(".git")
+
+
+def checkout_origin(checkout: Path) -> str:
+    """What *checkout* is a copy of: its configured origin URL, or the checkout's own
+    path where the remote is missing. Config, not `remote get-url`, which
+    url.*.insteadOf rewrites into whatever host the reader pushes through.
+    """
+    url = git(checkout, "config", "--get", "remote.origin.url").stdout.strip()
+    return normalize_remote(url) if url else str(checkout)
+
+
+def containing_checkout(directory: Path, cache: dict):
+    """The root of the git checkout whose working tree holds *directory*, or None.
+
+    Cached per directory: the deployed links are dozens and they share a parent.
+    """
+    if directory not in cache:
+        out = git(directory, "rev-parse", "--show-toplevel")
+        cache[directory] = str(Path(out.stdout.strip()).resolve()) if out.returncode == 0 else None
+    return cache[directory]
+
+
+def check_clone_hook(rep: Report, clone: Path) -> None:
+    """Whether a push from *clone* runs push-guard, the last gate between a push in
+    a shape nobody intended and the remote. Linked worktrees inherit this config."""
+    if not clone.is_dir():
+        rep.line(BAD, str(clone), "clone directory is missing")
+        return
+    configured = git(clone, "config", "--get", "core.hooksPath").stdout.strip()
+    if not configured:
+        rep.line(BAD, str(clone), "core.hooksPath is unset, so no pre-push hook runs")
+        return
+    # git resolves a relative value from the top of the tree, not from wherever
+    # the doctor happens to be running.
+    hooks = Path(configured)
+    if not hooks.is_absolute():
+        hooks = clone / hooks
+    hook = hooks / "pre-push"
+    if not hooks.is_dir():
+        rep.line(BAD, str(clone), f"core.hooksPath is not a directory: {hooks}")
+    elif not hook.is_file():
+        rep.line(BAD, str(clone), f"there is no pre-push hook in {hooks}")
+    elif not os.access(hook, os.X_OK):
+        rep.line(BAD, str(clone), f"{hook} is not executable")
+    elif "push-guard" not in hook.read_text(errors="replace"):
+        rep.line(BAD, str(clone), f"{hook} does not run push-guard")
+    else:
+        rep.line(OK, str(clone), str(hooks))
+
+
+def check_deployed_tools(rep: Report, home: Path) -> None:
+    """Whether one deployed checkout serves every tooling link in ~/bin and ~/.local/bin.
+
+    Two checkouts behind the links are the fault: a lane runs the tool from one and
+    reads the wrapper from the other, and neither looks wrong alone.
+    """
+    reference = checkout_origin(TOOLING_REPO)
+    groups: dict = {}
+    cache: dict = {}
+    for bindir in (home / "bin", home / ".local" / "bin"):
+        if not bindir.is_dir():
+            continue
+        for entry in sorted(bindir.iterdir()):
+            if not entry.is_symlink():
+                continue
+            top = containing_checkout(entry.resolve().parent, cache)
+            if top and checkout_origin(Path(top)) == reference:
+                groups.setdefault(top, []).append(entry)
+
+    if not groups:
+        rep.line(OK, "one deployed checkout",
+                 f"no link under ~/bin or ~/.local/bin resolves into a copy of {TOOLING_REPO}")
+    elif len(groups) > 1:
+        detail = "; ".join(f"{top} [{len(links)} on PATH], e.g. {links[0]}"
+                           for top, links in sorted(groups.items()))
+        rep.line(BAD, "one deployed checkout", f"{len(groups)} checkouts behind the links: {detail}")
+    else:
+        top, links = next(iter(groups.items()))
+        head = git(Path(top), "rev-parse", "--short", "HEAD").stdout.strip()
+        rep.line(OK, "one deployed checkout", f"{top} at {head or 'no commit'} [{len(links)} on PATH]")
+
+
+def cmd_clones(args, rep: Report) -> None:
+    """Report the hook state of every clone a lane pushes from and the checkout the
+    deployed tools resolve into. Reports only: both are the operator's to set."""
+    try:
+        cfg = load_config()
+    except Refusal as exc:
+        rep.line("ERR", "lanes.toml", exc.detail)
+        return
+
+    rep.head("Lane clones")
+    if not cfg.repos:
+        rep.line(WARN, "lane clones", f"{cfg.path} defines no [repos] entries")
+    for repo in sorted(cfg.repos.values(), key=lambda r: str(r.clone)):
+        check_clone_hook(rep, repo.clone)
+
+    rep.head("Deployed tools")
+    check_deployed_tools(rep, Path.home())
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="hermes-doctor", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -482,10 +610,12 @@ def main() -> int:
     s.add_argument("--format", default="md", choices=["md", "jsonl", "qmd", "html"])
     s.add_argument("--out", help="output directory")
 
-    a = sub.add_parser("all", help="web (no live calls) + platforms")
+    a = sub.add_parser("all", help="web (no live calls) + platforms + clones")
     a.add_argument("--live", action="store_true")
 
     sub.add_parser("live", help="live checkout the scheduled jobs reset and run from")
+
+    sub.add_parser("clones", help="push-guard on every lane clone, one deployed tooling checkout")
 
     args = ap.parse_args()
     rep = Report()
@@ -497,11 +627,14 @@ def main() -> int:
         cmd_sessions(args, rep)
     elif args.cmd == "live":
         cmd_live(args, rep)
+    elif args.cmd == "clones":
+        cmd_clones(args, rep)
     elif args.cmd == "all":
         args.profile = None
         args.fix = False
         cmd_web(args, rep)
         cmd_platforms(args, rep)
+        cmd_clones(args, rep)
     return rep.exit_code()
 
 
