@@ -37,6 +37,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "lib"))
 
+import lane  # noqa: E402
 import lane_keeper  # noqa: E402
 
 # The repository every case spawns against.
@@ -81,11 +82,17 @@ def make_origin(tmp: Path) -> Path:
 def write_stub_tmux(bin_dir: Path) -> None:
     """A tmux that keeps its windows in a file and their panes in others.
 
-    `$STUB_DATA/windows` holds the windows that exist, one name per line,
-    and `$STUB_DATA/pane_<window>` holds a window's text. Every call is
-    logged to `$STUB_DATA/tmux.log` and to `$STUB_DATA/calls.log`, which
-    every stub writes to in one order, and the steps that order the
-    spawn are appended to `$STUB_DATA/steps.log`.
+    The server keeps its windows under the socket directory the
+    environment names: `$TMUX_TMPDIR/windows` holds the windows that
+    exist, one name per line, and `$TMUX_TMPDIR/pane_<window>` holds a
+    window's text. A tmux with no socket directory finds no server: it
+    would start one of its own, and that one sees no windows, so every
+    lane would read as gone.
+
+    Every call is logged to `$STUB_DATA/tmux.log` and to
+    `$STUB_DATA/calls.log`, which every stub writes to in one order,
+    and the steps that order the spawn are appended to
+    `$STUB_DATA/steps.log`.
 
     Text typed into a window is run, so the harness the tool started is a
     process the test can see.
@@ -100,6 +107,11 @@ for arg in "$@"; do
     if [ "$prev" = "-t" ]; then target="$arg"; fi
     prev="$arg"
 done
+sockets="${TMUX_TMPDIR:-}"
+if [ -z "$sockets" ]; then
+    echo "tmux: no server running" >&2
+    exit 1
+fi
 case "$cmd" in
 new-window)
     if [ -e "$STUB_DATA/fail_new_window" ]; then
@@ -128,7 +140,8 @@ new-window)
     present=missing
     [ -d "$dir" ] && present=present
     printf 'new-window %s worktree=%s\n' "$name" "$present" >> "$STUB_DATA/steps.log"
-    printf '%s\n' "$name" >> "$STUB_DATA/windows"
+    mkdir -p "$sockets"
+    printf '%s\n' "$name" >> "$sockets/windows"
     if [ -f "$STUB_DATA/kill_on_new_window" ]; then
         kill -TERM $PPID
         exit 143
@@ -158,22 +171,22 @@ list-windows)
     if [ -f "$STUB_DATA/hold_list_windows" ]; then
         # A test holds the read: the answer is the list the file held
         # when the read started, and the call waits for the release.
-        if [ -f "$STUB_DATA/windows" ]; then cat "$STUB_DATA/windows"; fi
+        if [ -f "$sockets/windows" ]; then cat "$sockets/windows"; fi
         rm -f "$STUB_DATA/hold_list_windows"
         while [ ! -f "$STUB_DATA/release_list_windows" ]; do sleep 0.05; done
         exit 0
     fi
-    if [ -f "$STUB_DATA/windows" ]; then cat "$STUB_DATA/windows"; fi
+    if [ -f "$sockets/windows" ]; then cat "$sockets/windows"; fi
     ;;
 capture-pane)
     name="${target#*:}"
-    if [ -f "$STUB_DATA/pane_$name" ]; then cat "$STUB_DATA/pane_$name"; fi
+    if [ -f "$sockets/pane_$name" ]; then cat "$sockets/pane_$name"; fi
     ;;
 kill-window)
     name="${target#*:}"
-    if [ -f "$STUB_DATA/windows" ]; then
-        grep -v -x "$name" "$STUB_DATA/windows" > "$STUB_DATA/windows.tmp" || true
-        mv "$STUB_DATA/windows.tmp" "$STUB_DATA/windows"
+    if [ -f "$sockets/windows" ]; then
+        grep -v -x "$name" "$sockets/windows" > "$sockets/windows.tmp" || true
+        mv "$sockets/windows.tmp" "$sockets/windows"
     fi
     printf 'kill-window %s\n' "$name" >> "$STUB_DATA/steps.log"
     ;;
@@ -290,17 +303,25 @@ exec "''' + real + r'''" "$@"
 
 
 def write_stub_ssh(bin_dir: Path) -> None:
-    """An ssh that runs the command here.
+    """An ssh that runs the command here, in the session's own environment.
 
     The lane's side effects happen on the agent host, so the tool sends
     them over ssh. The stub runs the command in this world, and execs
     it: the command's parent is then the tool, which is what a stub
     that interrupts the tool has to signal.
 
+    The far side gets the home it has and the stub's own data
+    directory, so a variable the executor fails to carry is missing
+    over there too, and a case cannot pass on the caller's
+    environment. The far side's session sets TMUX_TMPDIR empty: the
+    helper adds one of its own only when the variable is absent, and
+    the far side's tmux has to see what the executor carried.
+
     Every argument is logged as it arrives, and the arguments the far
     side would see are logged too, so a case can tell a path that
     reached the command whole from one that was split in two.
     """
+    bash = shutil.which("bash") or "/bin/bash"
     body = r'''#!/usr/bin/env bash
 printf 'ssh %s\n' "$*" >> "$STUB_DATA/ssh.log"
 for arg in "$@"; do printf 'ssh-arg %s\n' "$arg" >> "$STUB_DATA/ssh.log"; done
@@ -312,7 +333,10 @@ show_split() {
     for arg in "$@"; do printf 'ssh-split %s\n' "$arg" >> "$STUB_DATA/ssh.log"; done
 }
 show_split "$cmd"
-run_remote() { exec bash -c "$1"; }
+run_remote() {
+    exec env -i HOME="$HOME" STUB_DATA="$STUB_DATA" \
+        TMUX_TMPDIR= ''' + bash + r''' -c "$1"
+}
 run_remote "$cmd"
 '''
     path = bin_dir / "ssh"
@@ -542,12 +566,23 @@ class Env:
         directory.mkdir()
         return Env(directory)
 
+    @property
+    def sockets(self) -> Path:
+        """Where the agent host's tmux server keeps its sockets."""
+        return self.home / ".tmux-sockets"
+
     def env(self, extra: dict | None = None) -> dict:
-        """The environment the tool runs in."""
+        """The environment the tool runs in.
+
+        The socket directory is in it: the reporter runs on the agent
+        host, where the server's sockets are, and its own environment
+        names them.
+        """
         env = os.environ.copy()
         env["PATH"] = f"{self.bin}:{env['PATH']}"
         env["HOME"] = str(self.home)
         env["STUB_DATA"] = str(self.data)
+        env["TMUX_TMPDIR"] = str(self.sockets)
         env["LANE_CONFIG"] = str(self.config)
         env["LANE_PI_SETTLE"] = "0"
         env.pop("LANE_SESSION", None)
@@ -588,11 +623,20 @@ class Env:
 
     def set_pane(self, window: str, text: str) -> None:
         """What a window shows."""
-        (self.data / f"pane_{window}").write_text(text)
+        self.sockets.mkdir(parents=True, exist_ok=True)
+        (self.sockets / f"pane_{window}").write_text(text)
+
+    def open_window(self, window: str, text: str = "") -> None:
+        """A window the agent host's tmux server holds."""
+        self.sockets.mkdir(parents=True, exist_ok=True)
+        with (self.sockets / "windows").open("a") as handle:
+            handle.write(f"{window}\n")
+        if text:
+            self.set_pane(window, text)
 
     def remove_window(self, window: str) -> None:
         """A window that is gone."""
-        path = self.data / "windows"
+        path = self.sockets / "windows"
         if not path.exists():
             return
         kept = [line for line in path.read_text().splitlines() if line != window]
@@ -627,6 +671,36 @@ def set_pr(env: Env, branch: str, number: int, state: str, head: str,
 def lease_branch(issue: int, lease_id: int) -> str:
     """The branch a lease works on: its issue, and the lease that owns it."""
     return f"lane/{issue}-{lease_id}"
+
+
+def keeper_call(env: Env, path: str, body: dict | None = None) -> dict:
+    """One call to the keeper, as the writer makes it."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(f"{env.keeper_url}{path}", data=data,
+                                     method="POST" if data else "GET")
+    request.add_header("Authorization", f"Bearer {env.token}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(request, timeout=30) as answer:
+        return json.loads(answer.read().decode("utf-8"))
+
+
+def claim_body(env: Env, issue: int = 5, window: str = "tooling-5") -> dict:
+    """What a claim asks the keeper for."""
+    return {
+        "repo": REPO,
+        "issue": issue,
+        "harness": "hermes",
+        "profile": "minimax",
+        "branch": f"lane/{issue}",
+        "base": "origin/main",
+        "worktree": str(env.worktree_root / f"tooling-{issue}"),
+        "clone": str(env.clone),
+        "tmux_session": "0",
+        "window": window,
+        "session": "coord-a",
+        "harness_session": "abc123",
+    }
 
 
 def lane_worktree(env: Env, issue: int) -> Path:
@@ -1452,7 +1526,7 @@ def test_interrupted(env: Env) -> list[str]:
     if world.leases():
         failures.append(f"interrupted: the lease survived the window: "
                         f"{world.leases()}")
-    windows = (world.data / "windows")
+    windows = (world.sockets / "windows")
     if windows.exists() and "tooling-1" in windows.read_text():
         failures.append("interrupted: the window was left open")
     if (world.worktree_root / "tooling-1").exists():
@@ -1527,7 +1601,7 @@ def test_refuses_taken_places(env: Env) -> list[str]:
         failures.append("taken places: the branch was touched")
 
     world = env.sibling("window")
-    (world.data / "windows").write_text("tooling-1\n")
+    world.open_window("tooling-1")
     result = world.spawn(1)
     if result.returncode == 0:
         failures.append("taken places: a spawn took a window name that was "
@@ -1542,7 +1616,7 @@ def test_refuses_taken_places(env: Env) -> list[str]:
         failures.append("taken places: the refused spawn added the label")
     if "new-window" in world.log("tmux.log"):
         failures.append("taken places: the refused spawn opened a window")
-    if "tooling-1" not in (world.data / "windows").read_text():
+    if "tooling-1" not in (world.sockets / "windows").read_text():
         failures.append("taken places: the window was closed")
     return failures
 
@@ -1641,7 +1715,7 @@ def test_finish_merged(env: Env) -> list[str]:
     result = env.run("finish", "1")
     if result.returncode != 0:
         return [f"finish merged: the finish failed: {result.stderr.strip()!r}"]
-    if "tooling-5" in (env.data / "windows").read_text():
+    if "tooling-5" in (env.sockets / "windows").read_text():
         failures.append("finish merged: the window is still open")
     if worktree.exists():
         failures.append("finish merged: the worktree is still there")
@@ -1732,7 +1806,7 @@ def untouched(env: Env, issue: int, failures: list[str], why: str) -> None:
         failures.append(f"{why}: the worktree is gone")
     if not branch_exists(env, lease_branch(issue, 1)):
         failures.append(f"{why}: the branch is gone")
-    if f"tooling-{issue}" not in (env.data / "windows").read_text():
+    if f"tooling-{issue}" not in (env.sockets / "windows").read_text():
         failures.append(f"{why}: the window was closed")
     leases = env.leases()
     if not leases or leases[0]["state"] == "released":
@@ -2317,7 +2391,7 @@ def test_resume_open_window(env: Env) -> list[str]:
     if env.spawn(5).returncode != 0:
         return ["resume open window: the spawn failed"]
     stop_lane(env, 5)
-    (env.data / "windows").write_text("tooling-5\n")
+    env.open_window("tooling-5")
     result = env.run("resume", "1")
     if result.returncode == 0:
         failures.append("resume open window: the lane was resumed into a "
@@ -2329,7 +2403,7 @@ def test_resume_open_window(env: Env) -> list[str]:
     if row.get("state") != "stopped":
         failures.append(f"resume open window: the lease reads "
                         f"{row.get('state')!r} rather than 'stopped'")
-    if "tooling-5" not in (env.data / "windows").read_text():
+    if "tooling-5" not in (env.sockets / "windows").read_text():
         failures.append("resume open window: the window was closed")
     if "kill-window" in env.log("tmux.log"):
         failures.append("resume open window: the resume closed a window it "
@@ -2368,7 +2442,7 @@ def test_resume_interrupted(env: Env) -> list[str]:
     if result.returncode != 143:
         failures.append(f"resume interrupted: the exit status was "
                         f"{result.returncode}, not 143")
-    if "tooling-5" in (env.data / "windows").read_text():
+    if "tooling-5" in (env.sockets / "windows").read_text():
         failures.append("resume interrupted: the window was left open")
     row = lease_row(env, 1)
     if row.get("state") != "stopped":
@@ -2688,6 +2762,54 @@ def test_ssh_argv(env: Env) -> list[str]:
     return failures
 
 
+def test_remote_command_carries_the_socket_dir(env: Env) -> list[str]:
+    """The executor's command names the socket directory, unexpanded.
+
+    The far side expands it, so the dollars stay literal here: the
+    directory is the one the far side's own home holds.
+    """
+    failures = []
+    prefix = 'TMUX_TMPDIR="${TMUX_TMPDIR:-$HOME/.tmux-sockets}"'
+    for argv in (["lane-agent", "tmux", "list-windows"],
+                 ["git", "-C", "/tmp/a work tree", "status"]):
+        command = lane.Agent("agent-host")._command(argv)
+        if prefix not in command:
+            failures.append(f"remote command: the command does not carry "
+                            f"the socket directory: {command!r}")
+        if str(env.home) in command:
+            failures.append("remote command: the socket directory was "
+                            "expanded on this side")
+    return failures
+
+
+def test_remote_tmux_finds_the_server(env: Env) -> list[str]:
+    """A remote command finds the tmux server on the agent host.
+
+    The server keeps its sockets under the home the far side has, and
+    the executor carries the directory to it: a tmux that finds no
+    socket starts a second server, and a second server sees no windows,
+    so every lane would read as stopped.
+    """
+    failures = []
+    # The lease, claimed through the keeper: the record's own service.
+    answer = keeper_call(env, "/api/claim", claim_body(env))
+    lease_id = int(answer["lease"])
+    keeper_call(env, f"/api/lease/{lease_id}/opened", {})
+    # The server on the agent host, with the lane's window in it.
+    env.open_window("tooling-5", HERMES_IDLE)
+    listing = env.run("list")
+    if listing.returncode != 0:
+        failures.append(f"remote tmux: the list failed: "
+                        f"{listing.stderr.strip()!r}")
+    state = lease_row(env, lease_id).get("state")
+    if state == "stopped":
+        failures.append("remote tmux: the lease reads stopped: the far side "
+                        "found no tmux server")
+    elif state != "idle":
+        failures.append(f"remote tmux: the lease reads {state!r}, not 'idle'")
+    return failures
+
+
 def test_report_install(env: Env) -> list[str]:
     """The reporter ships with a timer, and the timer runs every minute.
 
@@ -2780,6 +2902,8 @@ CASES = [
     ("report", test_report),
     ("report-stopped", test_report_stopped),
     ("ssh-argv", test_ssh_argv),
+    ("remote-command", test_remote_command_carries_the_socket_dir),
+    ("remote-tmux", test_remote_tmux_finds_the_server),
     ("report-install", test_report_install),
 ]
 
