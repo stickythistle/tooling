@@ -314,6 +314,11 @@ class KeeperClient:
 REMOTE_PATH = ("$HOME/.local/share/mise/shims:$HOME/.local/bin:"
                "$HOME/bin:$PATH")
 
+# The socket directory a command on the agent host gets. A tmux that
+# finds no socket starts a second server, and a second server sees no
+# windows. The dollars stay literal, as PATH's do.
+REMOTE_TMUX_TMPDIR = '"${TMUX_TMPDIR:-$HOME/.tmux-sockets}"'
+
 
 class Agent:
     """The agent host, where the windows and the worktrees live.
@@ -333,9 +338,12 @@ class Agent:
         """The command, as the far side reads it.
 
         The argv is joined into one string, so a path with a space
-        reaches the far side as one argument.
+        reaches the far side as one argument. The environment the far
+        side needs travels with the command: a non-interactive ssh
+        reads no profile, so a variable left out is missing there.
         """
-        return f"PATH={REMOTE_PATH} {shlex.join(argv)}"
+        return (f"PATH={REMOTE_PATH} TMUX_TMPDIR={REMOTE_TMUX_TMPDIR} "
+                f"{shlex.join(argv)}")
 
 
 class Local:
