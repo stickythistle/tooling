@@ -18,20 +18,21 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Design/Performance/UX findings stay in REVIEW_NOTES.md: a night's review runs
-# ~13 findings and most are opinions about shape, which would bury the defects.
+# Design, performance, UX, style, and nit findings stay in REVIEW_NOTES.md.
+# Severity words change between nights, so unfamiliar severities are filed:
+# a wrong issue can be closed, while a dropped Critical finding disappears.
 #
-# Excluded rather than included, because the reviewer's severity vocabulary is
-# not stable between nights -- one wrote "Critical Security" and "Correctness",
-# another wrote bare "Critical" and "High" for the same kinds of finding. An
-# inclusion list filed nothing from the second. Excluding also fails the safe
-# way: an unfamiliar severity gets filed, and a wrongly filed issue is visible
-# and closable where a dropped Critical is neither.
-# Stamped into every issue this files, and how a later run knows which issues
-# are its own. Set it per project only if two pipelines file into one tracker,
-# and set it before the first filing: changing it orphans everything already
-# filed, which silently drops dedup back to exact-title matching.
+# MARKER identifies pipeline-owned issues; override it by project.
 MARKER = os.environ.get("PIPELINE_FINDING_MARKER", "agent-finding:")
+
+# A marker comment identifies a pipeline-owned issue by its shape as well as
+# its spelling. Older issues may carry the project's previous prefix, and
+# losing that prefix would silently drop them back to exact-title matching.
+FINDING_MARKER = re.compile(
+    rf"<!--\s*(?:{re.escape(MARKER)}|[a-z0-9][a-z0-9-]*-finding:)\s+"
+    r"[a-z0-9][a-z0-9-]*-[0-9a-f]{8}\s*-->",
+    re.I,
+)
 
 SKIPPED_SEVERITIES = re.compile(r"design|performance|\bux\b|style|nit", re.I)
 
@@ -107,14 +108,20 @@ def tokens(title):
     return {w for w in re.findall(r"[a-z0-9_]+", title.lower()) if w not in STOPWORDS}
 
 
+def token_overlap(left, right):
+    """The share of the two titles' words that are common."""
+    have, want = tokens(left), tokens(right)
+    return len(have & want) / len(have | want) if have and want else 0.0
+
+
 def ask_judge(title, candidates):
     """Ask a model whether this finding is one of these issues.
 
     Only for the middle ground the mechanical checks cannot settle.
 
-    Fails open: a judge that errors, times out or answers unintelligibly files
-    the finding. A duplicate issue is visible and closable; one dropped by a
-    confused judge is neither.
+    Fails open: a judge that errors, times out or answers unintelligibly
+    returns no match. The caller files unless an exact match already proves
+    the finding is tracked.
     """
     judge = os.environ.get("PIPELINE_DEDUP_JUDGE")
     if not judge or not candidates:
@@ -123,15 +130,16 @@ def ask_judge(title, candidates):
     prompt = (
         "Two bug reports are the same finding when they describe the same defect "
         "in the same place, however differently they are worded.\n\n"
-        f"New finding:\n{title}\n\nExisting issues:\n{listing}\n\n"
+        f"New finding:\n{title}\n\nExisting issues (oldest first):\n{listing}\n\n"
         "Reply with the number of the issue that is the same finding, or NONE. "
-        "Reply with nothing else."
+        "If several listed issues track the same finding, reply with the "
+        "earliest one. Reply with nothing else."
     )
     try:
         r = subprocess.run(shlex.split(judge) + [prompt], capture_output=True,
                            text=True, timeout=int(os.environ.get("PIPELINE_DEDUP_TIMEOUT", "180")))
     except (subprocess.TimeoutExpired, OSError) as e:
-        print(f"  judge unavailable ({e.__class__.__name__}); filing", file=sys.stderr)
+        print(f"  judge unavailable ({e.__class__.__name__}); no match", file=sys.stderr)
         return None
     m = re.search(r"\b(\d+)\b", r.stdout or "")
     if not m:
@@ -154,34 +162,78 @@ def already_filed(repo, title, fp):
     want = tokens(title)
     seen = {}
     near = []
-    for query in (f'in:title {title}', " ".join(sorted(want))[:200]):
+    queries = [f'in:title {title}']
+    if want:
+        # GitHub ANDs terms in a title search, so a rewording that adds words
+        # hides the older issue. OR keeps both spellings among the candidates;
+        # the marker and local checks still decide what may match.
+        queries.append(f"in:title ({' OR '.join(sorted(want))})")
+    for query in queries:
         r = run(["gh", "issue", "list", "--repo", repo, "--state", "all",
                  "--search", query, "--json", "number,title,body", "--limit", "50"])
         if r.returncode != 0:
             raise SystemExit(f"gh issue list failed: {r.stderr.strip()}")
         for issue in json.loads(r.stdout or "[]"):
             seen[issue["number"]] = issue
+    exact = []
+    strong = []
     for num, issue in sorted(seen.items()):
         body = issue.get("body") or ""
-        if fp in body or issue.get("title") == title:
-            return num
+        issue_title = issue.get("title", "")
+        if fp in body or issue_title == title:
+            exact.append((num, issue_title))
+            continue
         # Only against issues this pipeline filed: an overlap rule loose enough
         # to catch a rewording is loose enough to collide with a human's issue.
-        if MARKER not in body:
+        if not FINDING_MARKER.search(body):
             continue
-        have = tokens(issue.get("title", ""))
-        if not (want and have):
+        if not (want and tokens(issue_title)):
             continue
-        overlap = len(want & have) / len(want | have)
+        overlap = token_overlap(title, issue_title)
         if overlap >= 0.6:
-            return num
+            strong.append((num, issue_title))
         # Suspicious but not decisive: "Dev compose exposes API without
         # authentication on host network" against "Dev compose runs the API with
         # no bearer token, published to the host" scores 0.36 and is one defect.
-        # Lowering the threshold instead would start dropping real findings.
-        if overlap >= 0.25:
-            near.append((num, issue.get("title", "")))
-    return ask_judge(title, near)
+        # The judge decides this band, and the marker keeps human issues out.
+        if overlap >= 0.1:
+            near.append((num, issue_title))
+
+    if strong:
+        chosen_num, chosen_title = strong[0]
+        # A later rewording can overlap more strongly than the original. Ask
+        # the judge to choose the issue when an older candidate may be the
+        # same finding.
+        older_family = any(
+            num < chosen_num and token_overlap(chosen_title, other_title) >= 0.25
+            for num, other_title in near
+        )
+    else:
+        chosen_num = chosen_title = None
+        older_family = True
+
+    if older_family:
+        judged = ask_judge(title, near)
+        if judged is not None:
+            chosen_num, chosen_title = next(
+                candidate for candidate in near if candidate[0] == judged)
+        elif chosen_num is None:
+            return exact[0][0] if exact else None
+
+    confirmed = {chosen_num}
+    confirmed.update(num for num, _ in exact if num < chosen_num)
+    older_candidates = sorted(
+        (num, other_title) for num, other_title in near
+        if num < chosen_num and token_overlap(chosen_title, other_title) >= 0.25
+    )
+    for num, other_title in older_candidates:
+        if num >= min(confirmed):
+            break
+        # Overlap only nominates an older issue. The judge compares it with
+        # the selected issue before it can replace that issue.
+        if ask_judge(chosen_title, [(num, other_title)]) == num:
+            confirmed.add(num)
+    return min(confirmed)
 
 
 def main():
