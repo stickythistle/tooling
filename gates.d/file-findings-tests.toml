@@ -1,0 +1,4 @@
+[[gates]]
+name = "file findings tests"
+when = '^(pipeline/file_findings\.py|tests/test_file_findings\.py)$'
+run = "python3 tests/test_file_findings.py"
