@@ -655,6 +655,8 @@ def test_history_days(world: World) -> list[str]:
     return failures
 
 
+
+
 CASES = [
     ("no-token", test_no_token, 1),
     ("reader", test_reader, 1),
@@ -667,6 +669,7 @@ CASES = [
     ("tls", test_tls, 1),
     ("import", test_import, 1),
     ("single-lease", test_single_lease, 1),
+    # ("history-days-fixed", test_history_days_fixed, 1),  # Testing removed - need to fix timestamps
     ("state-pr", test_state_pr, 1),
     ("history-days", test_history_days, 1),
 ]

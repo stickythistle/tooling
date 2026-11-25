@@ -247,19 +247,13 @@ class Keeper:
                  for name, size in self.settings.pools.items()]
         return {"now": moment, "leases": leases, "pools": pools}
 
-    def history(self, limit: int, since: float | None = None) -> list[dict]:
+    def history(self, limit: int, since: float) -> list[dict]:
         """The lanes that have ended, the newest first."""
         conn = self.store.connection()
-        if since is not None:
-            rows = conn.execute(
-                "SELECT * FROM leases WHERE state = ? AND finished_at >= ? "
-                "ORDER BY finished_at DESC, id DESC LIMIT ?",
-                (lane.RELEASED, since, limit)).fetchall()
-        else:
-            rows = conn.execute(
-                "SELECT * FROM leases WHERE state = ? "
-                "ORDER BY finished_at DESC, id DESC LIMIT ?",
-                (lane.RELEASED, limit)).fetchall()
+        rows = conn.execute(
+            "SELECT * FROM leases WHERE state = ? AND finished_at >= ? "
+            "ORDER BY finished_at DESC, id DESC LIMIT ?",
+            (lane.RELEASED, since, limit)).fetchall()
         moment = time.time()
         return [lane.lease_record(row, moment, None) for row in rows]
 
@@ -437,7 +431,7 @@ def now_section(settings: Settings, leases: list[dict],
         "</section>")
 
 
-def history_section(settings: Settings, leases: list[dict], since: float | None = None) -> str:
+def history_section(settings: Settings, leases: list[dict], days: int) -> str:
     """The lanes that have ended, the newest first."""
 
     rows = []
@@ -460,11 +454,7 @@ def history_section(settings: Settings, leases: list[dict], since: float | None 
     if not rows:
         rows.append("<tr><td colspan=\"7\" class=\"muted\">no lane has ended"
                     "</td></tr>")
-    if since is not None:
-        days = int((time.time() - since) / (24 * 60 * 60))
-        heading = f"<h2>History · last {days} days</h2>"
-    else:
-        heading = f"<h2>History · last {DEFAULT_DAYS} days</h2>"
+    heading = f"<h2>History · last {days} days</h2>"
     return (
         "<section id=\"history\">" +
         heading +
@@ -511,9 +501,10 @@ a:hover { text-decoration: underline; }
 """
 
 
-def dashboard(keeper: Keeper, limit: int, since: float | None = None) -> str:
+def dashboard(keeper: Keeper, limit: int, days: int) -> str:
     """The page: what is live now, and what has ended."""
     moment = keeper.now()
+    since = time.time() - (days * 24 * 60 * 60)
     history_leases = keeper.history(limit, since)
     return (
         "<!DOCTYPE html>\n"
@@ -531,7 +522,7 @@ def dashboard(keeper: Keeper, limit: int, since: float | None = None) -> str:
         "refreshes itself every 30 seconds, and it changes nothing.</p>"
         "</header>\n"
         f"{now_section(keeper.settings, moment['leases'], moment['pools'])}\n"
-        f"{history_section(keeper.settings, history_leases, since)}\n"
+        f"{history_section(keeper.settings, history_leases, days)}\n"
         "</body>\n"
         "</html>\n"
     )
@@ -645,15 +636,15 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             days = self._days(query)
             limit = self._limit(query)
-            since = self._since(query) if days else None
-            self._html(200, dashboard(self.keeper, limit, since))
+            since = self._since(query)
+            self._html(200, dashboard(self.keeper, limit, days))
             return
         if path == "/api/now":
             self._json(200, self.keeper.now())
             return
         if path == "/api/history":
             limit = self._limit(query)
-            self._json(200, {"leases": self.keeper.history(limit)})
+            self._json(200, {"leases": self.keeper.history(limit, 0.0)})
             return
         match = re.fullmatch(r"/api/lease/(\d+)", path)
         if match:
@@ -682,11 +673,11 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest(f"limit {raw!r} is not a number") from None
         return max(1, min(MAX_LIMIT, limit))
 
-    def _days(self, query: dict) -> int | None:
+    def _days(self, query: dict) -> int:
         """How many days back the caller asks for."""
         raw = query.get("days", [None])[0]
         if raw is None:
-            return None
+            return DEFAULT_DAYS
         try:
             days = int(raw)
         except ValueError:
@@ -695,12 +686,10 @@ class Handler(BaseHTTPRequestHandler):
             raise BadRequest(f"days {raw!r} is not positive")
         return max(1, min(MAX_DAYS, days))
 
-    def _since(self, query: dict) -> float | None:
+    def _since(self, query: dict) -> float:
         """Cutoff time for history calls."""
         days = self._days(query)
-        if days is not None:
-            return time.time() - (days * 24 * 60 * 60)
-        return None
+        return time.time() - (days * 24 * 60 * 60)
 
     # -- the writes
 
