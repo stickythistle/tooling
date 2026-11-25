@@ -30,6 +30,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,6 +119,13 @@ new-window)
         echo "tmux: simulated failure" >&2
         exit 1
     fi
+    # The failure that hits one window and not the next: a start that
+    # fails takes one request's unit, and the next request starts.
+    if [ -e "$STUB_DATA/fail_new_window_once" ]; then
+        rm -f "$STUB_DATA/fail_new_window_once"
+        echo "tmux: simulated failure" >&2
+        exit 1
+    fi
     # A test can hold the window open: the lease is claimed by then and
     # the window is not, which is the state a second caller has to read.
     # The hold is for the first window only.
@@ -142,6 +150,12 @@ new-window)
     printf 'new-window %s worktree=%s\n' "$name" "$present" >> "$STUB_DATA/steps.log"
     mkdir -p "$sockets"
     printf '%s\n' "$name" >> "$sockets/windows"
+    # The window gets an id, the way tmux gives one, so a caller can
+    # close that window and no other.
+    id=$(( $(cat "$sockets/next_id" 2>/dev/null || echo 0) + 1 ))
+    printf '%s\n' "$id" > "$sockets/next_id"
+    printf '%s %s\n' "$id" "$name" >> "$sockets/ids"
+    printf '@%s\n' "$id"
     if [ -f "$STUB_DATA/kill_on_new_window" ]; then
         kill -TERM $PPID
         exit 143
@@ -168,6 +182,16 @@ send-keys)
     fi
     ;;
 list-windows)
+    if [ -e "$STUB_DATA/fail_list_windows" ]; then
+        # A tmux that fails for a reason of its own: the answer says
+        # nothing about the window.
+        echo "tmux: simulated failure" >&2
+        exit 1
+    fi
+    if [ -e "$STUB_DATA/no_session" ]; then
+        echo "can't find session: 0" >&2
+        exit 1
+    fi
     if [ -f "$STUB_DATA/hold_list_windows" ]; then
         # A test holds the read: the answer is the list the file held
         # when the read started, and the call waits for the release.
@@ -184,11 +208,37 @@ capture-pane)
     ;;
 kill-window)
     name="${target#*:}"
+    if [ "${target#@}" != "$target" ]; then
+        # A window id: the name it was given when it opened. An id the
+        # stub does not know is a target tmux would refuse.
+        name=$(awk -v id="${target#@}" '$1 == id {print $2; exit}' "$sockets/ids" 2>/dev/null)
+        if [ -z "$name" ]; then
+            echo "can't find window: $target" >&2
+            exit 1
+        fi
+    fi
     if [ -f "$sockets/windows" ]; then
         grep -v -x "$name" "$sockets/windows" > "$sockets/windows.tmp" || true
         mv "$sockets/windows.tmp" "$sockets/windows"
     fi
+    if [ -f "$sockets/ids" ]; then
+        awk -v n="$name" '$2 != n' "$sockets/ids" > "$sockets/ids.tmp" || true
+        mv "$sockets/ids.tmp" "$sockets/ids"
+    fi
     printf 'kill-window %s\n' "$name" >> "$STUB_DATA/steps.log"
+    ;;
+rename-window)
+    old="${target#*:}"
+    new="${@: -1}"
+    if [ -f "$sockets/windows" ]; then
+        sed "s|^${old}\$|${new}|" "$sockets/windows" > "$sockets/windows.tmp" || true
+        mv "$sockets/windows.tmp" "$sockets/windows"
+    fi
+    if [ -f "$sockets/ids" ]; then
+        awk -v o="$old" -v n="$new" '$2 == o {$2 = n} {print}' "$sockets/ids" > "$sockets/ids.tmp" || true
+        mv "$sockets/ids.tmp" "$sockets/ids"
+    fi
+    printf 'rename-window %s %s\n' "$old" "$new" >> "$STUB_DATA/steps.log"
     ;;
 esac
 exit 0
@@ -395,6 +445,7 @@ def config_text(cfg: dict, keeper_url: str, token_file: str) -> str:
     lines = [f'tmux_session = "{cfg["tmux_session"]}"',
              f'worktree_root = "{cfg["worktree_root"]}"',
              f'ready_seconds = {cfg["ready_seconds"]}',
+             f'queue_percent = {cfg.get("queue_percent", 100)}',
              ""]
     lines.append("[pools]")
     for name, size in cfg["pools"].items():
@@ -609,6 +660,21 @@ class Env:
         result = self.run("list", "--json")
         return [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
 
+    def requests(self) -> list[dict]:
+        """The requests the record holds: the ones waiting and the failed."""
+        rows = []
+        for line in self.run("list", "--json").stdout.splitlines():
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if row.get("kind") == "request":
+                rows.append(row)
+        return rows
+
+    def waiting(self) -> list[dict]:
+        """The requests waiting for a unit."""
+        return [row for row in self.requests() if row["state"] == "queued"]
+
     def steps(self) -> list[str]:
         """The ordered steps the stubs recorded."""
         path = self.data / "steps.log"
@@ -683,6 +749,24 @@ def keeper_call(env: Env, path: str, body: dict | None = None) -> dict:
         request.add_header("Content-Type", "application/json")
     with urllib.request.urlopen(request, timeout=30) as answer:
         return json.loads(answer.read().decode("utf-8"))
+
+
+def keeper_status(env: Env, path: str,
+                  body: dict | None = None) -> tuple[int, dict]:
+    """One call to the keeper, and the answer with the status it came
+    with. A refusal is an answer, not an exception."""
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = urllib.request.Request(f"{env.keeper_url}{path}", data=data,
+                                     method="POST" if data else "GET")
+    request.add_header("Authorization", f"Bearer {env.token}")
+    if data is not None:
+        request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=30) as answer:
+            return answer.status, json.loads(answer.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8")
+        return exc.code, json.loads(raw) if raw else {}
 
 
 def claim_body(env: Env, issue: int = 5, window: str = "tooling-5") -> dict:
@@ -2840,6 +2924,1159 @@ def test_report_install(env: Env) -> list[str]:
     return failures
 
 
+def test_dispatch_install(env: Env) -> list[str]:
+    """The dispatcher ships with a timer, and the timer runs every minute.
+
+    A release made by another caller, and a dispatch that failed
+    partway, are both picked up by the next tick.
+    """
+    failures = []
+    service = (REPO_ROOT / "install" / "lane-dispatch" /
+               "lane-dispatch.service")
+    timer = (REPO_ROOT / "install" / "lane-dispatch" /
+             "lane-dispatch.timer")
+    for path in (service, timer):
+        if not path.is_file():
+            failures.append(f"dispatch install: {path} is not there")
+            return failures
+    unit = service.read_text()
+    if "lane dispatch" not in unit:
+        failures.append(f"dispatch install: the service does not run the "
+                        f"dispatcher: {unit!r}")
+    if "Type=oneshot" not in unit:
+        failures.append("dispatch install: the service is not a one-shot")
+    ticks = timer.read_text()
+    if "OnUnitActiveSec=60s" not in ticks:
+        failures.append(f"dispatch install: the timer does not run every "
+                        f"minute: {ticks!r}")
+    if "WantedBy=timers.target" not in ticks:
+        failures.append("dispatch install: the timer is not installed for "
+                        "the timers target")
+    return failures
+
+
+def brief_file(env: Env) -> Path:
+    """A brief on the agent host, for the lane to read."""
+    path = env.tmp / "brief.md"
+    path.write_text("carry it out\n")
+    return path
+
+
+def age_lease(env: Env, lease_id: int, seconds: float = 3600.0) -> None:
+    """Make a lease's state older, the way an interrupted start looks."""
+    conn = sqlite3.connect(env.db, isolation_level=None, timeout=30)
+    conn.execute("UPDATE leases SET state_since = ? WHERE id = ?",
+                 (time.time() - seconds, lease_id))
+    conn.close()
+
+
+def test_taken_worktree_survives(env: Env) -> list[str]:
+    """A start whose worktree is taken fails the request, and the tree
+    somebody else made survives."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["taken worktree: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"taken worktree: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    # a tree somebody else made, at the path the request names
+    worktree = lane_worktree(env, 6)
+    made = subprocess.run(["git", "-C", str(env.clone), "worktree", "add",
+                           "-q", "-b", "somebody-else", str(worktree),
+                           "origin/main"], capture_output=True, text=True)
+    if made.returncode != 0:
+        return [f"taken worktree: the tree was not made: {made.stderr!r}"]
+    (worktree / "uncommitted.txt").write_text("work\n")
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"taken worktree: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1:
+        failures.append(f"taken worktree: the request was not marked "
+                        f"failed: {rows!r}")
+    elif failed[0]["issue"] != 6:
+        failures.append(f"taken worktree: another request was marked failed: "
+                        f"{failed!r}")
+    if not (worktree / "uncommitted.txt").exists():
+        failures.append("taken worktree: the tree somebody else made was "
+                        "removed")
+    plain = env.spawn(7, session="coord-c")
+    if plain.returncode != 0:
+        failures.append(f"taken worktree: the unit was not freed: "
+                        f"{plain.stderr.strip()!r}")
+    return failures
+
+
+def test_interrupted_start_with_a_window(env: Env) -> list[str]:
+    """An interrupted start whose window is there is left alone, and it is
+    reported.
+
+    A window found by session and name may not be the lease's: one with
+    that name could have been opened after the take.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["interrupted start: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"interrupted start: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"interrupted start: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"interrupted start: the take failed: {answer!r}"]
+    # a window with that name, opened after the take
+    env.open_window("tooling-6")
+    age_lease(env, lease)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"interrupted start: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    if "kill-window" in env.log("tmux.log"):
+        failures.append(f"interrupted start: a window was killed: "
+                        f"{env.log('tmux.log')!r}")
+    if "tooling-6" not in (env.sockets / "windows").read_text():
+        failures.append("interrupted start: the window was closed")
+    row = lease_row(env, lease)
+    if row.get("state") != "busy":
+        failures.append(f"interrupted start: the lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    listing = env.run("list", "--json")
+    shown = [json.loads(line) for line in listing.stdout.splitlines()
+             if line.strip() and json.loads(line).get("id") == lease]
+    if not shown or shown[0].get("state") != "incomplete":
+        failures.append(f"interrupted start: the list does not show the "
+                        f"lease as incomplete: {shown!r}")
+    if "ERR incomplete" not in dispatched.stderr:
+        failures.append(f"interrupted start: the dispatch reported nothing: "
+                        f"{dispatched.stderr.strip()!r}")
+    for expected in (str(lease), "tooling-6", "lane release", "rename-window"):
+        if expected not in dispatched.stderr:
+            failures.append(f"interrupted start: the report names no "
+                            f"{expected!r}: {dispatched.stderr.strip()!r}")
+    rows = env.requests()
+    if [row for row in rows if row["state"] == "failed"]:
+        failures.append(f"interrupted start: the request was marked failed: "
+                        f"{rows!r}")
+    return failures
+
+
+def test_interrupted_start_unknown_window(env: Env) -> list[str]:
+    """An interrupted start whose window cannot be read is left alone, so
+    the next dispatch tries again."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["interrupted start: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"interrupted start: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"interrupted start: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"interrupted start: the take failed: {answer!r}"]
+    age_lease(env, lease)
+    # the tmux that would answer fails for a reason of its own
+    (env.data / "fail_list_windows").write_text("")
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"interrupted start: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, lease)
+    if row.get("state") != "busy":
+        failures.append(f"interrupted start: the lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    rows = env.requests()
+    if [row for row in rows if row["state"] == "failed"]:
+        failures.append(f"interrupted start: the request was marked failed: "
+                        f"{rows!r}")
+    if "ERR incomplete" not in dispatched.stderr:
+        failures.append(f"interrupted start: the dispatch reported nothing: "
+                        f"{dispatched.stderr.strip()!r}")
+    return failures
+
+
+def test_interrupted_start_without_a_session(env: Env) -> list[str]:
+    """A tmux with no such session says the window is gone, so the lease
+    stops."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["interrupted start: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"interrupted start: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"interrupted start: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"interrupted start: the take failed: {answer!r}"]
+    age_lease(env, lease)
+    (env.data / "no_session").write_text("")
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"interrupted start: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, lease)
+    if row.get("state") != "stopped":
+        failures.append(f"interrupted start: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1 or failed[0]["issue"] != 6:
+        failures.append(f"interrupted start: the request was not marked "
+                        f"failed: {rows!r}")
+    return failures
+
+
+def test_completed_start_is_left_alone(env: Env) -> list[str]:
+    """A start that delivered its brief is recorded opened, and the
+    recovery leaves it alone."""
+    failures = []
+    brief = brief_file(env)
+    if env.spawn(5, extra=("--brief", str(brief))).returncode != 0:
+        return ["completed start: the spawn failed"]
+    age_lease(env, 1)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"completed start: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if not row.get("window_opened_at"):
+        failures.append("completed start: the start was not recorded as open")
+    if row.get("state") == "stopped":
+        failures.append("completed start: the recovery stopped a lane that "
+                        "runs")
+    if "tooling-5" not in (env.sockets / "windows").read_text():
+        failures.append("completed start: the window was closed")
+    return failures
+
+
+def test_state_read_leaves_an_unfinished_start_alone(env: Env) -> list[str]:
+    """A state read leaves a lease whose window was never recorded alone.
+
+    Its pane says nothing yet, and a state read there would move its
+    state and hide the start from the recovery.
+    """
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["state read: the spawn failed"]
+    conn = sqlite3.connect(env.db, isolation_level=None, timeout=30)
+    conn.execute("UPDATE leases SET window_opened_at = 0, state = 'idle' "
+                 "WHERE id = 1")
+    conn.close()
+    before = lease_row(env, 1)
+    env.leases()
+    after = lease_row(env, 1)
+    if after.get("state") != before.get("state"):
+        failures.append(f"state read: the state changed: "
+                        f"{before.get('state')!r} -> {after.get('state')!r}")
+    if after.get("state_since") != before.get("state_since"):
+        failures.append("state read: the state time moved")
+    return failures
+
+
+def test_brief_must_be_absolute(env: Env) -> list[str]:
+    """A brief whose path is relative is refused before anything is
+    claimed.
+
+    The lane reads the brief where it runs, and the ssh command and the
+    harness read it in different directories.
+    """
+    failures = []
+    for extra in ((), ("--queue",)):
+        result = env.spawn(5, extra=(*extra, "--brief", "brief.md"))
+        if result.returncode == 0:
+            failures.append(f"brief absolute: a relative brief was accepted: "
+                            f"{extra!r}")
+        elif "absolute" not in result.stderr:
+            failures.append(f"brief absolute: the refusal does not say the "
+                            f"path must be absolute: {result.stderr.strip()!r}")
+    if env.leases():
+        failures.append(f"brief absolute: a lease was claimed: {env.leases()!r}")
+    if env.waiting():
+        failures.append(f"brief absolute: a request was recorded: "
+                        f"{env.waiting()!r}")
+    return failures
+
+
+def test_brief_must_be_a_file(env: Env) -> list[str]:
+    """A brief that is a directory is refused before anything is claimed."""
+    failures = []
+    directory = env.tmp / "brief-dir"
+    directory.mkdir()
+    for extra in ((), ("--queue",)):
+        result = env.spawn(5, extra=(*extra, "--brief", str(directory)))
+        if result.returncode == 0:
+            failures.append(f"brief file: a directory was accepted: {extra!r}")
+        elif "brief" not in result.stderr:
+            failures.append(f"brief file: the refusal does not name the "
+                            f"brief: {result.stderr.strip()!r}")
+    if env.leases():
+        failures.append(f"brief file: a lease was claimed: {env.leases()!r}")
+    return failures
+
+
+def test_brief_replaced_by_a_directory(env: Env) -> list[str]:
+    """A brief that is a directory when the lane starts fails the start,
+    and the unit goes to the next request."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["brief replaced: the spawn failed"]
+    brief = brief_file(env)
+    queued = env.spawn(6, session="coord-b",
+                       extra=("--queue", "--brief", str(brief)))
+    if queued.returncode != 0:
+        return [f"brief replaced: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    brief.unlink()
+    brief.mkdir()
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"brief replaced: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1:
+        failures.append(f"brief replaced: the request was not marked "
+                        f"failed: {rows!r}")
+    elif "brief" not in failed[0]["detail"]:
+        failures.append(f"brief replaced: the failure names no brief: "
+                        f"{failed!r}")
+    plain = env.spawn(7, session="coord-c")
+    if plain.returncode != 0:
+        failures.append(f"brief replaced: the unit was not freed: "
+                        f"{plain.stderr.strip()!r}")
+    return failures
+
+
+def test_interrupted_start_without_a_window(env: Env) -> list[str]:
+    """A start that was cut short, with no window, ends stopped, and what
+    the start cut is still there."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["interrupted start: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"interrupted start: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"interrupted start: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"interrupted start: the take failed: {answer!r}"]
+    # the start cut a worktree, and the file in it is the lane's work
+    worktree = lane_worktree(env, 6)
+    made = subprocess.run(["git", "-C", str(env.clone), "worktree", "add",
+                           "-q", "-b", f"lane/6-{lease}", str(worktree),
+                           "origin/main"], capture_output=True, text=True)
+    if made.returncode != 0:
+        return [f"interrupted start: the tree was not made: {made.stderr!r}"]
+    (worktree / "uncommitted.txt").write_text("work\n")
+    age_lease(env, lease)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"interrupted start: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, lease)
+    if row.get("state") != "stopped":
+        failures.append(f"interrupted start: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1 or failed[0]["issue"] != 6:
+        failures.append(f"interrupted start: the request was not marked "
+                        f"failed: {rows!r}")
+    if not (worktree / "uncommitted.txt").exists():
+        failures.append("interrupted start: the work was removed")
+    return failures
+
+
+def test_interrupted_resume(env: Env) -> list[str]:
+    """A resume that was cut short keeps its worktree and its branch.
+
+    The lease of a resumed lane holds its unit before its window opens,
+    so a resume that dies in between is an interrupted start too.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["interrupted resume: the spawn failed"]
+    worktree = lane_worktree(env, 5)
+    (worktree / "uncommitted.txt").write_text("work\n")
+    branch = lease_branch(5, 1)
+    stop_lane(env, 5)
+    # the resume takes the unit back, and its window never opens
+    status, answer = keeper_status(env, "/api/lease/1/resume", {})
+    if status != 200:
+        return [f"interrupted resume: the resume failed: {answer!r}"]
+    age_lease(env, 1)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"interrupted resume: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"interrupted resume: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    if not (worktree / "uncommitted.txt").exists():
+        failures.append("interrupted resume: the worktree was removed")
+    if not git_out(env.clone, "rev-parse", "--verify", branch):
+        failures.append("interrupted resume: the branch was removed")
+    return failures
+
+
+def test_brief_removed_before_the_start(env: Env) -> list[str]:
+    """A brief that is gone when the lane starts fails the start, and the
+    unit goes to the next request."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["brief removed: the spawn failed"]
+    brief = brief_file(env)
+    queued = env.spawn(6, session="coord-b",
+                       extra=("--queue", "--brief", str(brief)))
+    if queued.returncode != 0:
+        return [f"brief removed: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    brief.unlink()
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"brief removed: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1:
+        failures.append(f"brief removed: the request was not marked failed: "
+                        f"{rows!r}")
+    elif "brief" not in failed[0]["detail"]:
+        failures.append(f"brief removed: the failure names no brief: "
+                        f"{failed!r}")
+    plain = env.spawn(7, session="coord-c")
+    if plain.returncode != 0:
+        failures.append(f"brief removed: the unit was not freed: "
+                        f"{plain.stderr.strip()!r}")
+    return failures
+
+
+def test_queue_refuses_a_cost_the_pool_cannot_hold(env: Env) -> list[str]:
+    """A request that costs more than the pool holds is refused."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    cfg["profiles"]["big"] = {"pool": "minimax", "cost": 2, "model": "Big"}
+    env.write_config(cfg)
+    failures = []
+    result = env.spawn(5, profile="big", extra=("--queue",))
+    if result.returncode == 0:
+        failures.append("queue cost: a request that can never fit was "
+                        "accepted")
+    elif "cost" not in result.stderr:
+        failures.append(f"queue cost: the refusal does not name the cost: "
+                        f"{result.stderr.strip()!r}")
+    if env.waiting():
+        failures.append(f"queue cost: the request was recorded: "
+                        f"{env.waiting()!r}")
+    return failures
+
+
+def test_queue_records(env: Env) -> list[str]:
+    """A pool that is full takes the requests up to its depth, and refuses
+    the one past it with the holders named."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["queue records: the spawn that fills the pool failed"]
+    brief = brief_file(env)
+    queued = env.spawn(6, session="coord-b",
+                       extra=("--queue", "--brief", str(brief)))
+    if queued.returncode != 0:
+        failures.append(f"queue records: the queued spawn failed: "
+                        f"{queued.stderr.strip()!r}")
+    elif "position 1" not in queued.stdout:
+        failures.append(f"queue records: the queued spawn printed no "
+                        f"position: {queued.stdout!r}")
+    rows = env.waiting()
+    if len(rows) != 1:
+        failures.append(f"queue records: the request was not recorded: {rows!r}")
+    elif rows[0]["issue"] != 6 or rows[0]["session"] != "coord-b":
+        failures.append(f"queue records: the request holds another issue or "
+                        f"session: {rows!r}")
+    over = env.spawn(7, session="coord-c",
+                     extra=("--queue", "--brief", str(brief)))
+    if over.returncode == 0:
+        failures.append("queue records: a request past the depth was accepted")
+    elif "request 1" not in over.stderr:
+        failures.append(f"queue records: the refusal did not name the "
+                        f"holder: {over.stderr.strip()!r}")
+    if len(env.waiting()) != 1:
+        failures.append(f"queue records: the refused request was recorded: "
+                        f"{env.waiting()!r}")
+    return failures
+
+
+def test_queue_claims_when_there_is_room(env: Env) -> list[str]:
+    """A queued spawn takes a unit when the pool has one, and the lane
+    reads the brief."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    brief = brief_file(env)
+    result = env.spawn(5, extra=("--queue", "--brief", str(brief)))
+    if result.returncode != 0:
+        return [f"queue with room: the spawn failed: "
+                f"{result.stderr.strip()!r}"]
+    if "lease 1" not in result.stdout:
+        failures.append(f"queue with room: the spawn reported no lease: "
+                        f"{result.stdout!r}")
+    if env.waiting():
+        failures.append(f"queue with room: the request waited for a unit "
+                        f"that was free: {env.waiting()!r}")
+    steps = env.steps()
+    if not any(step.startswith("launch Read ") and str(brief) in step
+               for step in steps):
+        failures.append(f"queue with room: the brief was not delivered: {steps}")
+    return failures
+
+
+def test_brief_without_queue(env: Env) -> list[str]:
+    """A hand spawn delivers its brief the way a queued one does."""
+    failures = []
+    brief = brief_file(env)
+    result = env.spawn(5, extra=("--brief", str(brief)))
+    if result.returncode != 0:
+        return [f"brief without queue: the spawn failed: "
+                f"{result.stderr.strip()!r}"]
+    steps = env.steps()
+    if not any(step.startswith("launch Read ") and str(brief) in step
+               for step in steps):
+        failures.append(f"brief without queue: the brief was not delivered: "
+                        f"{steps}")
+    return failures
+
+
+def test_brief_must_exist(env: Env) -> list[str]:
+    """A brief that is missing is refused while its author is there."""
+    failures = []
+    missing = env.tmp / "no-such-brief.md"
+    result = env.spawn(5, extra=("--brief", str(missing)))
+    if result.returncode == 0:
+        failures.append("brief must exist: the spawn reported success")
+    elif "brief" not in result.stderr:
+        failures.append(f"brief must exist: the refusal did not name the "
+                        f"brief: {result.stderr.strip()!r}")
+    return failures
+
+
+def test_release_starts_the_oldest(env: Env) -> list[str]:
+    """A release starts the oldest request for the pool, and the lane
+    reads its brief."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 2
+    env.write_config(cfg)
+    failures = []
+    for issue in (5, 6):
+        if env.spawn(issue).returncode != 0:
+            return [f"release starts: the spawn for issue {issue} failed"]
+    brief = brief_file(env)
+    for issue, session in ((7, "coord-b"), (8, "coord-c")):
+        queued = env.spawn(issue, session=session,
+                           extra=("--queue", "--brief", str(brief)))
+        if queued.returncode != 0:
+            failures.append(f"release starts: the enqueue for issue {issue} "
+                            f"failed: {queued.stderr.strip()!r}")
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"release starts: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    steps = env.steps()
+    if not any(step.startswith("new-window tooling-7") for step in steps):
+        failures.append(f"release starts: the oldest request did not start: "
+                        f"{steps}")
+    if any(step.startswith("new-window tooling-8") for step in steps):
+        failures.append(f"release starts: the second request started too: "
+                        f"{steps}")
+    if not any(step.startswith("launch Read ") and str(brief) in step
+               for step in steps):
+        failures.append(f"release starts: the brief was not delivered: {steps}")
+    rows = env.waiting()
+    if len(rows) != 1 or rows[0]["issue"] != 8:
+        failures.append(f"release starts: the queue does not hold the second "
+                        f"request: {rows!r}")
+    return failures
+
+
+def test_plain_spawn_refused_with_a_queue(env: Env) -> list[str]:
+    """A plain spawn is refused while a pool has requests waiting, and
+    takes a unit as it does when the queue is empty."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    plain = env.spawn(5)
+    if plain.returncode != 0:
+        failures.append(f"plain spawn: the spawn failed: "
+                        f"{plain.stderr.strip()!r}")
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        failures.append(f"plain spawn: the enqueue failed: "
+                        f"{queued.stderr.strip()!r}")
+    refused = env.spawn(7, session="coord-c")
+    if refused.returncode == 0:
+        failures.append("plain spawn: a plain spawn took the unit a request "
+                        "was waiting for")
+    elif "--queue" not in refused.stderr:
+        failures.append(f"plain spawn: the refusal did not point at --queue: "
+                        f"{refused.stderr.strip()!r}")
+    elif "1 request" not in refused.stderr:
+        failures.append(f"plain spawn: the refusal did not name the queue "
+                        f"length: {refused.stderr.strip()!r}")
+    return failures
+
+
+def test_release_races_a_plain_spawn(env: Env) -> list[str]:
+    """A release and a plain spawn that race: the request at the head of
+    the queue takes the unit every time.
+
+    The two run against one database over two connections, so the
+    transaction that frees the unit and the transaction that takes it
+    are serialized by the database itself.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    for round_number in range(6):
+        held = claim_body(env, issue=100 + round_number)
+        held["window"] = f"held-{round_number}"
+        held["worktree"] = str(env.worktree_root / f"held-{round_number}")
+        status, answer = keeper_status(env, "/api/claim", held)
+        if status != 200:
+            failures.append(f"race: the claim that fills the pool answered "
+                            f"{status}: {answer!r}")
+            return failures
+        lease = int(answer["lease"])
+        wanted = claim_body(env, issue=200 + round_number)
+        wanted["window"] = f"wanted-{round_number}"
+        wanted["worktree"] = str(env.worktree_root / f"wanted-{round_number}")
+        wanted["queue_percent"] = 100
+        status, answer = keeper_status(env, "/api/queue", wanted)
+        if status != 200:
+            failures.append(f"race: the enqueue answered {status}: {answer!r}")
+            return failures
+        answers: dict = {}
+        lock = threading.Lock()
+
+        def release() -> None:
+            code, payload = keeper_status(
+                env, f"/api/lease/{lease}/release", {})
+            with lock:
+                answers["release"] = (code, payload)
+
+        def spawn() -> None:
+            code, payload = keeper_status(
+                env, "/api/claim",
+                claim_body(env, issue=300 + round_number))
+            with lock:
+                answers["claim"] = (code, payload)
+
+        threads = [threading.Thread(target=release),
+                   threading.Thread(target=spawn)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        code, payload = answers["claim"]
+        if code != 409:
+            failures.append(f"race: the plain claim answered {code}, not a "
+                            f"refusal: {payload!r}")
+        elif payload.get("key") not in ("queue", "pool"):
+            failures.append(f"race: the refusal names neither the queue nor "
+                            f"the pool: {payload!r}")
+        code, payload = answers["release"]
+        if code != 200:
+            failures.append(f"race: the release answered {code}: {payload!r}")
+        rows = [row for row in env.leases()
+                if row.get("kind") == "lease" and row["state"] == "starting"]
+        if len(rows) != 1 or rows[0]["issue"] != 200 + round_number:
+            failures.append(f"race: the request did not take the unit: {rows!r}")
+            return failures
+        # the next round starts with an empty pool
+        keeper_status(env, f"/api/lease/{rows[0]['id']}/release", {})
+    return failures
+
+
+def test_stopped_keeps_its_unit(env: Env) -> list[str]:
+    """A lane that stopped keeps its unit while the grace lasts, so the
+    queue waits for it."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["stopped keeps its unit: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        failures.append(f"stopped keeps its unit: the enqueue failed: "
+                        f"{queued.stderr.strip()!r}")
+    stop_lane(env, 5)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"stopped keeps its unit: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    if not env.waiting():
+        failures.append("stopped keeps its unit: the request took the unit "
+                        "of a lane that stopped")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"stopped keeps its unit: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    resumed = env.run("resume", "1")
+    if resumed.returncode != 0:
+        failures.append(f"stopped keeps its unit: the resume failed: "
+                        f"{resumed.stderr.strip()!r}")
+    env.run("dispatch")
+    if not env.waiting():
+        failures.append("stopped keeps its unit: the request took the unit "
+                        "of a lane that was resumed")
+    row = lease_row(env, 1)
+    if row.get("state") != "busy":
+        failures.append(f"stopped keeps its unit: the resumed lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    return failures
+
+
+def test_stopped_grace_passes(env: Env) -> list[str]:
+    """A lane that stopped long enough ago lets the request take its
+    unit."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["stopped grace passes: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        failures.append(f"stopped grace passes: the enqueue failed: "
+                        f"{queued.stderr.strip()!r}")
+    stop_lane(env, 5)
+    # the lane stopped long enough ago that its unit is free again
+    conn = sqlite3.connect(env.db, isolation_level=None, timeout=30)
+    conn.execute("UPDATE leases SET state_since = ? WHERE id = ?",
+                 (time.time() - 3600, 1))
+    conn.close()
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"stopped grace passes: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    steps = env.steps()
+    if not any(step.startswith("new-window tooling-6") for step in steps):
+        failures.append(f"stopped grace passes: the request did not take the "
+                        f"unit: {steps}")
+    return failures
+
+
+def test_failed_start(env: Env) -> list[str]:
+    """A start that fails marks the request failed, and the next request
+    starts."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 2
+    env.write_config(cfg)
+    failures = []
+    for issue in (5, 6):
+        if env.spawn(issue).returncode != 0:
+            return [f"failed start: the spawn for issue {issue} failed"]
+    brief = brief_file(env)
+    for issue, session in ((7, "coord-b"), (8, "coord-c")):
+        queued = env.spawn(issue, session=session,
+                           extra=("--queue", "--brief", str(brief)))
+        if queued.returncode != 0:
+            failures.append(f"failed start: the enqueue for issue {issue} "
+                            f"failed: {queued.stderr.strip()!r}")
+    # the first window that opens fails
+    (env.data / "fail_new_window_once").write_text("")
+    released = env.run("release", "1")
+    if released.returncode != 0:
+        failures.append(f"failed start: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    rows = env.requests()
+    failed = [row for row in rows if row["state"] == "failed"]
+    if len(failed) != 1:
+        failures.append(f"failed start: the request was not marked failed: "
+                        f"{rows!r}")
+    elif failed[0]["issue"] != 7:
+        failures.append(f"failed start: another request was marked failed: "
+                        f"{failed!r}")
+    elif "window" not in failed[0]["detail"]:
+        failures.append(f"failed start: the failure carries no message: "
+                        f"{failed!r}")
+    steps = env.steps()
+    if not any(step.startswith("new-window tooling-8") for step in steps):
+        failures.append(f"failed start: the next request did not start: {steps}")
+    if env.waiting():
+        failures.append(f"failed start: the next request is still waiting: "
+                        f"{env.waiting()!r}")
+    return failures
+
+
+def test_two_dispatchers(env: Env) -> list[str]:
+    """Two dispatches against one starting lease: it starts once."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["two dispatchers: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        failures.append(f"two dispatchers: the enqueue failed: "
+                        f"{queued.stderr.strip()!r}")
+    # the release is made through the keeper, so no dispatcher starts it
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    if status != 200:
+        failures.append(f"two dispatchers: the release answered {status}: "
+                        f"{answer!r}")
+    procs = [subprocess.Popen([str(env.lane), "dispatch"],
+                              stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True,
+                              env=env.env()) for _ in range(2)]
+    for proc in procs:
+        proc.communicate()
+    steps = env.steps()
+    windows = [step for step in steps
+               if step.startswith("new-window tooling-6")]
+    if len(windows) != 1:
+        failures.append(f"two dispatchers: the lane was started "
+                        f"{len(windows)} times: {steps}")
+    launches = [step for step in steps if step.startswith("launch hermes-stub")]
+    if len(launches) != 2:
+        failures.append(f"two dispatchers: the harness was started "
+                        f"{len(launches)} times: {steps}")
+    return failures
+
+
+def test_dequeue(env: Env) -> list[str]:
+    """A request is removed from the queue."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["dequeue: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        failures.append(f"dequeue: the enqueue failed: "
+                        f"{queued.stderr.strip()!r}")
+    rows = env.waiting()
+    if len(rows) != 1:
+        return [f"dequeue: the request was not recorded: {rows!r}"]
+    request = rows[0]["id"]
+    removed = env.run("dequeue", str(request))
+    if removed.returncode != 0:
+        failures.append(f"dequeue: the removal failed: "
+                        f"{removed.stderr.strip()!r}")
+    if env.waiting():
+        failures.append(f"dequeue: the request is still waiting: "
+                        f"{env.waiting()!r}")
+    # the issue the request held is free again
+    if env.run("release", "1").returncode != 0:
+        failures.append("dequeue: the release failed")
+    plain = env.spawn(6, session="coord-b")
+    if plain.returncode != 0:
+        failures.append(f"dequeue: the issue was still held: "
+                        f"{plain.stderr.strip()!r}")
+    return failures
+
+
+def test_completion_between_the_lookup_and_the_stop(env: Env) -> list[str]:
+    """A start that finishes while the recovery looks is left alone.
+
+    The recovery looked and saw no window, and the start recorded its
+    window in between. The keeper stops the lease only while it is still
+    unfinished, so the lease keeps running.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["completion race: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"completion race: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"completion race: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"completion race: the take failed: {answer!r}"]
+    age_lease(env, lease)
+    # the recovery looks, and the look waits
+    (env.data / "hold_list_windows").write_text("")
+    dispatched = subprocess.Popen([str(env.lane), "dispatch"],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True,
+                                  env=env.env())
+    deadline = time.time() + 30
+    while time.time() < deadline and (env.data / "hold_list_windows").exists():
+        time.sleep(0.05)
+    # the start finishes while the recovery waits
+    status, answer = keeper_status(env, f"/api/lease/{lease}/opened", {})
+    if status != 200:
+        dispatched.kill()
+        return [f"completion race: the completion was refused: {answer!r}"]
+    (env.data / "release_list_windows").write_text("")
+    out, err = dispatched.communicate(timeout=60)
+    row = lease_row(env, lease)
+    if row.get("state") != "busy":
+        failures.append(f"completion race: the lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    if not row.get("window_opened_at"):
+        failures.append("completion race: the completion was not recorded")
+    rows = env.requests()
+    if [row for row in rows if row["state"] == "failed"]:
+        failures.append(f"completion race: the request was marked failed: "
+                        f"{rows!r}")
+    if "ERR incomplete" in err:
+        failures.append(f"completion race: the recovery reported the lease: "
+                        f"{err.strip()!r}")
+    return failures
+
+
+def test_stop_before_the_completion(env: Env) -> list[str]:
+    """A lease the recovery stopped refuses its late completion.
+
+    The start closes the window it opened itself, and the lease stays
+    stopped.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    # the spawn waits at its window, so the recovery finds no window
+    (env.data / "hold_new_window").write_text("")
+    spawned = subprocess.Popen(
+        [str(env.lane), "spawn", "--repo", REPO, "--issue", "5", "--harness",
+         "hermes", "--profile", "minimax", "--session", "coord-a"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        env=env.env())
+    deadline = time.time() + 30
+    while time.time() < deadline and not leases_in(env):
+        time.sleep(0.05)
+    if not leases_in(env):
+        spawned.kill()
+        return ["stop first: the spawn did not claim a lease"]
+    age_lease(env, 1)
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"stop first: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"stop first: the lease reads {row.get('state')!r} "
+                        f"rather than 'stopped'")
+    # the start goes on, and its completion is refused
+    (env.data / "release_new_window").write_text("")
+    out, err = spawned.communicate(timeout=60)
+    if spawned.returncode == 0:
+        failures.append("stop first: the spawn reported success")
+    elif "ERR lease" not in err:
+        failures.append(f"stop first: the spawn did not report the lease: "
+                        f"{err.strip()!r}")
+    if "tooling-5" in (env.sockets / "windows").read_text():
+        failures.append("stop first: the window the start opened was left open")
+    row = lease_row(env, 1)
+    if row.get("state") != "stopped":
+        failures.append(f"stop first: the lease reads {row.get('state')!r} "
+                        f"rather than 'stopped'")
+    return failures
+
+
+def test_release_frees_an_incomplete_lease(env: Env) -> list[str]:
+    """A release closes the window of an incomplete lease and frees the
+    unit."""
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["release incomplete: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"release incomplete: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"release incomplete: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"release incomplete: the take failed: {answer!r}"]
+    env.open_window("tooling-6")
+    age_lease(env, lease)
+    released = env.run("release", str(lease))
+    if released.returncode != 0:
+        failures.append(f"release incomplete: the release failed: "
+                        f"{released.stderr.strip()!r}")
+    row = lease_row(env, lease)
+    if row.get("state") != "released":
+        failures.append(f"release incomplete: the lease reads "
+                        f"{row.get('state')!r} rather than 'released'")
+    if "tooling-6" in (env.sockets / "windows").read_text():
+        failures.append("release incomplete: the window was left open")
+    # the unit is free
+    plain = env.spawn(7, session="coord-c")
+    if plain.returncode != 0:
+        failures.append(f"release incomplete: the unit was not freed: "
+                        f"{plain.stderr.strip()!r}")
+    return failures
+
+
+def test_renamed_window_lets_the_recovery_stop_the_lease(env: Env) -> list[str]:
+    """A window that is somebody else's can be renamed out of the way.
+
+    The next dispatch finds the lane's window absent, and the lease
+    stops without a window being killed.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 1
+    env.write_config(cfg)
+    failures = []
+    if env.spawn(5).returncode != 0:
+        return ["renamed window: the spawn failed"]
+    queued = env.spawn(6, session="coord-b", extra=("--queue",))
+    if queued.returncode != 0:
+        return [f"renamed window: the enqueue failed: "
+                f"{queued.stderr.strip()!r}"]
+    status, answer = keeper_status(env, "/api/lease/1/release", {})
+    promoted = answer.get("promoted") or []
+    if len(promoted) != 1:
+        return [f"renamed window: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{lease}/start", {})
+    if status != 200:
+        return [f"renamed window: the take failed: {answer!r}"]
+    env.open_window("tooling-6")
+    age_lease(env, lease)
+    renamed = subprocess.run([str(env.bin / "tmux"), "rename-window", "-t",
+                              "0:tooling-6", "tooling-6-other"],
+                             capture_output=True, text=True, env=env.env())
+    if renamed.returncode != 0:
+        return [f"renamed window: the rename failed: {renamed.stderr!r}"]
+    dispatched = env.run("dispatch")
+    if dispatched.returncode != 0:
+        failures.append(f"renamed window: the dispatch failed: "
+                        f"{dispatched.stderr.strip()!r}")
+    row = lease_row(env, lease)
+    if row.get("state") != "stopped":
+        failures.append(f"renamed window: the lease reads "
+                        f"{row.get('state')!r} rather than 'stopped'")
+    if "kill-window" in env.log("tmux.log"):
+        failures.append(f"renamed window: a window was killed: "
+                        f"{env.log('tmux.log')!r}")
+    if "tooling-6-other" not in (env.sockets / "windows").read_text():
+        failures.append("renamed window: the renamed window was removed")
+    return failures
+
+
+def test_batch_carries_on_after_the_recovery(env: Env) -> list[str]:
+    """A batch of promoted leases starts even when the first one loses to
+    the recovery.
+
+    The recovery fails the request of the lease it stopped, and the
+    dispatcher fails it again: that has to leave the other lease alone.
+    """
+    cfg = env.default_config()
+    cfg["pools"]["minimax"] = 2
+    env.write_config(cfg)
+    failures = []
+    for issue in (5, 6):
+        if env.spawn(issue).returncode != 0:
+            return [f"batch: the spawn for issue {issue} failed"]
+    for issue in (7, 8):
+        queued = env.spawn(issue, session="coord-b", extra=("--queue",))
+        if queued.returncode != 0:
+            failures.append(f"batch: the enqueue for issue {issue} failed: "
+                            f"{queued.stderr.strip()!r}")
+    promoted = []
+    for lease in ("1", "2"):
+        status, answer = keeper_status(env, f"/api/lease/{lease}/release", {})
+        promoted.extend(answer.get("promoted") or [])
+    if len(promoted) != 2:
+        return [f"batch: the releases did not promote two leases: "
+                f"{promoted!r}"]
+    # the dispatch takes the first lease and waits at its window
+    (env.data / "hold_new_window").write_text("")
+    dispatched = subprocess.Popen([str(env.lane), "dispatch"],
+                                  stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True,
+                                  env=env.env())
+    deadline = time.time() + 30
+    while time.time() < deadline and (env.data / "hold_new_window").exists():
+        time.sleep(0.05)
+    first = int(promoted[0]["id"])
+    status, answer = keeper_status(env, f"/api/lease/{first}/interrupted", {})
+    if status != 200:
+        dispatched.kill()
+        return [f"batch: the recovery did not stop the lease: {answer!r}"]
+    (env.data / "release_new_window").write_text("")
+    out, err = dispatched.communicate(timeout=120)
+    second = int(promoted[1]["id"])
+    row = lease_row(env, second)
+    if row.get("state") != "busy":
+        failures.append(f"batch: the second lease reads "
+                        f"{row.get('state')!r} rather than 'busy'")
+    if "tooling-8" not in (env.sockets / "windows").read_text():
+        failures.append(f"batch: the second lane did not start: "
+                        f"{err.strip()!r}")
+    return failures
+
+
 CASES = [
     ("race", test_race),
     ("read-under-a-write-lock", test_read_under_a_write_lock),
@@ -2905,6 +4142,37 @@ CASES = [
     ("remote-command", test_remote_command_carries_the_socket_dir),
     ("remote-tmux", test_remote_tmux_finds_the_server),
     ("report-install", test_report_install),
+    ("dispatch-install", test_dispatch_install),
+    ("queue-records", test_queue_records),
+    ("queue-with-room", test_queue_claims_when_there_is_room),
+    ("brief-without-queue", test_brief_without_queue),
+    ("brief-must-exist", test_brief_must_exist),
+    ("release-starts-the-oldest", test_release_starts_the_oldest),
+    ("plain-spawn-refused", test_plain_spawn_refused_with_a_queue),
+    ("release-races-a-plain-spawn", test_release_races_a_plain_spawn),
+    ("stopped-keeps-its-unit", test_stopped_keeps_its_unit),
+    ("stopped-grace-passes", test_stopped_grace_passes),
+    ("failed-start", test_failed_start),
+    ("two-dispatchers", test_two_dispatchers),
+    ("dequeue", test_dequeue),
+    ("taken-worktree-survives", test_taken_worktree_survives),
+    ("interrupted-start-window", test_interrupted_start_with_a_window),
+    ("interrupted-start-unknown-window", test_interrupted_start_unknown_window),
+    ("interrupted-start-no-session", test_interrupted_start_without_a_session),
+    ("completed-start", test_completed_start_is_left_alone),
+    ("completion-race", test_completion_between_the_lookup_and_the_stop),
+    ("stop-before-completion", test_stop_before_the_completion),
+    ("release-frees-an-incomplete-lease", test_release_frees_an_incomplete_lease),
+    ("renamed-window", test_renamed_window_lets_the_recovery_stop_the_lease),
+    ("batch-after-the-recovery", test_batch_carries_on_after_the_recovery),
+    ("state-read", test_state_read_leaves_an_unfinished_start_alone),
+    ("interrupted-start-no-window", test_interrupted_start_without_a_window),
+    ("interrupted-resume", test_interrupted_resume),
+    ("brief-removed", test_brief_removed_before_the_start),
+    ("brief-must-be-absolute", test_brief_must_be_absolute),
+    ("brief-must-be-a-file", test_brief_must_be_a_file),
+    ("brief-replaced-by-a-directory", test_brief_replaced_by_a_directory),
+    ("queue-cost", test_queue_refuses_a_cost_the_pool_cannot_hold),
 ]
 
 

@@ -2,7 +2,10 @@
 """Ask the lane keeper for the lane state, so two sessions cannot both take a lane.
 
     lane spawn --repo R --issue N --harness H --profile P
+    lane spawn --repo R --issue N --harness H --profile P --queue --brief PATH
     lane list [--json]
+    lane dispatch
+    lane dequeue REQUEST
     lane resume LEASE
     lane check LEASE
     lane release LEASE
@@ -12,6 +15,9 @@
     lane report
 
 A refusal exits 1 and names what refused.
+
+`--queue` waits for a unit when the pool is full; `--brief` names a
+brief on the agent host.
 
 `lane report` runs on the agent host, where the windows are.
 """

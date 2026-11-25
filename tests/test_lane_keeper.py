@@ -16,11 +16,13 @@ talks to it over loopback with urllib.
 import hashlib
 import json
 import shutil
+import sqlite3
 import ssl
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -70,7 +72,10 @@ class World:
                  "[listen]", "host = \"127.0.0.1\"", "port = 0", "",
                  "[pools]",
                  f"minimax = {pool_size}", "", "[profiles.minimax]",
-                 "pool = \"minimax\"", "cost = 1", "model = \"MiniMax\"", ""]
+                 "pool = \"minimax\"", "cost = 1", "model = \"MiniMax\"", "",
+                 "[profiles.big]",
+                 "pool = \"minimax\"", f"cost = {pool_size + 1}",
+                 "model = \"Big\"", ""]
         for role, token in TOKENS.items():
             lines.append("[[tokens]]")
             lines.append(f"role = \"{role}\"")
@@ -90,9 +95,10 @@ class World:
 
     def call(self, path: str, token: str | None = None, method: str = "GET",
              body: dict | None = None, scheme: str = "http",
-             context: ssl.SSLContext | None = None) -> tuple[int, str]:
+             context: ssl.SSLContext | None = None,
+             port: int | None = None) -> tuple[int, str]:
         """One request, and the answer."""
-        url = f"{scheme}://127.0.0.1:{self.port}{path}"
+        url = f"{scheme}://127.0.0.1:{port or self.port}{path}"
         data = json.dumps(body).encode("utf-8") if body is not None else None
         request = urllib.request.Request(url, data=data, method=method)
         if token:
@@ -411,6 +417,64 @@ def make_cert(tmp: Path) -> tuple[Path, Path]:
     return cert, key
 
 
+MAIN_SCHEMA = """
+CREATE TABLE leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
+    harness TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    model TEXT NOT NULL,
+    pool TEXT NOT NULL,
+    cost INTEGER NOT NULL,
+    branch TEXT NOT NULL,
+    base TEXT NOT NULL,
+    base_sha TEXT NOT NULL DEFAULT '',
+    worktree TEXT NOT NULL,
+    clone TEXT NOT NULL,
+    tmux_session TEXT NOT NULL,
+    window TEXT NOT NULL,
+    window_opened_at REAL NOT NULL DEFAULT 0,
+    session TEXT NOT NULL,
+    harness_session TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    state_since REAL NOT NULL,
+    created_at REAL NOT NULL,
+    finished_at REAL,
+    outcome TEXT,
+    pr INTEGER,
+    pr_state TEXT
+);
+CREATE INDEX IF NOT EXISTS leases_by_state ON leases(state);
+CREATE INDEX IF NOT EXISTS leases_by_pool ON leases(pool);
+"""
+
+
+def main_database(path: Path) -> None:
+    """A database as the record was before it grew a queue.
+
+    The tables and the columns are the ones it had then: the migration
+    has to add what it grew since, and every row in it has to stay
+    readable.
+    """
+    conn = sqlite3.connect(path, isolation_level=None, timeout=30)
+    conn.executescript(MAIN_SCHEMA)
+    for number, state in ((1, "busy"), (2, "released")):
+        conn.execute(
+            "INSERT INTO leases (id, repo, issue, harness, profile, model, "
+            "pool, cost, branch, base, worktree, clone, tmux_session, "
+            "window, session, harness_session, state, state_since, "
+            "created_at, finished_at, outcome) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (number, REPO, 100 + number, "hermes", "minimax", "MiniMax",
+             "minimax", 1, f"lane/{100 + number}-{number}", "origin/main",
+             f"/wt/tooling-{100 + number}", "/clone", "0",
+             f"tooling-{100 + number}", "coord-a", "abc123", state, 1.0, 1.0,
+             2.0 if state == "released" else None,
+             "released" if state == "released" else None))
+    conn.close()
+
+
 def old_database(path: Path, count: int = 2) -> None:
     """A database from before the keeper owned the record.
 
@@ -521,6 +585,399 @@ def test_state_pr(world: World) -> list[str]:
     return failures
 
 
+def queue_body(world: World, issue: int, percent: int = 100) -> dict:
+    """What an enqueue asks the keeper for."""
+    body = world.claim_body(issue=issue)
+    body["queue_percent"] = percent
+    return body
+
+
+def hold_place(world: World, issue: int) -> int:
+    """A lease that holds a place, written into the record.
+
+    A lane that stopped long ago still holds its issue: it took no unit
+    with it, and the request waiting for that issue cannot start.
+    """
+    conn = sqlite3.connect(world.db, isolation_level=None, timeout=30)
+    cursor = conn.execute(
+        "INSERT INTO leases (repo, issue, harness, profile, model, pool, "
+        "cost, branch, base, worktree, clone, tmux_session, window, "
+        "session, state, state_since, created_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (REPO, issue, "hermes", "minimax", "MiniMax", "minimax", 1,
+         f"lane/{issue}", "origin/main", f"/wt/tooling-{issue}", "/clone",
+         "0", f"tooling-{issue}", "coord-a", "stopped", time.time() - 3600,
+         time.time()))
+    lease = int(cursor.lastrowid)
+    conn.close()
+    return lease
+
+
+def test_queue(world: World) -> list[str]:
+    """A pool that is full takes a request, and the release that frees the
+    unit promotes it."""
+    failures = []
+    status, answer = world.claim(issue=5)
+    if status != 200:
+        return [f"queue: the claim failed: {answer!r}"]
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 6))
+    if status != 200:
+        return [f"queue: the enqueue failed: {answer!r}"]
+    payload = json.loads(answer)
+    if payload.get("status") != "queued":
+        failures.append(f"queue: the request was not recorded: {answer!r}")
+    elif payload.get("position") != 1:
+        failures.append(f"queue: the request has no position: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    waiting = json.loads(answer).get("queue") or []
+    if len(waiting) != 1 or waiting[0].get("issue") != 6:
+        failures.append(f"queue: the request is not in the record: {answer!r}")
+    # a plain claim is refused while a request waits for the unit
+    status, answer = world.call("/api/claim", token=TOKENS["writer"],
+                                method="POST", body=world.claim_body(issue=7))
+    if status != 409:
+        failures.append(f"queue: a plain claim took the unit a request was "
+                        f"waiting for: {answer!r}")
+    elif json.loads(answer).get("key") != "queue":
+        failures.append(f"queue: the refusal does not name the queue: "
+                        f"{answer!r}")
+    # the release promotes the request, and the lease holds the unit
+    status, answer = world.call("/api/lease/1/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    if status != 200:
+        failures.append(f"queue: the release failed: {answer!r}")
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1:
+        failures.append(f"queue: the release did not promote the request: "
+                        f"{answer!r}")
+    elif promoted[0].get("state") != "starting":
+        failures.append(f"queue: the promoted lease is not starting: "
+                        f"{answer!r}")
+    elif promoted[0].get("issue") != 6:
+        failures.append(f"queue: another request was promoted: {answer!r}")
+    status, answer = world.call("/api/claim", token=TOKENS["writer"],
+                                method="POST", body=world.claim_body(issue=7))
+    if status != 409:
+        failures.append(f"queue: a claim took the unit of a starting lease: "
+                        f"{answer!r}")
+    return failures
+
+
+def test_queue_depth(world: World) -> list[str]:
+    """The queue holds as many requests as the pool has units, and refuses
+    the one past it."""
+    failures = []
+    status, answer = world.claim(issue=5)
+    if status != 200:
+        return [f"queue depth: the claim failed: {answer!r}"]
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 6))
+    if status != 200:
+        failures.append(f"queue depth: the enqueue failed: {answer!r}")
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 7))
+    if status != 409:
+        failures.append(f"queue depth: a request past the depth was "
+                        f"accepted: {answer!r}")
+    elif "request" not in json.loads(answer).get("detail", ""):
+        failures.append(f"queue depth: the refusal names no holder: "
+                        f"{answer!r}")
+    return failures
+
+
+def test_queue_percent(world: World) -> list[str]:
+    """The depth is a percentage of the pool, rounded down."""
+    failures = []
+    for issue in range(5, 9):
+        status, answer = world.claim(issue=issue)
+        if status != 200:
+            return [f"queue percent: the claim failed: {answer!r}"]
+    accepted = 0
+    for issue in range(9, 13):
+        status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                    method="POST",
+                                    body=queue_body(world, issue, 50))
+        if status == 200:
+            accepted += 1
+            continue
+        break
+    if accepted != 2:
+        failures.append(f"queue percent: the queue held {accepted} requests, "
+                        f"not two")
+    return failures
+
+
+def test_queue_order(world: World) -> list[str]:
+    """The requests start in the order they were queued."""
+    failures = []
+    for issue in (5, 6):
+        status, answer = world.claim(issue=issue)
+        if status != 200:
+            return [f"queue order: the claim failed: {answer!r}"]
+    for issue in (7, 8):
+        status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                    method="POST",
+                                    body=queue_body(world, issue))
+        if status != 200:
+            failures.append(f"queue order: the enqueue failed: {answer!r}")
+    # the pool is full: nothing is promoted until a unit is free
+    status, answer = world.call("/api/promote", token=TOKENS["writer"],
+                                method="POST", body={})
+    promoted = json.loads(answer).get("leases") or []
+    if promoted:
+        failures.append(f"queue order: a request was promoted with no unit "
+                        f"free: {answer!r}")
+    # the release that frees a unit promotes the oldest request
+    status, answer = world.call("/api/lease/1/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1 or promoted[0].get("issue") != 7:
+        failures.append(f"queue order: the wrong request was promoted: "
+                        f"{answer!r}")
+    status, answer = world.call("/api/lease/2/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1 or promoted[0].get("issue") != 8:
+        failures.append(f"queue order: the second request did not start: "
+                        f"{answer!r}")
+    return failures
+
+
+def test_dequeue(world: World) -> list[str]:
+    """A writer removes a request, waiting or failed."""
+    failures = []
+    status, answer = world.claim(issue=5)
+    if status != 200:
+        return [f"dequeue: the claim failed: {answer!r}"]
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 6))
+    if status != 200:
+        return [f"dequeue: the enqueue failed: {answer!r}"]
+    request = json.loads(answer).get("queue")
+    status, answer = world.call(f"/api/queue/{request}/dequeue",
+                                token=TOKENS["writer"], method="POST",
+                                body={})
+    if status != 200:
+        failures.append(f"dequeue: the removal failed: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    if json.loads(answer).get("queue"):
+        failures.append(f"dequeue: the request is still waiting: {answer!r}")
+    # a request that is gone says so
+    status, answer = world.call(f"/api/queue/{request}/dequeue",
+                                token=TOKENS["writer"], method="POST",
+                                body={})
+    if status != 409:
+        failures.append(f"dequeue: a request that is gone was removed: "
+                        f"{answer!r}")
+    return failures
+
+
+def test_dashboard_queue(world: World) -> list[str]:
+    """The page shows the requests waiting, beside the pool bars."""
+    failures = []
+    status, answer = world.claim(issue=5)
+    if status != 200:
+        return [f"dashboard queue: the claim failed: {answer!r}"]
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 6))
+    if status != 200:
+        return [f"dashboard queue: the enqueue failed: {answer!r}"]
+    status, page = world.call("/", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"dashboard queue: the page answered {status}: "
+                        f"{page[:120]!r}")
+        return failures
+    if "tooling-6" not in page and f"{REPO}#6" not in page:
+        failures.append("dashboard queue: the page shows no waiting request")
+    if "coord-a" not in page:
+        failures.append("dashboard queue: the page shows no session")
+    return failures
+
+
+def test_migration(world: World) -> list[str]:
+    """A database from before the queue is brought up to date, and every
+    row in it stays readable."""
+    failures = []
+    old = world.tmp / "old-lanes.db"
+    main_database(old)
+    settings = replace(lane_keeper.load_settings(world.config), database=old)
+    server = lane_keeper.make_server(settings)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        status, answer = world.call("/api/history", token=TOKENS["reader"],
+                                    port=port)
+        if status != 200:
+            failures.append(f"migration: the history answered {status}: "
+                            f"{answer[:120]!r}")
+            return failures
+        records = json.loads(answer)["leases"]
+        if len(records) != 1 or records[0].get("issue") != 102:
+            failures.append(f"migration: the history does not hold the old "
+                            f"row: {records!r}")
+        status, answer = world.call("/api/now", token=TOKENS["reader"],
+                                    port=port)
+        if status != 200:
+            failures.append(f"migration: the now answered {status}: "
+                            f"{answer[:120]!r}")
+            return failures
+        leases = json.loads(answer)["leases"]
+        if len(leases) != 1 or leases[0].get("issue") != 101:
+            failures.append(f"migration: the live row did not come through: "
+                            f"{leases!r}")
+        # the queue works on the database the migration brought up to date
+        status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                    method="POST",
+                                    body=queue_body(world, 7), port=port)
+        if status != 200:
+            failures.append(f"migration: the queue refused the old "
+                            f"database: {answer[:120]!r}")
+    finally:
+        server.shutdown()
+        server.server_close()
+    return failures
+
+
+def test_promotion_refusal(world: World) -> list[str]:
+    """A request whose place is taken is marked failed, and the next
+    request starts.
+
+    The keeper refuses a claim for a place a waiting request holds, so
+    the lease that takes one is a lease the record already held. The
+    test writes it.
+    """
+    failures = []
+    for issue in (5, 8):
+        status, answer = world.claim(issue=issue)
+        if status != 200:
+            return [f"promotion refusal: the claim failed: {answer!r}"]
+    for issue in (6, 7):
+        status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                    method="POST",
+                                    body=queue_body(world, issue))
+        if status != 200:
+            failures.append(f"promotion refusal: the enqueue failed: "
+                            f"{answer!r}")
+    holder = hold_place(world, 6)
+    status, answer = world.call("/api/lease/1/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    if status != 200:
+        failures.append(f"promotion refusal: the release failed: {answer!r}")
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1 or promoted[0].get("issue") != 7:
+        failures.append(f"promotion refusal: the next request did not "
+                        f"start: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    failed = json.loads(answer).get("failed") or []
+    if len(failed) != 1:
+        failures.append(f"promotion refusal: the request was not marked "
+                        f"failed: {answer!r}")
+    elif failed[0].get("issue") != 6:
+        failures.append(f"promotion refusal: another request was marked "
+                        f"failed: {failed!r}")
+    elif str(holder) not in failed[0].get("detail", ""):
+        failures.append(f"promotion refusal: the failure names no holder: "
+                        f"{failed!r}")
+    return failures
+
+
+def test_impossible_request(world: World) -> list[str]:
+    """A request that can never fit in the pool is marked failed, and the
+    next request starts."""
+    failures = []
+    for issue in (5, 8):
+        status, answer = world.claim(issue=issue)
+        if status != 200:
+            return [f"impossible request: the claim failed: {answer!r}"]
+    body = queue_body(world, 6)
+    body["profile"] = "big"
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=body)
+    if status != 200:
+        failures.append(f"impossible request: the enqueue failed: {answer!r}")
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 7))
+    if status != 200:
+        failures.append(f"impossible request: the second enqueue failed: "
+                        f"{answer!r}")
+    status, answer = world.call("/api/lease/1/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1 or promoted[0].get("issue") != 7:
+        failures.append(f"impossible request: the next request did not "
+                        f"start: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    failed = json.loads(answer).get("failed") or []
+    if len(failed) != 1:
+        failures.append(f"impossible request: the request was not marked "
+                        f"failed: {answer!r}")
+    else:
+        detail = failed[0].get("detail", "")
+        if "3" not in detail or "2" not in detail:
+            failures.append(f"impossible request: the failure names no cost "
+                            f"and size: {failed!r}")
+    return failures
+
+
+def test_fail_takes_the_lease_with_it(world: World) -> list[str]:
+    """A failed start takes its lease with it, and a retry changes
+    nothing.
+
+    The dispatcher that dies between the two writes leaves no request
+    pointing at a lease that is gone.
+    """
+    failures = []
+    status, answer = world.claim(issue=5)
+    if status != 200:
+        return [f"fail with lease: the claim failed: {answer!r}"]
+    status, answer = world.call("/api/queue", token=TOKENS["writer"],
+                                method="POST", body=queue_body(world, 6))
+    if status != 200:
+        return [f"fail with lease: the enqueue failed: {answer!r}"]
+    request = json.loads(answer)["queue"]
+    status, answer = world.call("/api/lease/1/release", token=TOKENS["writer"],
+                                method="POST", body={})
+    promoted = json.loads(answer).get("promoted") or []
+    if len(promoted) != 1:
+        return [f"fail with lease: the release did not promote: {answer!r}"]
+    lease = int(promoted[0]["id"])
+    # the dispatcher takes the lease before it starts it
+    status, answer = world.call(f"/api/lease/{lease}/start",
+                                token=TOKENS["writer"], method="POST", body={})
+    if status != 200:
+        return [f"fail with lease: the take failed: {answer!r}"]
+    body = {"detail": "the start did not work", "lease": lease}
+    status, answer = world.call(f"/api/queue/{request}/fail",
+                                token=TOKENS["writer"], method="POST",
+                                body=body)
+    if status != 200:
+        failures.append(f"fail with lease: the failure was refused: "
+                        f"{answer!r}")
+    status, answer = world.call(f"/api/lease/{lease}", token=TOKENS["reader"])
+    if status != 404:
+        failures.append(f"fail with lease: the lease survived: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    failed = json.loads(answer).get("failed") or []
+    if len(failed) != 1 or failed[0].get("issue") != 6:
+        failures.append(f"fail with lease: the request was not failed: "
+                        f"{answer!r}")
+    # the same call again: the lease is gone and the request is failed,
+    # and the answer is still a success
+    status, answer = world.call(f"/api/queue/{request}/fail",
+                                token=TOKENS["writer"], method="POST",
+                                body=body)
+    if status != 200:
+        failures.append(f"fail with lease: the retry was refused: {answer!r}")
+    status, answer = world.call("/api/now", token=TOKENS["reader"])
+    failed = json.loads(answer).get("failed") or []
+    if len(failed) != 1:
+        failures.append(f"fail with lease: the retry changed the record: "
+                        f"{answer!r}")
+    return failures
+
+
 CASES = [
     ("no-token", test_no_token, 1),
     ("reader", test_reader, 1),
@@ -534,6 +991,16 @@ CASES = [
     ("import", test_import, 1),
     ("single-lease", test_single_lease, 1),
     ("state-pr", test_state_pr, 1),
+    ("queue", test_queue, 1),
+    ("queue-depth", test_queue_depth, 1),
+    ("queue-percent", test_queue_percent, 4),
+    ("queue-order", test_queue_order, 2),
+    ("dequeue", test_dequeue, 1),
+    ("dashboard-queue", test_dashboard_queue, 1),
+    ("migration", test_migration, 1),
+    ("promotion-refusal", test_promotion_refusal, 2),
+    ("impossible-request", test_impossible_request, 2),
+    ("fail-with-lease", test_fail_takes_the_lease_with_it, 1),
 ]
 
 

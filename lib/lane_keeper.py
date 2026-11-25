@@ -232,7 +232,8 @@ class Keeper:
         self.store = Store(settings.database)
 
     def now(self) -> dict:
-        """The lanes that are live, and what each pool has taken."""
+        """The lanes that are live, the requests waiting, and what each
+        pool has taken."""
         conn = self.store.connection()
         moment = time.time()
         leases = [lane.lease_record(row, moment, None)
@@ -241,7 +242,16 @@ class Keeper:
                   "used": lane.pool_used(conn, name),
                   "size": size}
                  for name, size in self.settings.pools.items()]
-        return {"now": moment, "leases": leases, "pools": pools}
+        waiting = []
+        positions: dict[str, int] = {}
+        for row in lane.queued_requests(conn):
+            positions[row["pool"]] = positions.get(row["pool"], 0) + 1
+            waiting.append(lane.queue_record(row, positions[row["pool"]],
+                                             moment))
+        failed = [lane.queue_record(row, None, moment)
+                  for row in lane.failed_requests(conn)]
+        return {"now": moment, "leases": leases, "pools": pools,
+                "queue": waiting, "failed": failed}
 
     def history(self, limit: int) -> list[dict]:
         """The lanes that have ended, the newest first."""
@@ -262,6 +272,7 @@ LEASE_COLUMNS = (
     "branch", "base", "base_sha", "worktree", "clone", "tmux_session",
     "window", "window_opened_at", "session", "harness_session", "state",
     "state_since", "created_at", "finished_at", "outcome", "pr", "pr_state",
+    "brief", "queue_id",
 )
 
 # The value each column takes in an older database.
@@ -273,6 +284,8 @@ IMPORT_DEFAULTS = {
     "outcome": None,
     "pr": None,
     "pr_state": None,
+    "brief": "",
+    "queue_id": None,
 }
 
 
@@ -330,21 +343,6 @@ def import_leases(settings: Settings, source: Path) -> int:
 
 # ----- the page ------------------------------------------------------------
 
-def human_age(seconds: float) -> str:
-    """How long, in the units a person reads."""
-    seconds = int(max(0.0, seconds))
-    if seconds < 60:
-        return f"{seconds}s"
-    minutes, rest = divmod(seconds, 60)
-    if minutes < 60:
-        return f"{minutes}m"
-    hours, minutes = divmod(minutes, 60)
-    if hours < 24:
-        return f"{hours}h {minutes}m"
-    days, hours = divmod(hours, 24)
-    return f"{days}d {hours}h"
-
-
 def clock(timestamp: float | None) -> str:
     """The time of day, as the page shows it."""
     if not timestamp:
@@ -395,8 +393,51 @@ def pool_bars(settings: Settings, pools: list[dict]) -> str:
     return "".join(bars)
 
 
-def now_section(settings: Settings, leases: list[dict],
-                pools: list[dict]) -> str:
+def queue_rows(settings: Settings, queue: list[dict],
+               failed: list[dict]) -> str:
+    """The requests waiting for a unit, and the ones that failed.
+
+    The rows stand beside the pool bars: a queue nobody can see is a
+    queue nobody waits for.
+    """
+    rows = []
+    for request in queue:
+        rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(request['position']))}</td>"
+            f"<td>{html.escape(str(request['pool']))}</td>"
+            f"<td>{issue_link(settings, str(request['repo']), int(request['issue']))}</td>"
+            f"<td>{html.escape(str(request['session']))}</td>"
+            f"<td>{lane.human_age(request['age_seconds'])}</td>"
+            "</tr>")
+    if not rows:
+        rows.append("<tr><td colspan=\"5\" class=\"muted\">no request is "
+                    "waiting</td></tr>")
+    tables = [
+        "<table class=\"queue\"><thead><tr><th>POS</th><th>POOL</th>"
+        "<th>REPO#ISSUE</th><th>SESSION</th><th>AGE</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"]
+    if failed:
+        rows = []
+        for request in failed:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(request['id']))}</td>"
+                f"<td>{html.escape(str(request['pool']))}</td>"
+                f"<td>{issue_link(settings, str(request['repo']), int(request['issue']))}</td>"
+                f"<td>{html.escape(str(request['session']))}</td>"
+                f"<td>{lane.human_age(request['age_seconds'])}</td>"
+                f"<td>{html.escape(str(request['detail']))}</td>"
+                "</tr>")
+        tables.append(
+            "<table class=\"queue\"><thead><tr><th>ID</th><th>POOL</th>"
+            "<th>REPO#ISSUE</th><th>SESSION</th><th>AGE</th><th>FAILED</th>"
+            f"</tr></thead><tbody>{''.join(rows)}</tbody></table>")
+    return "".join(tables)
+
+
+def now_section(settings: Settings, leases: list[dict], pools: list[dict],
+                queue: list[dict], failed: list[dict]) -> str:
     """The lanes that are live."""
     rows = []
     for lease in leases:
@@ -409,7 +450,7 @@ def now_section(settings: Settings, leases: list[dict],
             f"<span class=\"muted\">/{html.escape(str(lease['profile']))}</span></td>"
             "<td>"
             f"<span class=\"state\">{html.escape(str(lease['state']))}</span>"
-            f"<span class=\"muted\">for {human_age(lease['state_age_seconds'])}</span>"
+            f"<span class=\"muted\">for {lane.human_age(lease['state_age_seconds'])}</span>"
             f"<span class=\"muted\">as of {clock(lease['state_since'])}</span>"
             "</td>"
             f"<td>{pull_link(settings, str(lease['repo']), lease['pr'], lease['pr_state'])}</td>"
@@ -421,6 +462,7 @@ def now_section(settings: Settings, leases: list[dict],
         "<section id=\"now\">"
         "<h2>Now</h2>"
         f"<div class=\"pools\">{pool_bars(settings, pools)}</div>"
+        f"{queue_rows(settings, queue, failed)}"
         "<table><thead><tr><th>ID</th><th>REPO#ISSUE</th><th>WINDOW</th>"
         "<th>HARNESS</th><th>STATE</th><th>PR</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
@@ -435,7 +477,7 @@ def history_section(settings: Settings, leases: list[dict]) -> str:
         finished = lease["finished_at"]
         duration = ""
         if started and finished:
-            duration = human_age(finished - started)
+            duration = lane.human_age(finished - started)
         rows.append(
             "<tr>"
             f"<td>{html.escape(str(lease['id']))}</td>"
@@ -513,7 +555,7 @@ def dashboard(keeper: Keeper, limit: int) -> str:
         "<p class=\"muted\">The lane record, as it is now. This page "
         "refreshes itself every 30 seconds, and it changes nothing.</p>"
         "</header>\n"
-        f"{now_section(keeper.settings, moment['leases'], moment['pools'])}\n"
+        f"{now_section(keeper.settings, moment['leases'], moment['pools'], moment['queue'], moment['failed'])}\n"
         f"{history_section(keeper.settings, keeper.history(limit))}\n"
         "</body>\n"
         "</html>\n")
@@ -671,32 +713,55 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/claim":
             self._claim(body)
             return
-        match = re.fullmatch(r"/api/lease/(\d+)/([a-z]+)", path)
-        if match is None:
-            self._json(404, {"key": "path",
-                             "detail": f"{path} is not an endpoint"})
+        if path == "/api/queue":
+            self._enqueue(body)
             return
-        lease_id = int(match.group(1))
-        action = match.group(2)
-        if action == "state":
-            self._state(lease_id, body)
-        elif action == "opened":
-            self._opened(lease_id, body)
-        elif action == "release":
-            self._release(lease_id, body)
-        elif action == "resume":
-            self._resume(lease_id, body)
-        elif action == "finish":
-            self._finish(lease_id, body)
-        elif action == "undo":
-            self._undo(lease_id, body)
-        else:
-            self._json(404, {"key": "path",
-                             "detail": f"{action} is not something a lease "
-                                       "does"})
+        if path == "/api/promote":
+            self._promote()
+            return
+        match = re.fullmatch(r"/api/lease/(\d+)/([a-z]+)", path)
+        if match is not None:
+            lease_id = int(match.group(1))
+            action = match.group(2)
+            if action == "state":
+                self._state(lease_id, body)
+            elif action == "opened":
+                self._opened(lease_id, body)
+            elif action == "release":
+                self._release(lease_id, body)
+            elif action == "resume":
+                self._resume(lease_id, body)
+            elif action == "finish":
+                self._finish(lease_id, body)
+            elif action == "undo":
+                self._undo(lease_id, body)
+            elif action == "start":
+                self._start(lease_id)
+            elif action == "interrupted":
+                self._interrupted(lease_id)
+            else:
+                self._json(404, {"key": "path",
+                                 "detail": f"{action} is not something a lease "
+                                           "does"})
+            return
+        match = re.fullmatch(r"/api/queue/(\d+)/([a-z]+)", path)
+        if match is not None:
+            request_id = int(match.group(1))
+            action = match.group(2)
+            if action == "fail":
+                self._fail(request_id, body)
+            elif action == "dequeue":
+                self._dequeue(request_id)
+            else:
+                self._json(404, {"key": "path",
+                                 "detail": f"{action} is not something a "
+                                           "request does"})
+            return
+        self._json(404, {"key": "path",
+                         "detail": f"{path} is not an endpoint"})
 
-    def _claim(self, body: dict) -> None:
-        """Take a lease, with the claim's own rules."""
+    def _request_of(self, body: dict) -> lane.Request:
+        """The request a claim or an enqueue asks for."""
         settings = self.keeper.settings
         name = _field(body, "profile")
         profile = settings.profiles.get(name)
@@ -705,7 +770,7 @@ class Handler(BaseHTTPRequestHandler):
         issue = body.get("issue")
         if isinstance(issue, bool) or not isinstance(issue, int):
             raise lane.Refusal("request", "the claim names no issue")
-        req = lane.Request(
+        return lane.Request(
             repo=_field(body, "repo"),
             issue=issue,
             harness=_field(body, "harness"),
@@ -724,11 +789,135 @@ class Handler(BaseHTTPRequestHandler):
             session=_field(body, "session"),
             harness_session=_optional(body, "harness_session"),
             launch="",
+            brief=_optional(body, "brief"),
         )
+
+    def _claim(self, body: dict) -> None:
+        """Take a lease, with the claim's own rules."""
+        settings = self.keeper.settings
+        req = self._request_of(body)
         conn = self.keeper.store.connection()
-        lease_id, branch = lane.claim(conn, req,
-                                      settings.pools[profile.pool])
+        lease_id, branch = lane.claim(conn, req, settings.pools[req.pool])
         self._json(200, {"lease": lease_id, "branch": branch})
+
+    def _enqueue(self, body: dict) -> None:
+        """Take a lease when the pool has room, or record a request.
+
+        The percentage of the pool the queue holds comes with the
+        request: the keeper counts the pool, and the settings say how
+        deep its queue is.
+        """
+        settings = self.keeper.settings
+        req = self._request_of(body)
+        percent = _integer(body, "queue_percent")
+        if percent is None:
+            percent = lane.DEFAULT_QUEUE_PERCENT
+        if not 0 <= percent <= 100:
+            raise lane.Refusal("request",
+                               f"queue_percent {percent} is not between 0 "
+                               "and 100")
+        conn = self.keeper.store.connection()
+        answer = lane.enqueue(conn, req, settings.pools[req.pool], percent)
+        self._json(200, answer)
+
+    def _promote(self) -> None:
+        """Promote the requests whose pool has room.
+
+        The leases that are starting are returned, whether this call
+        promoted them or an earlier one did: whoever frees the unit is
+        not the one that starts the lane.
+        """
+        conn = self.keeper.store.connection()
+        with lane.transaction(conn):
+            lane.promote(conn, self.keeper.settings.pools, time.time())
+            rows = conn.execute("SELECT * FROM leases WHERE state = ? "
+                                "ORDER BY id", (lane.STARTING,)).fetchall()
+        moment = time.time()
+        self._json(200, {"leases": [lane.lease_record(row, moment, None)
+                                    for row in rows]})
+
+    def _start(self, lease_id: int) -> None:
+        """Take a starting lease: one dispatcher wins it."""
+        conn = self.keeper.store.connection()
+        with lane.transaction(conn):
+            changed = conn.execute(
+                "UPDATE leases SET state = ?, state_since = ? "
+                "WHERE id = ? AND state = ?",
+                ("busy", time.time(), lease_id, lane.STARTING)).rowcount
+            if not changed:
+                raise lane.Refusal("lease",
+                                   f"lease {lease_id} is not starting")
+            row = conn.execute("SELECT * FROM leases WHERE id = ?",
+                               (lease_id,)).fetchone()
+        self._json(200, lane.lease_record(row, time.time(), None))
+
+    def _fail(self, request_id: int, body: dict) -> None:
+        """Mark a request failed: the lane never came up.
+
+        The lease goes with it, in one transaction: a dispatcher that
+        dies between the writes leaves no request pointing at a lease
+        that is gone. A retry changes nothing.
+        """
+        conn = self.keeper.store.connection()
+        with lane.transaction(conn):
+            row = conn.execute("SELECT * FROM queue WHERE id = ?",
+                               (request_id,)).fetchone()
+            if row is None:
+                raise lane.Refusal("request", f"no request {request_id}")
+            if row["state"] != lane.FAILED:
+                if row["state"] != lane.STARTING:
+                    raise lane.Refusal(
+                        "request",
+                        f"request {request_id} is {row['state']}, and only "
+                        "a starting request can fail")
+                conn.execute("UPDATE queue SET state = ?, detail = ?, "
+                             "lease_id = NULL, updated_at = ? WHERE id = ?",
+                             (lane.FAILED, _optional(body, "detail"),
+                              time.time(), request_id))
+            lease_id = _integer(body, "lease")
+            if lease_id is not None:
+                lane.undo_claim(conn, lease_id, state="busy")
+        self._json(200, {"request": request_id, "state": lane.FAILED})
+
+    def _dequeue(self, request_id: int) -> None:
+        """Take a request out of the record."""
+        conn = self.keeper.store.connection()
+        with lane.transaction(conn):
+            row = conn.execute("SELECT * FROM queue WHERE id = ?",
+                               (request_id,)).fetchone()
+            if row is None:
+                raise lane.Refusal("request", f"no request {request_id}")
+            if row["state"] not in (lane.QUEUED, lane.FAILED):
+                raise lane.Refusal(
+                    "request",
+                    f"request {request_id} is {row['state']}; only a waiting "
+                    "or a failed request can be removed")
+            conn.execute("DELETE FROM queue WHERE id = ?", (request_id,))
+        self._json(200, {"request": request_id, "removed": True})
+
+    def _interrupted(self, lease_id: int) -> None:
+        """Stop a lease whose start was cut short.
+
+        The lease stops while it is still busy with no window recorded: a
+        start that finished in the meantime keeps its lease. Its request
+        fails in the same transaction.
+        """
+        conn = self.keeper.store.connection()
+        with lane.transaction(conn):
+            lease = self._lease(conn, lease_id)
+            if lease["state"] != "busy" or lease["window_opened_at"]:
+                stopped = False
+            else:
+                lane.set_state(conn, lease_id, lane.STOPPED)
+                if lease["queue_id"]:
+                    conn.execute(
+                        "UPDATE queue SET state = ?, detail = ?, "
+                        "lease_id = NULL, updated_at = ? WHERE id = ? "
+                        "AND state = ?",
+                        (lane.FAILED, "the start did not finish",
+                         time.time(), lease["queue_id"], lane.STARTING))
+                stopped = True
+        self._json(200, {"lease": lease_id, "stopped": stopped})
 
     def _state(self, lease_id: int, body: dict) -> None:
         """Record what a lane's pane says about it.
@@ -756,26 +945,44 @@ class Handler(BaseHTTPRequestHandler):
     def _opened(self, lease_id: int, body: dict) -> None:
         """Record that a lane's window is open.
 
+        Only a busy lease opens a window. A lease that stopped or ended
+        has none to record, and a start that arrives after the recovery
+        stopped its lease is refused here.
+
         The commit the worktree was cut at goes with it: a worktree
         reused later may sit on another commit, and the lease has to say
         which one it was given.
         """
         conn = self.keeper.store.connection()
-        self._lease(conn, lease_id)
-        opened = lane.record_window_opened(conn, lease_id,
-                                           _number(body, "opened_at"))
-        base_sha = _optional(body, "base_sha")
-        if base_sha:
-            lane.record_base_sha(conn, lease_id, base_sha)
+        with lane.transaction(conn):
+            self._lease(conn, lease_id)
+            opened, changed = lane.record_window_opened(
+                conn, lease_id, _number(body, "opened_at"), state="busy")
+            if not changed:
+                raise lane.Refusal("state",
+                                   f"lease {lease_id} is not busy; only a "
+                                   "busy lease opens a window")
+            base_sha = _optional(body, "base_sha")
+            if base_sha:
+                lane.record_base_sha(conn, lease_id, base_sha)
         self._json(200, {"lease": lease_id, "window_opened_at": opened})
 
     def _release(self, lease_id: int, body: dict) -> None:
-        """End a lease, and write how it ended."""
+        """End a lease, and write how it ended.
+
+        The unit the lease held is free in the same transaction, so the
+        request at the head of the queue takes it before anybody else
+        can.
+        """
         conn = self.keeper.store.connection()
-        lease = self._lease(conn, lease_id)
-        outcome = self._end(conn, lease, lane.OUTCOME_RELEASED,
-                            _integer(body, "pr"), _optional(body, "pr_state"))
-        self._json(200, {"lease": lease_id, "outcome": outcome})
+        with lane.transaction(conn):
+            lease = self._lease(conn, lease_id)
+            outcome = self._end(conn, lease, lane.OUTCOME_RELEASED,
+                                _integer(body, "pr"), _optional(body, "pr_state"))
+            promoted = lane.promote(conn, self.keeper.settings.pools,
+                                    time.time())
+        self._json(200, {"lease": lease_id, "outcome": outcome,
+                         "promoted": promoted})
 
     def _resume(self, lease_id: int, body: dict) -> None:
         """Take a pool unit back for a stopped lane."""
@@ -792,17 +999,26 @@ class Handler(BaseHTTPRequestHandler):
         self._json(200, {"lease": lease_id, "state": "busy"})
 
     def _finish(self, lease_id: int, body: dict) -> None:
-        """Record that a lane has finished, and how it ended."""
+        """Record that a lane has finished, and how it ended.
+
+        The unit the lease held is free in the same transaction, so the
+        request at the head of the queue takes it before anybody else
+        can.
+        """
         conn = self.keeper.store.connection()
-        lease = self._lease(conn, lease_id)
-        outcome = body.get("outcome")
-        if outcome not in (lane.OUTCOME_MERGED, lane.OUTCOME_ABANDONED):
-            raise lane.Refusal("request",
-                               f"outcome {outcome!r} is neither merged nor "
-                               "abandoned")
-        outcome = self._end(conn, lease, outcome,
-                            _integer(body, "pr"), _optional(body, "pr_state"))
-        self._json(200, {"lease": lease_id, "outcome": outcome})
+        with lane.transaction(conn):
+            lease = self._lease(conn, lease_id)
+            outcome = body.get("outcome")
+            if outcome not in (lane.OUTCOME_MERGED, lane.OUTCOME_ABANDONED):
+                raise lane.Refusal("request",
+                                   f"outcome {outcome!r} is neither merged nor "
+                                   "abandoned")
+            outcome = self._end(conn, lease, outcome,
+                                _integer(body, "pr"), _optional(body, "pr_state"))
+            promoted = lane.promote(conn, self.keeper.settings.pools,
+                                    time.time())
+        self._json(200, {"lease": lease_id, "outcome": outcome,
+                         "promoted": promoted})
 
     def _end(self, conn, lease, outcome: str, pr: int | None,
              pr_state: str | None) -> str:
@@ -810,18 +1026,32 @@ class Handler(BaseHTTPRequestHandler):
 
         A lane that is already over keeps the ending it was given: a
         second report of an ending leaves the first alone.
+
+        The request the lease came from is the lease now, and it goes
+        with it: the lane's history is the record of what it was.
         """
         if lease["state"] == lane.RELEASED:
             return lease["outcome"] or outcome
         lane.set_state(conn, lease["id"], lane.RELEASED)
         lane.record_history(conn, lease["id"], outcome, pr, pr_state)
+        if lease["queue_id"]:
+            conn.execute("DELETE FROM queue WHERE id = ? AND state = ?",
+                         (lease["queue_id"], lane.STARTING))
         return outcome
 
     def _undo(self, lease_id: int, body: dict) -> None:
-        """Undo the claim: the lease row goes."""
+        """Undo the claim: the lease row goes.
+
+        Only a busy lease is undone: an undo takes back a claim, and a
+        lease that stopped or ended stays as it is.
+        """
         conn = self.keeper.store.connection()
-        self._lease(conn, lease_id)
-        lane.undo_claim(conn, lease_id)
+        with lane.transaction(conn):
+            self._lease(conn, lease_id)
+            if not lane.undo_claim(conn, lease_id, state="busy"):
+                raise lane.Refusal("state",
+                                   f"lease {lease_id} is not busy; only a "
+                                   "busy lease is undone")
         self._json(200, {"lease": lease_id, "undone": True})
 
     def _lease(self, conn, lease_id: int):

@@ -34,6 +34,42 @@ LABEL = "lane:active"
 RELEASED = "released"
 STOPPED = "stopped"
 
+# The state a promoted request's lease is in: it holds its pool unit,
+# and a dispatcher starts it.
+STARTING = "starting"
+
+# The states a queued request is in. A request waits for a unit, and a
+# request whose start failed says so until it is dismissed.
+QUEUED = "queued"
+FAILED = "failed"
+
+# How long a stopped lease keeps its unit while a queue waits for one.
+# The lane is restarted in place, and its unit must not go to the queue
+# while that happens.
+STOPPED_GRACE = 900.0
+
+# The percentage of a pool that its queue holds, when the settings name
+# none. The queue is then as deep as the pool.
+DEFAULT_QUEUE_PERCENT = 100
+
+# How long a start may take before another dispatcher treats it as
+# interrupted. A spawn cuts a worktree, opens a window and starts a
+# harness, and the dispatcher that began it may never come back.
+START_TIMEOUT = 900.0
+
+# What a window lookup answers: the window is there, the window is
+# gone, or the answer is unsure.
+PRESENT = "present"
+ABSENT = "absent"
+UNKNOWN = "unknown"
+
+# The state a lease shows while its start is unresolved.
+INCOMPLETE = "incomplete"
+
+# What the lane is told to read. A brief is a path on the agent host,
+# and the lane reads it where it runs.
+BRIEF_TEXT = "Read {path} and carry it out."
+
 # The character a runaway harness repeats when it floods the pane.
 FLOOD_CHAR = "⇒"
 
@@ -305,6 +341,57 @@ class KeeperClient:
         """Take a claim back: the lease goes, as it never was."""
         return self._call("POST", f"/api/lease/{lease_id}/undo", {})
 
+    def enqueue(self, body: dict) -> dict:
+        """Take a lease, or record a request that waits for one."""
+        return self._call("POST", "/api/queue", body)
+
+    def promote(self) -> list[dict]:
+        """The leases the queue promoted, and the ones it promoted before.
+
+        A promotion is made by whoever freed the unit, so the dispatcher
+        that starts it is often not the one that made it.
+        """
+        payload = self._call("POST", "/api/promote", {})
+        return list(payload.get("leases") or [])
+
+    def take_start(self, lease_id: int) -> dict | None:
+        """Take a starting lease. None when another dispatcher won it."""
+        status, payload = self._request("POST", f"/api/lease/{lease_id}/start",
+                                        {})
+        if status == 409:
+            return None
+        if status >= 400:
+            raise Refusal(str(payload.get("key") or "keeper"),
+                          str(payload.get("detail")
+                              or f"the keeper answered {status}"))
+        return payload
+
+    def fail_start(self, request_id: int | None, detail: str,
+                   lease_id: int | None = None) -> None:
+        """Mark a request failed: the start did not work.
+
+        The lease goes with the request when the caller names it, so
+        the two are cleaned up together.
+        """
+        if request_id is None:
+            return
+        body = {"detail": detail}
+        if lease_id is not None:
+            body["lease"] = lease_id
+        self._call("POST", f"/api/queue/{request_id}/fail", body)
+
+    def interrupt(self, lease_id: int) -> dict:
+        """Stop a lease whose start was cut short.
+
+        The keeper stops it only while it is still busy with no window
+        recorded, and says whether it did.
+        """
+        return self._call("POST", f"/api/lease/{lease_id}/interrupted", {})
+
+    def dequeue(self, request_id: int) -> dict:
+        """Take a request out of the queue."""
+        return self._call("POST", f"/api/queue/{request_id}/dequeue", {})
+
 
 # ----- the side effects ----------------------------------------------------
 
@@ -394,6 +481,7 @@ class Config:
     tmux_session: str
     worktree_root: Path | None
     ready_seconds: float
+    queue_percent: int
     pools: dict[str, int]
     profiles: dict[str, Profile]
     harnesses: dict[str, Harness]
@@ -525,6 +613,12 @@ def load_config(path: Path | None = None) -> Config:
     ready = raw.get("ready_seconds", DEFAULT_READY_SECONDS)
     if isinstance(ready, bool) or not isinstance(ready, (int, float)):
         raise Refusal("config", f"{path}: ready_seconds is not a number")
+    percent = raw.get("queue_percent", DEFAULT_QUEUE_PERCENT)
+    if isinstance(percent, bool) or not isinstance(percent, int) \
+            or not 0 <= percent <= 100:
+        raise Refusal("config",
+                      f"{path}: queue_percent {percent!r} is not a whole "
+                      "number between 0 and 100")
 
     pools = parse_pools(raw, path)
     profiles = parse_profiles(raw, path, pools)
@@ -570,6 +664,7 @@ def load_config(path: Path | None = None) -> Config:
         tmux_session=tmux_session,
         worktree_root=Path(root).expanduser() if root else None,
         ready_seconds=float(ready),
+        queue_percent=percent,
         pools=pools,
         profiles=profiles,
         harnesses=harnesses,
@@ -659,6 +754,32 @@ CREATE TABLE IF NOT EXISTS leases (
 );
 CREATE INDEX IF NOT EXISTS leases_by_state ON leases(state);
 CREATE INDEX IF NOT EXISTS leases_by_pool ON leases(pool);
+
+CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    issue INTEGER NOT NULL,
+    harness TEXT NOT NULL,
+    profile TEXT NOT NULL,
+    model TEXT NOT NULL,
+    pool TEXT NOT NULL,
+    cost INTEGER NOT NULL,
+    branch TEXT NOT NULL DEFAULT '',
+    base TEXT NOT NULL,
+    brief TEXT NOT NULL DEFAULT '',
+    worktree TEXT NOT NULL,
+    clone TEXT NOT NULL,
+    tmux_session TEXT NOT NULL,
+    window TEXT NOT NULL,
+    session TEXT NOT NULL,
+    harness_session TEXT NOT NULL DEFAULT '',
+    state TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    lease_id INTEGER,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS queue_by_pool ON queue(pool, state, id);
 """
 
 
@@ -690,6 +811,8 @@ ADDED_COLUMNS = (
     ("outcome", "TEXT"),
     ("pr", "INTEGER"),
     ("pr_state", "TEXT"),
+    ("brief", "TEXT NOT NULL DEFAULT ''"),
+    ("queue_id", "INTEGER"),
 )
 
 
@@ -797,16 +920,27 @@ def record_history(conn: sqlite3.Connection, lease_id: int, outcome: str,
 
 
 def record_window_opened(conn: sqlite3.Connection, lease_id: int,
-                         opened_at: float | None = None) -> float:
+                         opened_at: float | None = None,
+                         state: str | None = None) -> tuple[float, bool]:
     """Record when a lease's window opened, and say when.
 
     The window is open from here on, so a reconcile that cannot see it
     knows the lane stopped.
+
+    The state the lease has to be in for the window to count is given
+    by the caller: a lease that stopped in the meantime keeps no
+    window, and the write changes nothing.
     """
     now = time.time() if opened_at is None else opened_at
-    conn.execute("UPDATE leases SET window_opened_at = ? WHERE id = ?",
-                 (now, lease_id))
-    return now
+    if state is None:
+        changed = conn.execute(
+            "UPDATE leases SET window_opened_at = ? WHERE id = ?",
+            (now, lease_id)).rowcount
+    else:
+        changed = conn.execute(
+            "UPDATE leases SET window_opened_at = ? WHERE id = ? AND state = ?",
+            (now, lease_id, state)).rowcount
+    return now, bool(changed)
 
 
 def record_base_sha(conn: sqlite3.Connection, lease_id: int,
@@ -820,9 +954,20 @@ def record_base_sha(conn: sqlite3.Connection, lease_id: int,
                  (base_sha, lease_id))
 
 
-def undo_claim(conn: sqlite3.Connection, lease_id: int) -> None:
-    """Take a claim back: the lease goes, as it never was."""
-    conn.execute("DELETE FROM leases WHERE id = ?", (lease_id,))
+def undo_claim(conn: sqlite3.Connection, lease_id: int,
+               state: str | None = None) -> bool:
+    """Take a claim back: the lease goes, as it never was.
+
+    The state the lease has to be in is given by the caller: a lease
+    that stopped or ended keeps its row, and nothing is taken back.
+    """
+    if state is None:
+        changed = conn.execute("DELETE FROM leases WHERE id = ?",
+                               (lease_id,)).rowcount
+    else:
+        changed = conn.execute("DELETE FROM leases WHERE id = ? AND state = ?",
+                               (lease_id, state)).rowcount
+    return bool(changed)
 
 
 # ----- the claim ------------------------------------------------------------
@@ -847,39 +992,52 @@ class Request:
     session: str
     harness_session: str
     launch: str
+    # The brief the lane reads, and the request the lease came from.
+    # Both are empty for a spawn that was not queued.
+    brief: str = ""
+    queue_id: int | None = None
 
 
 def refuse_taken_places(client: KeeperClient, agent: Agent,
-                        req: Request) -> None:
+                        req: Request, exclude: int | None = None) -> None:
     """Refuse a spawn whose place is already taken by something else.
 
     The claim refuses the places a live lease holds and names the
     holder. These are the places nothing leased: a worktree, a branch
     or a window somebody else made. The worktree, the branch and the
     window are on the agent host, so they are asked about there.
+
+    `exclude` leaves one lease out: the one that is starting holds its
+    own places.
     """
     if path_exists(agent, req.worktree) and not leased(client, "worktree",
-                                                        req.worktree):
+                                                        req.worktree,
+                                                        exclude=exclude):
         raise Refusal("worktree", f"worktree {req.worktree} already exists")
     # A branch still to be named takes no place: the default carries the
     # id of a lease not yet claimed.
     if req.branch and branch_exists(agent, req.clone, req.branch) \
-            and not leased(client, "branch", req.branch):
+            and not leased(client, "branch", req.branch, exclude=exclude):
         raise Refusal("branch",
                       f"branch {req.branch} already exists in {req.clone}")
     if window_exists_at(agent, req.tmux_session, req.window) and not leased(
-            client, "window", req.window, session=req.tmux_session):
+            client, "window", req.window, session=req.tmux_session,
+            exclude=exclude):
         raise Refusal("window",
                       f"window {req.tmux_session}:{req.window} is already open")
 
 
 def leased(client: KeeperClient, column: str, value: str,
-           session: str | None = None) -> bool:
+           session: str | None = None, exclude: int | None = None) -> bool:
     """Whether a live lease holds a place.
 
     The column names the field, and only the fields the leases record.
+    `exclude` leaves one lease out: the one that is starting holds its
+    own places.
     """
     for lease in client.now()["leases"]:
+        if exclude is not None and lease["id"] == exclude:
+            continue
         if column == "window":
             if lease["tmux_session"] == session and lease["window"] == value:
                 return True
@@ -892,6 +1050,17 @@ def path_exists(agent: Agent, path: str) -> bool:
     """Whether a path is there, on the agent host."""
     code, _, _ = agent.run(["test", "-e", path])
     return code == 0
+
+
+def path_readable(agent: Agent, path: str) -> bool:
+    """Whether the path is a regular file the lane can read.
+
+    A directory is readable and it exists, and neither is a brief: the
+    lane reads a file.
+    """
+    if agent.run(["test", "-f", path])[0] != 0:
+        return False
+    return agent.run(["test", "-r", path])[0] == 0
 
 
 def branch_exists(agent: Agent, clone: Path, branch: str) -> bool:
@@ -911,6 +1080,137 @@ def default_branch(issue: int, lease_id: int) -> str:
     return f"lane/{issue}-{lease_id}"
 
 
+@contextmanager
+def transaction(conn: sqlite3.Connection):
+    """One transaction, and a rollback when it fails.
+
+    The write lock is taken at once: a check that reads and then writes
+    lets two callers pass it.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        yield
+    except BaseException:
+        if conn.in_transaction:
+            conn.execute("ROLLBACK")
+        raise
+    conn.execute("COMMIT")
+
+
+def refuse_holders(conn: sqlite3.Connection, req: Request) -> None:
+    """Refuse a request whose place a live lease holds.
+
+    The lease names the holder, so the refusal says which one to end.
+    """
+    holder = conn.execute(
+        "SELECT id, window, session FROM leases WHERE state != ? "
+        "AND repo = ? AND issue = ?",
+        (RELEASED, req.repo, req.issue),
+    ).fetchone()
+    if holder is not None:
+        raise Refusal(
+            "lease",
+            f"{req.repo}#{req.issue} is leased by lease {holder['id']} "
+            f"(window {holder['window']}, session {holder['session']})")
+    holder = conn.execute(
+        "SELECT id, window, session FROM leases WHERE state != ? "
+        "AND worktree = ?",
+        (RELEASED, req.worktree),
+    ).fetchone()
+    if holder is not None:
+        raise Refusal(
+            "lease",
+            f"worktree {req.worktree} is leased by lease {holder['id']} "
+            f"(window {holder['window']}, session {holder['session']})")
+    holder = conn.execute(
+        "SELECT id, window, session FROM leases WHERE state != ? "
+        "AND tmux_session = ? AND window = ?",
+        (RELEASED, req.tmux_session, req.window),
+    ).fetchone()
+    if holder is not None:
+        raise Refusal(
+            "lease",
+            f"window {req.tmux_session}:{req.window} is leased by lease "
+            f"{holder['id']} (window {holder['window']}, "
+            f"session {holder['session']})")
+
+
+def refuse_queued_holders(conn: sqlite3.Connection, req: Request) -> None:
+    """Refuse a request whose place a waiting request holds.
+
+    The request at the head of the queue would fail to start otherwise:
+    the place it waits for is taken.
+    """
+    row = conn.execute(
+        "SELECT id, session FROM queue WHERE state = ? AND repo = ? "
+        "AND issue = ?", (QUEUED, req.repo, req.issue)).fetchone()
+    if row is not None:
+        raise Refusal(
+            "queue",
+            f"{req.repo}#{req.issue} is waited for by request {row['id']} "
+            f"(session {row['session']})")
+    row = conn.execute(
+        "SELECT id, session FROM queue WHERE state = ? AND worktree = ?",
+        (QUEUED, req.worktree)).fetchone()
+    if row is not None:
+        raise Refusal(
+            "queue",
+            f"worktree {req.worktree} is waited for by request {row['id']} "
+            f"(session {row['session']})")
+    row = conn.execute(
+        "SELECT id, session FROM queue WHERE state = ? "
+        "AND tmux_session = ? AND window = ?",
+        (QUEUED, req.tmux_session, req.window)).fetchone()
+    if row is not None:
+        raise Refusal(
+            "queue",
+            f"window {req.tmux_session}:{req.window} is waited for by "
+            f"request {row['id']} (session {row['session']})")
+
+
+def insert_lease(conn: sqlite3.Connection, req: Request, size: int,
+                 state: str = "busy") -> tuple[int, str]:
+    """Put the lease in, and say which branch it works on.
+
+    The default branch carries the id the INSERT produces, so the row
+    goes in blank and is filled before the COMMIT: no reader sees a
+    lease without one.
+    """
+    filling = conn.execute(
+        "SELECT id, window, session, cost FROM leases "
+        "WHERE state NOT IN (?, ?) AND pool = ? ORDER BY id",
+        (RELEASED, STOPPED, req.pool),
+    ).fetchall()
+    used = sum(row["cost"] for row in filling)
+    if used + req.cost > size:
+        holders = ", ".join(
+            f"lease {row['id']} (window {row['window']}, "
+            f"session {row['session']}) holds {row['cost']}"
+            for row in filling) or "no lease"
+        raise Refusal(
+            "pool",
+            f"pool {req.pool} is full: {used} of {size} units are taken "
+            f"and this profile costs {req.cost}; {holders}")
+    cursor = conn.execute(
+        "INSERT INTO leases (repo, issue, harness, profile, model, pool, "
+        "cost, branch, base, base_sha, brief, queue_id, worktree, clone, "
+        "tmux_session, window, session, harness_session, state, state_since, "
+        "created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (req.repo, req.issue, req.harness, req.profile, req.model,
+         req.pool, req.cost, req.branch, req.base, "", req.brief,
+         req.queue_id, req.worktree, str(req.clone), req.tmux_session,
+         req.window, req.session, req.harness_session, state, time.time(),
+         time.time()),
+    )
+    lease_id = int(cursor.lastrowid)
+    branch = req.branch
+    if not branch:
+        branch = default_branch(req.issue, lease_id)
+        conn.execute("UPDATE leases SET branch = ? WHERE id = ?",
+                     (branch, lease_id))
+    return lease_id, branch
+
+
 def claim(conn: sqlite3.Connection, req: Request,
           size: int) -> tuple[int, str]:
     """Take the lease, or refuse, and say which branch it works on.
@@ -919,80 +1219,215 @@ def claim(conn: sqlite3.Connection, req: Request,
     database happens: a check that reads and then writes lets two callers
     pass it, and a unique index cannot sum a pool's costs.
 
-    The default branch carries the id the INSERT produces, so the row
-    goes in blank and is filled before the COMMIT: no reader sees a
-    lease without one.
+    A pool with requests waiting takes no plain claim: the unit belongs
+    to the request at the head of its queue, or the queue is a slower way
+    to lose the race it exists to fix.
     """
-    conn.execute("BEGIN IMMEDIATE")
-    try:
-        holder = conn.execute(
-            "SELECT id, window, session FROM leases WHERE state != ? "
-            "AND repo = ? AND issue = ?",
-            (RELEASED, req.repo, req.issue),
-        ).fetchone()
-        if holder is not None:
+    with transaction(conn):
+        refuse_holders(conn, req)
+        refuse_queued_holders(conn, req)
+        waiting = queued_requests(conn, req.pool)
+        if waiting:
             raise Refusal(
-                "lease",
-                f"{req.repo}#{req.issue} is leased by lease {holder['id']} "
-                f"(window {holder['window']}, session {holder['session']})")
-        holder = conn.execute(
-            "SELECT id, window, session FROM leases WHERE state != ? "
-            "AND worktree = ?",
-            (RELEASED, req.worktree),
-        ).fetchone()
-        if holder is not None:
-            raise Refusal(
-                "lease",
-                f"worktree {req.worktree} is leased by lease {holder['id']} "
-                f"(window {holder['window']}, session {holder['session']})")
-        holder = conn.execute(
-            "SELECT id, window, session FROM leases WHERE state != ? "
-            "AND tmux_session = ? AND window = ?",
-            (RELEASED, req.tmux_session, req.window),
-        ).fetchone()
-        if holder is not None:
-            raise Refusal(
-                "lease",
-                f"window {req.tmux_session}:{req.window} is leased by lease "
-                f"{holder['id']} (window {holder['window']}, "
-                f"session {holder['session']})")
-        filling = conn.execute(
-            "SELECT id, window, session, cost FROM leases "
-            "WHERE state NOT IN (?, ?) AND pool = ? ORDER BY id",
-            (RELEASED, STOPPED, req.pool),
+                "queue",
+                f"pool {req.pool} has {len(waiting)} request(s) waiting; a "
+                "plain spawn would take the unit ahead of them, so queue "
+                "with `lane spawn --queue`")
+        return insert_lease(conn, req, size)
+
+
+# ----- the queue ------------------------------------------------------------
+
+def queued_requests(conn: sqlite3.Connection,
+                    pool: str | None = None) -> list[sqlite3.Row]:
+    """The requests waiting for a unit, oldest first."""
+    if pool is None:
+        return conn.execute(
+            "SELECT * FROM queue WHERE state = ? ORDER BY id", (QUEUED,)
         ).fetchall()
-        used = sum(row["cost"] for row in filling)
-        if used + req.cost > size:
+    return conn.execute(
+        "SELECT * FROM queue WHERE state = ? AND pool = ? ORDER BY id",
+        (QUEUED, pool)).fetchall()
+
+
+def failed_requests(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    """The requests whose start failed, oldest first."""
+    return conn.execute(
+        "SELECT * FROM queue WHERE state = ? ORDER BY id", (FAILED,)
+    ).fetchall()
+
+
+def queue_depth(size: int, percent: int) -> int:
+    """How many requests a pool's queue holds.
+
+    The depth is a percentage of the pool, rounded down, and at least
+    one, so a pool always has room for a request.
+    """
+    return max(1, size * percent // 100)
+
+
+def pool_used_for_promotion(conn: sqlite3.Connection, pool: str,
+                             now: float) -> int:
+    """The units a pool has taken, as the queue sees them.
+
+    A lease that stopped less than the grace ago still holds its unit:
+    the lane is restarted in place, and the queue waits for it.
+    """
+    rows = conn.execute(
+        "SELECT cost, state, state_since FROM leases WHERE pool = ? "
+        "AND state != ?", (pool, RELEASED)).fetchall()
+    used = 0
+    for row in rows:
+        if row["state"] == STOPPED and now - row["state_since"] >= STOPPED_GRACE:
+            continue
+        used += row["cost"]
+    return used
+
+
+def request_of(row: sqlite3.Row) -> Request:
+    """A queued request, as a spawn asks for it."""
+    return Request(
+        repo=row["repo"],
+        issue=row["issue"],
+        harness=row["harness"],
+        profile=row["profile"],
+        model=row["model"],
+        pool=row["pool"],
+        cost=row["cost"],
+        branch=row["branch"],
+        base=row["base"],
+        brief=row["brief"],
+        worktree=row["worktree"],
+        clone=Path(row["clone"]),
+        tmux_session=row["tmux_session"],
+        window=row["window"],
+        session=row["session"],
+        harness_session=row["harness_session"],
+        launch="",
+        queue_id=row["id"],
+    )
+
+
+def enqueue(conn: sqlite3.Connection, req: Request, size: int,
+            percent: int) -> dict:
+    """Take a lease when the pool has room, or record a request that waits.
+
+    One transaction decides it, so two callers cannot both start a lane
+    and wait for one. A pool with requests waiting takes no new lane.
+    """
+    with transaction(conn):
+        refuse_holders(conn, req)
+        refuse_queued_holders(conn, req)
+        waiting = queued_requests(conn, req.pool)
+        if not waiting:
+            try:
+                lease_id, branch = insert_lease(conn, req, size)
+            except Refusal as exc:
+                if exc.key != "pool":
+                    raise
+            else:
+                return {"status": "claimed", "lease": lease_id,
+                        "branch": branch}
+        depth = queue_depth(size, percent)
+        if len(waiting) >= depth:
             holders = ", ".join(
-                f"lease {row['id']} (window {row['window']}, "
-                f"session {row['session']}) holds {row['cost']}"
-                for row in filling) or "no lease"
+                f"request {row['id']} ({row['repo']}#{row['issue']}, "
+                f"session {row['session']})" for row in waiting)
             raise Refusal(
-                "pool",
-                f"pool {req.pool} is full: {used} of {size} units are taken "
-                f"and this profile costs {req.cost}; {holders}")
+                "queue",
+                f"pool {req.pool} is full and holds {len(waiting)} of its "
+                f"{depth} queued requests; {holders}")
         cursor = conn.execute(
-            "INSERT INTO leases (repo, issue, harness, profile, model, pool, "
-            "cost, branch, base, base_sha, worktree, clone, tmux_session, "
-            "window, session, harness_session, state, state_since, created_at) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO queue (repo, issue, harness, profile, model, pool, "
+            "cost, branch, base, brief, worktree, clone, tmux_session, "
+            "window, session, harness_session, state, detail, lease_id, "
+            "created_at, updated_at) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (req.repo, req.issue, req.harness, req.profile, req.model,
-             req.pool, req.cost, req.branch, req.base, "", req.worktree,
-             str(req.clone), req.tmux_session, req.window, req.session,
-             req.harness_session, "busy", time.time(), time.time()),
+             req.pool, req.cost, req.branch, req.base, req.brief,
+             req.worktree, str(req.clone), req.tmux_session, req.window,
+             req.session, req.harness_session, QUEUED, "", None,
+             time.time(), time.time()),
         )
-        lease_id = int(cursor.lastrowid)
-        branch = req.branch
-        if not branch:
-            branch = default_branch(req.issue, lease_id)
-            conn.execute("UPDATE leases SET branch = ? WHERE id = ?",
-                         (branch, lease_id))
-        conn.execute("COMMIT")
-        return lease_id, branch
-    except BaseException:
-        if conn.in_transaction:
-            conn.execute("ROLLBACK")
-        raise
+        return {"status": "queued", "queue": int(cursor.lastrowid),
+                "position": len(waiting) + 1}
+
+
+def take_lease(conn: sqlite3.Connection, req: Request, size: int,
+               state: str = "busy") -> tuple[int, str]:
+    """Take the lease for a request that is starting.
+
+    The request stops waiting before the lease is made, so the place it
+    waited for is the lease's and not the request's.
+    """
+    refuse_holders(conn, req)
+    refuse_queued_holders(conn, req)
+    return insert_lease(conn, req, size, state)
+
+
+def promote(conn: sqlite3.Connection, pools: dict[str, int],
+            now: float) -> list[dict]:
+    """Promote the requests whose pool has room, oldest first.
+
+    A request too big for the room left blocks the ones behind it: the
+    queue stops there.
+    """
+    promoted: list[dict] = []
+    for pool, size in sorted(pools.items()):
+        used = pool_used_for_promotion(conn, pool, now)
+        while True:
+            row = conn.execute(
+                "SELECT * FROM queue WHERE pool = ? AND state = ? "
+                "ORDER BY id LIMIT 1", (pool, QUEUED)).fetchone()
+            if row is None:
+                break
+            if row["cost"] > size:
+                # The request can never fit in this pool, so it says so
+                # and the next request gets the unit.
+                conn.execute("UPDATE queue SET state = ?, detail = ?, "
+                             "lease_id = NULL, updated_at = ? WHERE id = ?",
+                             (FAILED, f"the request costs {row['cost']} and "
+                                      f"pool {pool} holds {size} unit(s)",
+                              now, row["id"]))
+                continue
+            if used + row["cost"] > size:
+                break
+            conn.execute("UPDATE queue SET state = ?, updated_at = ? "
+                         "WHERE id = ?", (STARTING, now, row["id"]))
+            try:
+                lease_id, _ = take_lease(conn, request_of(row), size,
+                                         STARTING)
+            except Refusal as exc:
+                # The request's place is taken, so it cannot start. It
+                # says why, and the next request gets the unit.
+                conn.execute("UPDATE queue SET state = ?, detail = ?, "
+                             "lease_id = NULL, updated_at = ? WHERE id = ?",
+                             (FAILED, exc.detail, now, row["id"]))
+                continue
+            conn.execute("UPDATE queue SET lease_id = ? WHERE id = ?",
+                         (lease_id, row["id"]))
+            used += row["cost"]
+            promoted.append(lease_of(conn, lease_id))
+    return promoted
+
+
+def lease_of(conn: sqlite3.Connection, lease_id: int) -> dict:
+    """One lease, as the record holds it."""
+    row = conn.execute("SELECT * FROM leases WHERE id = ?",
+                       (lease_id,)).fetchone()
+    return lease_record(row, time.time(), None)
+
+
+def queue_record(row: sqlite3.Row, position: int | None = None,
+                 now: float | None = None) -> dict:
+    """One request, as it is recorded."""
+    record = dict(row)
+    record["kind"] = "request"
+    if position is not None:
+        record["position"] = position
+    if now is not None:
+        record["age_seconds"] = int(max(0.0, now - row["created_at"]))
+    return record
 
 
 # ----- the window -----------------------------------------------------------
@@ -1024,6 +1459,26 @@ def window_exists_at(runner: Runner, session: str, window: str) -> bool:
 def window_exists(runner: Runner, lease: dict) -> bool:
     """Whether the lease's window is still there."""
     return window_exists_at(runner, lease["tmux_session"], lease["window"])
+
+
+def window_state_at(runner: Runner, session: str, window: str) -> str:
+    """Whether a window is there, and whether the answer is sure.
+
+    A tmux that fails for a reason of its own answers nothing: an ssh
+    error says nothing about the window. Only tmux says a window is
+    gone.
+    """
+    code, out, err = runner.run(
+        ["lane-agent", "tmux", "list-windows", "-t", f"{session}:",
+         "-F", "#{window_name}"])
+    if code == 0:
+        return PRESENT if window in out.splitlines() else ABSENT
+    # A tmux with no server, or one with no such session, says the
+    # window is gone.
+    if "no server running" in err or "can't find session" in err \
+            or "session not found" in err:
+        return ABSENT
+    return UNKNOWN
 
 
 def capture_pane(runner: Runner, lease: dict) -> str:
@@ -1154,8 +1609,14 @@ def read_states(client: KeeperClient, agent: Agent,
 
     The pane says what the lane is doing. A process match cannot say any
     of that, and `pgrep -f` matches the reader's own command line.
+
+    A lease that is starting waits for its window, and so does one whose
+    window was never recorded: its pane says nothing yet, and a state
+    read there would hide the start from the recovery.
     """
-    live = [lease for lease in leases if lease["state"] != RELEASED]
+    live = [lease for lease in leases
+            if lease["state"] not in (RELEASED, STARTING)
+            and lease["window_opened_at"]]
     first = {lease["id"]: capture_pane(agent, lease) for lease in live}
     pi_leases = [lease for lease in live if lease["harness"] == "pi"]
     if pi_leases:
@@ -1282,6 +1743,7 @@ class Spawn:
         self.worktree_cut = False
         self.branch_cut = False
         self.window_opened = False
+        self.window_id = ""
         self.base_sha = ""
 
     def _gh(self, *args: str) -> str:
@@ -1347,9 +1809,10 @@ class Spawn:
             base = self._git(self.req.clone, "rev-parse", self.req.base).strip()
             self.base_sha = base
             # The cut may land before the call that carries it is cut
-            # short, so the flags go up first. A branch the clone
-            # already carried belongs to whoever cut it.
-            self.worktree_cut = True
+            # short, so the flags go up first. A worktree the clone
+            # already carried belongs to whoever cut it, and a branch
+            # it already carried belongs to whoever cut it.
+            self.worktree_cut = not self._worktree_known()
             self.branch_cut = not branch_exists(self.agent, self.req.clone,
                                                 self.req.branch)
             self._git(self.req.clone, "worktree", "add", "-b", self.req.branch,
@@ -1375,10 +1838,13 @@ class Spawn:
     def undo_worktree(self) -> None:
         """Remove the worktree, and the branch it cut, if it is untouched.
 
+        The worktree goes only when this start cut it: a tree somebody
+        else made while the request waited is theirs.
+
         A branch the harness has committed to is work, so only a branch
         that still points where it was cut is deleted.
         """
-        if self._worktree_known():
+        if self.worktree_cut and self._worktree_known():
             try:
                 self._git(self.req.clone, "worktree", "remove", "--force",
                           self.req.worktree)
@@ -1402,23 +1868,37 @@ class Spawn:
         names the session, so a new window is opened in it. The lease
         travels with the window, so a launcher in the pane can ask
         whether it is still live.
+
+        The window's id comes with it: a window with that name may be
+        somebody else's, so the window is closed by that id.
         """
         # The window may open before the call that carries it is cut
         # short, so the flag goes up first.
         self.window_opened = True
         try:
-            self._tmux("new-window", "-d", "-t", f"{self.req.tmux_session}:",
-                       "-n", self.req.window, "-c", self.req.worktree,
-                       "-e", f"LANE_LEASE={self.lease_id}")
+            self.window_id = self._tmux(
+                "new-window", "-d", "-P", "-F", "#{window_id}",
+                "-t", f"{self.req.tmux_session}:", "-n", self.req.window,
+                "-c", self.req.worktree, "-e",
+                f"LANE_LEASE={self.lease_id}").strip()
         except CommandError as exc:
             raise StepFailure("window", exc.detail()) from exc
-        # The window is open from here on, so a reconcile that cannot see
-        # it knows the lane stopped. The commit the worktree was cut at
-        # goes with it: the lease says which one it was given.
-        self.client.opened(self.lease_id, base_sha=self.base_sha)
 
     def undo_window(self) -> None:
-        """Close the window."""
+        """Close the window.
+
+        The window goes by the id it was given: a window with that name
+        may be somebody else's. A call cut short leaves no id, and then
+        the name is the only handle there is.
+        """
+        if self.window_id:
+            code, _, err = self.agent.run(["lane-agent", "tmux",
+                                           "kill-window", "-t",
+                                           self.window_id])
+            if code != 0:
+                self.undone.append(
+                    f"window: {CommandError(['tmux', 'kill-window'], code, err).detail()}")
+            return
         if not window_exists_at(self.agent, self.req.tmux_session,
                                 self.req.window):
             return
@@ -1433,6 +1913,22 @@ class Spawn:
         send_launch(self.agent, f"{self.req.tmux_session}:{self.req.window}",
                     launch_text(self.req.launch, self.req.profile,
                                 self.req.window, self.req.harness_session))
+
+    def brief(self) -> None:
+        """Type the brief into the lane's window.
+
+        The lane reads the brief where it runs: the path is on the agent
+        host, and so is the window. A brief that is gone by then fails
+        the start.
+        """
+        if not self.req.brief:
+            return
+        if not path_readable(self.agent, self.req.brief):
+            raise StepFailure("brief",
+                              f"the brief {self.req.brief} is not a readable "
+                              "file")
+        send_launch(self.agent, f"{self.req.tmux_session}:{self.req.window}",
+                    BRIEF_TEXT.format(path=self.req.brief))
 
     def undo_steps(self) -> list:
         """The undos for what this spawn started, in reverse.
@@ -1454,6 +1950,10 @@ class Spawn:
 
         The undo runs in reverse, and the window takes the harness with
         it. Anything that ends the spawn early undoes what was done.
+
+        The completion is outside that: a lease the recovery stopped
+        while this start ran keeps the work it made, and the window
+        this start opened goes with it.
         """
         try:
             self.label()
@@ -1463,16 +1963,34 @@ class Spawn:
             # The harness needs a moment to come up: the wait keeps the
             # coordinator's first keystroke out of the shell.
             time.sleep(self.cfg.ready_seconds)
+            # The brief comes after the wait: the lane reads it when it
+            # can, and a lane that cannot read it fails here.
+            self.brief()
         except BaseException as exc:
             for step in self.undo_steps():
                 step()
-            self.client.undo(self.lease_id)
+            undo_lease(self.client, self.lease_id)
             if not isinstance(exc, StepFailure):
                 raise
             detail = exc.detail
             if self.undone:
                 detail = f"{detail} (undoing: {'; '.join(self.undone)})"
             raise StepFailure(exc.step, detail) from exc
+        # The start is complete now: the window is open and the lane has
+        # what it was sent. A reconcile that cannot see the window knows
+        # the lane stopped, and the commit the worktree was cut at goes
+        # with the lease.
+        try:
+            self.client.opened(self.lease_id, base_sha=self.base_sha)
+        except Refusal as exc:
+            # The lease was stopped while this start ran: the recovery
+            # found the start unfinished. The window this start opened
+            # goes with it, and the lease stays stopped.
+            self.undo_window()
+            raise StepFailure("lease",
+                              f"lease {self.lease_id} is no longer busy, so "
+                              "the start did not finish; its window was "
+                              "closed") from exc
 
 
 # ----- bringing a stopped lane back ----------------------------------------
@@ -1563,18 +2081,22 @@ def resume_lane(client: KeeperClient, agent: Agent, cfg: Config,
         if code != 0:
             raise StepFailure("window", CommandError(["tmux", "new-window"],
                                                       code, err).detail())
-        client.opened(lease["id"])
         send_launch(agent, target, launch_text(harness.launch,
                                                 lease["profile"],
                                                 lease["window"],
                                                 lease["harness_session"]))
+        # The resume is complete now: the harness is up. A lease that
+        # never records this is a start that was cut short.
+        client.opened(lease["id"])
     except BaseException:
         if window_opened:
             undone = close_window(agent, lease)
             if undone:
                 print(f"WARN window: {undone}", file=sys.stderr)
-        client.state(lease["id"], STOPPED)
+        # The window record goes before the lease stops: only a busy
+        # lease records a window.
         client.opened(lease["id"], opened_at=0)
+        client.state(lease["id"], STOPPED)
         raise
 
 
@@ -1674,7 +2196,7 @@ def check_finished(agent: Agent, lease: dict, pr: PullRequest,
 
 def take_down(client: KeeperClient, agent: Agent, lease: dict,
               worktree: Path, pr: PullRequest | None = None,
-              outcome: str = OUTCOME_RELEASED) -> None:
+              outcome: str = OUTCOME_RELEASED) -> list[dict]:
     """The steps, in order, stopping at the first one that fails. Each step
     says what it did, so a failure leaves the account of what already
     went.
@@ -1683,6 +2205,9 @@ def take_down(client: KeeperClient, agent: Agent, lease: dict,
 
     `outcome` says how the lane ended, and is written with the ending:
     a finished lane is history, and what it was is a fact.
+
+    The requests the release promoted are returned: the unit they wait
+    for is free now.
     """
     clone = Path(lease["clone"])
     branch = lease["branch"]
@@ -1733,10 +2258,11 @@ def take_down(client: KeeperClient, agent: Agent, lease: dict,
         print(f"the builder caches for {tree} were not pruned")
     else:
         print(f"pruned the builder caches for {tree}")
-    release_lease(client, agent, lease, outcome=outcome,
-                  pr=pr.number if pr else None,
-                  pr_state=pr.state if pr else None)
+    promoted = release_lease(client, agent, lease, outcome=outcome,
+                             pr=pr.number if pr else None,
+                             pr_state=pr.state if pr else None)
     print(f"released lease {lease['id']}")
+    return promoted
 
 
 # ----- the commands ---------------------------------------------------------
@@ -1747,7 +2273,7 @@ def repo_name(repo: str) -> str:
 
 
 def cmd_spawn(args: argparse.Namespace) -> int:
-    """Start a lane."""
+    """Start a lane, or queue one for a pool that is full."""
     cfg = load_config()
     profile = cfg.profile(args.profile)
     harness = cfg.harness(args.harness)
@@ -1790,6 +2316,7 @@ def cmd_spawn(args: argparse.Namespace) -> int:
         session=session,
         harness_session=uuid.uuid4().hex,
         launch=harness.launch,
+        brief=args.brief or "",
     )
     client = cfg.client()
     agent = cfg.agent()
@@ -1798,7 +2325,36 @@ def cmd_spawn(args: argparse.Namespace) -> int:
     # something else holds is refused before anything is claimed.
     reconcile(client, agent)
     refuse_taken_places(client, agent, req)
-    answer = client.claim(claim_body(req))
+    if req.brief and not os.path.isabs(req.brief):
+        # The lane reads the brief where it runs, and the ssh command
+        # and the harness read it in different directories.
+        raise Refusal("brief",
+                      f"the brief {req.brief} is not an absolute path; a "
+                      "brief is read on the agent host, so its path has to "
+                      "be absolute")
+    if req.brief and not path_readable(agent, req.brief):
+        # The lane reads the brief where it runs: a path that cannot be
+        # read there is refused while its author is still here.
+        raise Refusal("brief",
+                      f"the brief {req.brief} is not a readable file on "
+                      f"{agent.host}")
+    if args.queue and profile.cost > cfg.pools[profile.pool]:
+        # A request that costs more than the pool holds would wait for
+        # a unit the pool cannot give it.
+        raise Refusal(
+            "pool",
+            f"profile {profile.name} costs {profile.cost} and pool "
+            f"{profile.pool} holds {cfg.pools[profile.pool]} unit(s); a "
+            "request that can never fit is refused")
+    if args.queue:
+        answer = client.enqueue(enqueue_body(req, cfg.queue_percent))
+        if answer.get("status") == "queued":
+            print(f"queued {answer['queue']}")
+            print(f"position {answer['position']}")
+            print(f"pool {req.pool}")
+            return 0
+    else:
+        answer = client.claim(claim_body(req))
     lease_id = int(answer["lease"])
     branch = str(answer["branch"])
     Spawn(client, agent, cfg, replace(req, branch=branch), lease_id).run()
@@ -1825,8 +2381,203 @@ def claim_body(req: Request) -> dict:
     }
 
 
+def enqueue_body(req: Request, percent: int) -> dict:
+    """What an enqueue asks the keeper for.
+
+    The brief comes with it, and the percentage of the pool the queue
+    holds: the keeper counts the pool, and the settings every lane reads
+    say how deep its queue is.
+    """
+    body = claim_body(req)
+    body["brief"] = req.brief
+    body["queue_percent"] = percent
+    return body
+
+
+# ----- starting what the queue promoted -------------------------------------
+
+def request_of_lease(lease: dict, cfg: Config) -> Request:
+    """A lease, as a spawn asks for it."""
+    harness = cfg.harness(lease["harness"])
+    return Request(
+        repo=lease["repo"],
+        issue=int(lease["issue"]),
+        harness=lease["harness"],
+        profile=lease["profile"],
+        model=lease["model"],
+        pool=lease["pool"],
+        cost=int(lease["cost"]),
+        branch=lease["branch"],
+        base=lease["base"],
+        worktree=lease["worktree"],
+        clone=Path(lease["clone"]),
+        tmux_session=lease["tmux_session"],
+        window=lease["window"],
+        session=lease["session"],
+        harness_session=lease["harness_session"],
+        launch=harness.launch,
+        brief=lease.get("brief") or "",
+    )
+
+
+def start_lease(client: KeeperClient, agent: Agent, cfg: Config,
+                lease: dict) -> None:
+    """The spawn steps for a lane that is starting.
+
+    The steps are the ones a spawn runs, and the brief comes with them:
+    a lane that cannot read its brief fails the start, and the start is
+    undone.
+    """
+    req = request_of_lease(lease, cfg)
+    try:
+        # The request waited for a unit, and the places it names may
+        # have been taken in the meantime.
+        refuse_taken_places(client, agent, req, exclude=int(lease["id"]))
+    except Refusal as exc:
+        raise StepFailure(exc.key, exc.detail) from exc
+    Spawn(client, agent, cfg, req, int(lease["id"])).run()
+
+
+def undo_lease(client: KeeperClient, lease_id: int) -> None:
+    """Take a lease back, if it is still there.
+
+    A start that failed undoes its own lease, and the cleanup undoes it
+    again: the unit goes back either way.
+    """
+    try:
+        client.undo(lease_id)
+    except Refusal:
+        pass
+
+
+def interrupted_starts(client: KeeperClient) -> list[dict]:
+    """The leases whose start was cut short.
+
+    A lease that is busy with no window, and no record of a window
+    opening, was taken by a dispatcher that has not come back.
+    """
+    now = time.time()
+    return [lease for lease in client.now()["leases"]
+            if lease["state"] == "busy"
+            and not lease["window_opened_at"]
+            and now - lease["state_since"] > START_TIMEOUT]
+
+
+def reconcile_start(client: KeeperClient, agent: Agent,
+                    lease: dict) -> None:
+    """Resolve a start that was cut short.
+
+    A window that is there may belong to somebody else, and the
+    recovery never kills a window: such a lease is left alone and
+    reported.
+    """
+    state = window_state_at(agent, lease["tmux_session"], lease["window"])
+    if state == UNKNOWN:
+        print(f"ERR incomplete: lease {lease['id']} has no record of its "
+              f"start and its window {window_target(lease)} could not be "
+              f"read; the next dispatch tries again", file=sys.stderr)
+        return
+    if state == PRESENT:
+        print(f"ERR incomplete: lease {lease['id']} has the window "
+              f"{window_target(lease)} and no record of its start; if the "
+              f"window is the lane's, `lane release {lease['id']}` closes "
+              f"it and frees the unit; if it belongs to somebody else, "
+              f"rename it (`tmux rename-window -t {window_target(lease)} "
+              f"<name>`) and the next dispatch stops the lease",
+              file=sys.stderr)
+        return
+    # A window tmux says is gone means the start never finished: the
+    # lease stops and its request says why. The keeper does it in one
+    # transaction, so a start that finished in the meantime keeps its
+    # lease.
+    answer = client.interrupt(int(lease["id"]))
+    if not answer.get("stopped"):
+        # The start finished while the recovery looked: it recorded
+        # its window, and the recovery leaves it alone.
+        return
+
+
+def dispatch(client: KeeperClient, agent: Agent, cfg: Config,
+             leases: list[dict] | None = None) -> int:
+    """Start the lanes the queue promoted.
+
+    A start that fails frees its unit, and the next request takes it: a
+    queue that waits for a dispatcher to come round again is a queue that
+    waits.
+    """
+    started = 0
+    # A start that was cut short holds its unit with no window: the
+    # dispatcher that began it may never come back.
+    for lease in interrupted_starts(client):
+        reconcile_start(client, agent, lease)
+    pending = list(leases) if leases is not None else client.promote()
+    while pending:
+        failed = False
+        for lease in pending:
+            taken = client.take_start(int(lease["id"]))
+            if taken is None:
+                # Another dispatcher won the lease, so this one starts
+                # nothing.
+                continue
+            try:
+                start_lease(client, agent, cfg, taken)
+            except StepFailure as exc:
+                failed = True
+                print(f"ERR start: lease {taken['id']}: {exc.detail}",
+                      file=sys.stderr)
+                # The request says which step failed, so the author of
+                # the brief knows what to fix.
+                detail = f"{exc.step}: {exc.detail}"
+                if taken.get("queue_id"):
+                    # The request and the lease go in one transaction, so
+                    # a dispatcher that dies between them leaves no
+                    # request pointing at a lease that is gone.
+                    client.fail_start(int(taken["queue_id"]), detail,
+                                      lease_id=int(taken["id"]))
+                else:
+                    undo_lease(client, int(taken["id"]))
+                continue
+            started += 1
+            print(f"lease {taken['id']}")
+            print(f"target {taken['tmux_session']}:{taken['window']}")
+        pending = client.promote() if failed else []
+    return started
+
+
+def cmd_dispatch(args: argparse.Namespace) -> int:
+    """Start the requests the queue promoted."""
+    cfg = load_config()
+    client = cfg.client()
+    agent = cfg.agent()
+    started = dispatch(client, agent, cfg)
+    print(f"started {started}")
+    return 0
+
+
+def cmd_dequeue(args: argparse.Namespace) -> int:
+    """Remove a request: one that waits, or one that failed."""
+    cfg = load_config()
+    client = cfg.client()
+    client.dequeue(args.request)
+    print(f"removed request {args.request}")
+    return 0
+
+
+def displayed_state(lease: dict, now: float) -> str:
+    """The state a lease shows.
+
+    A busy lease whose window was never recorded shows as incomplete:
+    the lane never ran, and the recovery has yet to resolve it. The
+    record keeps its own state.
+    """
+    if lease["state"] == "busy" and not lease["window_opened_at"] \
+            and now - lease["state_since"] > START_TIMEOUT:
+        return INCOMPLETE
+    return lease["state"]
+
+
 def cmd_list(args: argparse.Namespace) -> int:
-    """Show the lanes."""
+    """Show the lanes, and the requests waiting for one."""
     cfg = load_config()
     client = cfg.client()
     agent = cfg.agent()
@@ -1849,8 +2600,15 @@ def cmd_list(args: argparse.Namespace) -> int:
                 print(f"ERR pr: lease {lease['id']}: {exc.detail}",
                       file=sys.stderr)
         records.append((lease, lease_record(lease, now, pr)))
+    live = client.now()
+    waiting = list(live.get("queue") or [])
+    failed = list(live.get("failed") or [])
+    for _, record in records:
+        record["state"] = displayed_state(record, now)
     if args.as_json:
         for _, record in records:
+            print(json.dumps({"kind": "lease", **record}))
+        for record in waiting + failed:
             print(json.dumps(record))
         return 0
     print(f"{'ID':>3}  {'REPO#ISSUE':<28} {'WINDOW':<20} "
@@ -1861,8 +2619,26 @@ def cmd_list(args: argparse.Namespace) -> int:
         number = str(record["pr"]) if record["pr"] else "-"
         state = record["pr_state"] or "-"
         print(f"{lease['id']:>3}  {label:<28} {lease['window']:<20} "
-              f"{lease['session']:<12} {lease['state']:<9} {number:>5} "
+              f"{lease['session']:<12} {record['state']:<9} {number:>5} "
               f"{state:<8} {age}s")
+    if waiting:
+        print()
+        print(f"{'POS':>3}  {'POOL':<10} {'REPO#ISSUE':<28} {'SESSION':<12} "
+              "AGE")
+        for record in waiting:
+            label = f"{record['repo']}#{record['issue']}"
+            age = human_age(now - record["created_at"])
+            print(f"{record['position']:>3}  {record['pool']:<10} "
+                  f"{label:<28} {record['session']:<12} {age}")
+    if failed:
+        print()
+        print(f"{'ID':>3}  {'POOL':<10} {'REPO#ISSUE':<28} {'SESSION':<12} "
+              "AGE  DETAIL")
+        for record in failed:
+            label = f"{record['repo']}#{record['issue']}"
+            age = human_age(now - record["created_at"])
+            print(f"{record['id']:>3}  {record['pool']:<10} {label:<28} "
+                  f"{record['session']:<12} {age}  {record['detail']}")
     return 0
 
 
@@ -1876,9 +2652,24 @@ def lease_record(lease: dict, now: float,
     return record
 
 
+def human_age(seconds: float) -> str:
+    """How long, in the units a person reads."""
+    seconds = int(max(0.0, seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, rest = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m"
+    hours, minutes = divmod(minutes, 60)
+    if hours < 24:
+        return f"{hours}h {minutes}m"
+    days, hours = divmod(hours, 24)
+    return f"{days}d {hours}h"
+
+
 def release_lease(client: KeeperClient, agent: Agent, lease: dict,
                    outcome: str | None = None, pr: int | None = None,
-                   pr_state: str | None = None) -> None:
+                   pr_state: str | None = None) -> list[dict]:
     """End a lease: close its window, mark it released, take the label off.
 
     The label goes even for a released lease: a label left on one is the
@@ -1887,7 +2678,11 @@ def release_lease(client: KeeperClient, agent: Agent, lease: dict,
     `outcome` says how the lane ended, and is written with the ending.
     A pull request is written when it is known. Releasing a lease that
     is already released writes nothing: its ending happened once.
+
+    The requests the release promoted are returned: their unit is free,
+    and they start within seconds.
     """
+    promoted: list[dict] = []
     if lease["state"] != RELEASED:
         if window_exists(agent, lease):
             code, _, err = agent.run(
@@ -1896,7 +2691,9 @@ def release_lease(client: KeeperClient, agent: Agent, lease: dict,
             if code != 0:
                 raise StepFailure("window", CommandError(
                     ["tmux", "kill-window"], code, err).detail())
-        client.end(lease["id"], outcome or OUTCOME_RELEASED, pr, pr_state)
+        answer = client.end(lease["id"], outcome or OUTCOME_RELEASED, pr,
+                            pr_state)
+        promoted = list(answer.get("promoted") or [])
     code, _, err = run(
         ["gh", "issue", "edit", str(lease["issue"]), "--repo",
          lease["repo"], "--remove-label", LABEL],
@@ -1904,6 +2701,7 @@ def release_lease(client: KeeperClient, agent: Agent, lease: dict,
     if code != 0:
         raise StepFailure("label", CommandError(
             ["gh", "issue", "edit"], code, err).detail())
+    return promoted
 
 
 def cmd_resume(args: argparse.Namespace) -> int:
@@ -1947,7 +2745,9 @@ def cmd_release(args: argparse.Namespace) -> int:
     lease = client.lease(args.lease)
     if lease is None:
         raise Refusal("lease", f"no lease {args.lease}")
-    release_lease(client, agent, lease, outcome=OUTCOME_RELEASED)
+    promoted = release_lease(client, agent, lease, outcome=OUTCOME_RELEASED)
+    # The unit the request was waiting for is free: it starts now.
+    dispatch(client, agent, cfg, promoted)
     return 0
 
 
@@ -1961,7 +2761,7 @@ def cmd_finish(args: argparse.Namespace) -> int:
     reconcile(client, agent)
     read_states(client, agent, all_leases(client))
     if args.merged:
-        return finish_merged(client, agent)
+        return finish_merged(client, agent, cfg)
     if args.lease is None:
         raise Refusal("usage", "which lease? give a lease number, or "
                                "--merged for every lane whose pull "
@@ -1974,27 +2774,31 @@ def cmd_finish(args: argparse.Namespace) -> int:
         raise Refusal("pr", f"no pull request for branch {lease['branch']}")
     worktree = check_finished(agent, lease, pr, args.abandon)
     outcome = OUTCOME_ABANDONED if args.abandon else OUTCOME_MERGED
-    take_down(client, agent, lease, worktree, pr, outcome)
+    promoted = take_down(client, agent, lease, worktree, pr, outcome)
+    dispatch(client, agent, cfg, promoted)
     return 0
 
 
-def finish_merged(client: KeeperClient, agent: Agent) -> int:
+def finish_merged(client: KeeperClient, agent: Agent, cfg: Config) -> int:
     """Take down every live lane whose pull request merged.
 
     Each lane stands on its own: one that refuses is reported, and the
     rest still go.
     """
     failures = 0
+    promoted: list[dict] = []
     for lease in client.now()["leases"]:
         try:
             pr = find_pr(lease["repo"], lease["branch"], lease["created_at"])
             if pr is None or pr.state != MERGED:
                 continue
             worktree = check_finished(agent, lease, pr, False)
-            take_down(client, agent, lease, worktree, pr, OUTCOME_MERGED)
+            promoted.extend(take_down(client, agent, lease, worktree, pr,
+                                      OUTCOME_MERGED))
         except (Refusal, StepFailure) as exc:
             failures += 1
             print(f"ERR lease {lease['id']}: {exc.detail}", file=sys.stderr)
+    dispatch(client, agent, cfg, promoted)
     return 1 if failures else 0
 
 
@@ -2009,6 +2813,9 @@ def cmd_report(args: argparse.Namespace) -> int:
     runner = Local()
     failures = 0
     for lease in client.now()["leases"]:
+        if lease["state"] == STARTING:
+            # A lease that is starting waits for its window.
+            continue
         try:
             state = pane_state_of(runner, lease)
             pr = find_pr(lease["repo"], lease["branch"], lease["created_at"])
@@ -2061,6 +2868,17 @@ def main(argv: list[str] | None = None) -> int:
                        help="window name (default: <repo>-<issue>)")
     spawn.add_argument("--session", default=None,
                        help="the claiming coordinator (default: $LANE_SESSION)")
+    spawn.add_argument("--queue", action="store_true",
+                       help="wait for a unit when the pool is full")
+    spawn.add_argument("--brief", default=None,
+                       help="a brief on the agent host, for the lane to read")
+
+    dispatch = commands.add_parser(
+        "dispatch", help="start the requests the queue promoted")
+
+    dequeue = commands.add_parser(
+        "dequeue", help="remove a request that waits, or one that failed")
+    dequeue.add_argument("request", type=int, help="the request number")
 
     listing = commands.add_parser("list", help="show the lanes")
     listing.add_argument("--json", action="store_true", dest="as_json",
@@ -2091,6 +2909,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "spawn":
             return cmd_spawn(args)
+        if args.command == "dispatch":
+            return cmd_dispatch(args)
+        if args.command == "dequeue":
+            return cmd_dequeue(args)
         if args.command == "list":
             return cmd_list(args)
         if args.command == "resume":

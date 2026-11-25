@@ -265,6 +265,31 @@ credentials that user can reach are still on the host: the empty config
 makes an accidental call fail, it does not make them unreadable. A lane
 is told that, and must not use them.
 
+## A pool that is full
+
+`lane spawn` against a full pool is refused, and nothing remembers the
+request. `lane spawn --queue` records it instead, and the lane reads the
+brief it names once it starts.
+
+The queue is as deep as the pool: `queue_percent` in `lanes.toml` says
+how much of it, as a percentage. A request past the depth is refused,
+with the requests waiting named.
+
+The requests start in the order they were queued. The request at the
+head of the queue takes the unit that is freed.
+
+A plain spawn on a pool with requests waiting is refused.
+
+`lane list` shows the requests waiting, and `lane dequeue <id>` removes
+one.
+
+The unit a request waits for is freed by ending a lane, and `lane
+dispatch` starts the request that took it.
+
+The timer in `install/lane-dispatch/` runs the dispatcher every minute,
+so a request starts even when the lane it waits for was ended by
+another caller.
+
 ## Watching `main`
 
 `main-watch-run` runs `main-watch` over a timer and says what broke `main`.

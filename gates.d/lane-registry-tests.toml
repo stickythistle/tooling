@@ -4,5 +4,5 @@
 
 [[gates]]
 name = "lane registry tests"
-when = '^(bin/lane|bin/lane-agent|lib/lane\.py|lib/lane_keeper\.py|tests/test_lane\.py|install/lane-report/)$'
+when = '^(bin/lane|bin/lane-agent|lib/lane\.py|lib/lane_keeper\.py|tests/test_lane\.py|install/lane-report/.*|install/lane-dispatch/.*)$'
 run = "python3 tests/test_lane.py"

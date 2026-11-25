@@ -9,6 +9,10 @@ tmux_session = "0"          # tmux target session
 worktree_root = "~/wt"      # default worktree: <root>/<repo name>-<issue>
 ready_seconds = 8           # wait after starting a harness, before it is used
 
+# How deep a pool's queue is, as a percentage of the pool. A request
+# waits for a unit, and the queue holds as many as the pool has units.
+queue_percent = 100
+
 # The keeper owns the lane record; this tool reads and changes it there.
 #
 # The token file holds the token alone, and its mode is checked: a token
