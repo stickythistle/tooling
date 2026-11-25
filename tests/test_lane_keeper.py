@@ -577,7 +577,7 @@ def test_history_days(world: World) -> list[str]:
         (recent_time, "merged", recent_lease_id)
     )
     
-    # Test default API view (should show both leases since it has no days filter)
+    # API shows both leases: no days filter on /api/history
     status, answer = world.call("/api/history", token=TOKENS["reader"])
     if status != 200:
         failures.append(f"history days: default view answered {status}, not 200: "
