@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -521,6 +522,139 @@ def test_state_pr(world: World) -> list[str]:
     return failures
 
 
+def test_history_days(world: World) -> list[str]:
+    """History shows lanes from the last N days when ?days=N is used.
+
+    The default view shows lanes from the last 7 days.
+    """
+    failures = []
+    # Mock current time as a fixed timestamp for testing
+    current_time = time.time()
+    
+    # Create a lease that finished 9 days ago (should not be in default view)
+    old_lease_id = 999
+    very_old_time = current_time - (9 * 24 * 60 * 60)  # 9 days ago
+    
+    # Create a lease that finished 6 days ago (should be in default view)
+    recent_lease_id = 1000
+    recent_time = current_time - (6 * 24 * 60 * 60)  # 6 days ago
+    
+
+    
+    conn = lane.open_db(world.db)
+    
+    # Insert the old lease (finished 8 days ago)
+    conn.execute(
+        "INSERT INTO leases (id, repo, issue, harness, profile, model, "
+        "pool, cost, branch, base, base_sha, worktree, clone, tmux_session, "
+        "window, session, harness_session, state, state_since, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (old_lease_id, REPO, 1, "hermes", "minimax", "MiniMax", "minimax", 1,
+         "old-branch", "origin/main", "", str(world.tmp / "old-wt"), "/clone",
+         "0", "old-window", "old-session", "", lane.RELEASED, very_old_time,
+         very_old_time - 1000)
+    )
+    # Update to set finished time and outcome
+    conn.execute(
+        "UPDATE leases SET finished_at = ?, outcome = ? WHERE id = ?",
+        (very_old_time, "merged", old_lease_id)
+    )
+    
+    # Insert the recent lease (finished 6 days ago)
+    conn.execute(
+        "INSERT INTO leases (id, repo, issue, harness, profile, model, "
+        "pool, cost, branch, base, base_sha, worktree, clone, tmux_session, "
+        "window, session, harness_session, state, state_since, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (recent_lease_id, REPO, 2, "hermes", "minimax", "MiniMax", "minimax", 1,
+         "recent-branch", "origin/main", "", str(world.tmp / "recent-wt"), "/clone",
+         "0", "recent-window", "recent-session", "", lane.RELEASED, recent_time,
+         recent_time - 1000)
+    )
+    # Update to set finished time and outcome
+    conn.execute(
+        "UPDATE leases SET finished_at = ?, outcome = ? WHERE id = ?",
+        (recent_time, "merged", recent_lease_id)
+    )
+    
+    # Test default API view (should show both leases since it has no days filter)
+    status, answer = world.call("/api/history", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: default view answered {status}, not 200: "
+                        f"{answer[:120]!r}")
+    leases = json.loads(answer)["leases"]
+    old_lease_present = any(lease["id"] == old_lease_id for lease in leases)
+    if not old_lease_present:
+        failures.append("history days: old lease (8 days ago) is missing from default API view")
+
+    
+    recent_lease_present = any(lease["id"] == recent_lease_id for lease in leases)
+    if not recent_lease_present:
+        failures.append("history days: recent lease (6 days ago) is missing from default API view")
+    
+    # Test HTML ?days=14 (should show both leases)
+    status, page = world.call("/?days=14", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: HTML days=14 answered {status}, not 200: "
+                        f"{page[:120]!r}")
+    if "History · last 14 days" not in page:
+        failures.append("history days: HTML does not show days=14 in heading")
+    if f">{old_lease_id}</td>" not in page:
+        failures.append("history days: HTML days=14 missing old lease")
+    if f">{recent_lease_id}</td>" not in page:
+        failures.append("history days: HTML days=14 missing recent lease")
+    
+    # Test HTML ?days=5 (should show no leases)
+    status, page = world.call("/?days=5", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: HTML days=5 answered {status}, not 200: "
+                        f"{page[:120]!r}")
+    if "History · last 5 days" not in page:
+        failures.append("history days: HTML does not show days=5 in heading")
+    if f">{old_lease_id}</td>" in page:
+        failures.append("history days: HTML days=5 shows old lease when it shouldn't")
+    if f">{recent_lease_id}</td>" in page:
+        failures.append("history days: HTML days=5 shows recent lease when it shouldn't")
+    
+    # Test invalid days parameter (should return 400)
+    status, answer = world.call("/?days=invalid", token=TOKENS["reader"])
+    if status != 400:
+        failures.append(f"history days: invalid days parameter answered {status}, not 400: "
+                        f"{answer[:120]!r}")
+    
+    # Test negative days parameter (should return 400)
+    status, answer = world.call("/?days=-5", token=TOKENS["reader"])
+    if status != 400:
+        failures.append(f"history days: negative days parameter answered {status}, not 400: "
+                        f"{answer[:120]!r}")
+    
+    # Test HTML dashboard shows days in heading when specified
+    status, page = world.call("/?days=7", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: HTML dashboard answered {status}, not 200: "
+                        f"{page[:120]!r}")
+    if "History · last 7 days" not in page:
+        failures.append("history days: HTML dashboard does not show days in heading")
+    
+    # Test HTML dashboard shows regular History heading when no days specified
+    status, page = world.call("/", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: HTML dashboard default answered {status}, not 200: "
+                        f"{page[:120]!r}")
+    if "History · last 7 days" not in page:
+        failures.append("history days: HTML dashboard does not show default days in heading")
+    
+    # Test days beyond MAX_DAYS (should be clamped)
+    status, page = world.call("/?days=400", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history days: days=400 answered {status}, not 200: "
+                        f"{page[:120]!r}")
+    if "History · last 365 days" not in page:
+        failures.append("history days: HTML does not clamp days=400 to MAX_DAYS")
+    
+    return failures
+
+
 CASES = [
     ("no-token", test_no_token, 1),
     ("reader", test_reader, 1),
@@ -534,6 +668,7 @@ CASES = [
     ("import", test_import, 1),
     ("single-lease", test_single_lease, 1),
     ("state-pr", test_state_pr, 1),
+    ("history-days", test_history_days, 1),
 ]
 
 
