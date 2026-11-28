@@ -1,0 +1,13 @@
+[Unit]
+Description=Start the lanes the lane queue promoted every minute
+
+[Timer]
+# The unit is freed by whoever ends the lane, and the dispatcher that
+# starts the request waiting for it may be another one. The timer starts
+# what nobody else did, a minute after it was promoted.
+OnBootSec=1min
+OnUnitActiveSec=60s
+Unit=lane-dispatch.service
+
+[Install]
+WantedBy=timers.target

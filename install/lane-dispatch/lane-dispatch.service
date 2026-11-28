@@ -1,0 +1,11 @@
+[Unit]
+Description=Start the lanes the lane queue promoted
+Documentation=man:lane(1)
+
+[Service]
+Type=oneshot
+# The dispatcher runs where the lanes are owned, so it can make the side
+# effects on the agent host over ssh.
+ExecStart=%h/bin/lane dispatch
+# A user service reads no profile, so the tools it calls are named here.
+Environment=PATH=%h/bin:%h/.local/bin:/usr/local/bin:/usr/bin:/bin
