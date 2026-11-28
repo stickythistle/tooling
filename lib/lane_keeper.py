@@ -46,6 +46,19 @@ DEFAULT_WEB = "https://github.com"
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 500
 
+# How many days back the history reaches when the caller names no
+# window, and the most it will reach.
+DEFAULT_DAYS = 7
+MAX_DAYS = 365
+
+# The seconds in a day, the width of the window the history reaches over.
+DAY_SECONDS = 86400
+
+# The bound that reaches every finished lane. A lane the old record
+# imported without a finishing time counts as finished at the epoch, so
+# this bound reaches it too.
+ALL_TIME = 0.0
+
 
 class BadRequest(Exception):
     """A request the service cannot read.
@@ -227,14 +240,21 @@ class Store:
 class Keeper:
     """What the handler needs: the settings and the record."""
 
-    def __init__(self, settings: Settings):
+    def __init__(self, settings: Settings, clock=None):
         self.settings = settings
         self.store = Store(settings.database)
+        # The clock the record is read at. A case that pins the moment
+        # passes its own, so the window it reads is the one it set.
+        self.clock = clock if clock is not None else time.time
+
+    def moment(self) -> float:
+        """The moment the record is read at."""
+        return self.clock()
 
     def now(self) -> dict:
         """The lanes that are live, and what each pool has taken."""
         conn = self.store.connection()
-        moment = time.time()
+        moment = self.moment()
         leases = [lane.lease_record(row, moment, None)
                   for row in lane.live_leases(conn)]
         pools = [{"pool": name,
@@ -243,14 +263,20 @@ class Keeper:
                  for name, size in self.settings.pools.items()]
         return {"now": moment, "leases": leases, "pools": pools}
 
-    def history(self, limit: int) -> list[dict]:
-        """The lanes that have ended, the newest first."""
+    def history(self, limit: int, since: float) -> list[dict]:
+        """The lanes that have ended, the newest first.
+
+        `since` is how far back a lane may have finished. A lane with no
+        finishing time counts as finished at the epoch, so the bound that
+        reaches every row reaches it too.
+        """
         conn = self.store.connection()
         rows = conn.execute(
             "SELECT * FROM leases WHERE state = ? "
+            "AND COALESCE(finished_at, 0) >= ? "
             "ORDER BY finished_at DESC, id DESC LIMIT ?",
-            (lane.RELEASED, limit)).fetchall()
-        moment = time.time()
+            (lane.RELEASED, since, limit)).fetchall()
+        moment = self.moment()
         return [lane.lease_record(row, moment, None) for row in rows]
 
 
@@ -427,8 +453,8 @@ def now_section(settings: Settings, leases: list[dict],
         "</section>")
 
 
-def history_section(settings: Settings, leases: list[dict]) -> str:
-    """The lanes that have ended, the newest first."""
+def history_section(settings: Settings, leases: list[dict], days: int) -> str:
+    """The lanes that have ended, the newest first, over the last `days`."""
     rows = []
     for lease in leases:
         started = lease["created_at"]
@@ -451,7 +477,7 @@ def history_section(settings: Settings, leases: list[dict]) -> str:
                     "</td></tr>")
     return (
         "<section id=\"history\">"
-        "<h2>History</h2>"
+        f"<h2>History · last {days} days</h2>"
         "<table><thead><tr><th>ID</th><th>REPO#ISSUE</th><th>STARTED</th>"
         "<th>FINISHED</th><th>DURATION</th><th>OUTCOME</th><th>PR</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
@@ -495,9 +521,10 @@ a:hover { text-decoration: underline; }
 """
 
 
-def dashboard(keeper: Keeper, limit: int) -> str:
+def dashboard(keeper: Keeper, limit: int, days: int) -> str:
     """The page: what is live now, and what has ended."""
     moment = keeper.now()
+    since = moment["now"] - days * DAY_SECONDS
     return (
         "<!DOCTYPE html>\n"
         "<html lang=\"en\">\n"
@@ -514,7 +541,7 @@ def dashboard(keeper: Keeper, limit: int) -> str:
         "refreshes itself every 30 seconds, and it changes nothing.</p>"
         "</header>\n"
         f"{now_section(keeper.settings, moment['leases'], moment['pools'])}\n"
-        f"{history_section(keeper.settings, keeper.history(limit))}\n"
+        f"{history_section(keeper.settings, keeper.history(limit, since), days)}\n"
         "</body>\n"
         "</html>\n")
 
@@ -626,13 +653,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _get(self, path: str, query: dict) -> None:
         if path == "/":
-            self._html(200, dashboard(self.keeper, self._limit(query)))
+            self._html(200, dashboard(self.keeper, self._limit(query),
+                                     self._days(query)))
             return
         if path == "/api/now":
             self._json(200, self.keeper.now())
             return
         if path == "/api/history":
-            self._json(200, {"leases": self.keeper.history(self._limit(query))})
+            # The JSON history reaches every finished lane; the window
+            # belongs to the dashboard.
+            self._json(200, {"leases": self.keeper.history(self._limit(query),
+                                                            ALL_TIME)})
             return
         match = re.fullmatch(r"/api/lease/(\d+)", path)
         if match:
@@ -652,14 +683,23 @@ class Handler(BaseHTTPRequestHandler):
 
     def _limit(self, query: dict) -> int:
         """How many finished lanes the caller asks for."""
-        raw = query.get("limit", [None])[0]
+        return self._bounded(query, "limit", DEFAULT_LIMIT, MAX_LIMIT)
+
+    def _days(self, query: dict) -> int:
+        """How many days back the history reaches."""
+        return self._bounded(query, "days", DEFAULT_DAYS, MAX_DAYS)
+
+    def _bounded(self, query: dict, name: str, default: int,
+                 most: int) -> int:
+        """A number the caller asked for, bounded between one and `most`."""
+        raw = query.get(name, [None])[0]
         if raw is None:
-            return DEFAULT_LIMIT
+            return default
         try:
-            limit = int(raw)
+            value = int(raw)
         except ValueError:
-            raise BadRequest(f"limit {raw!r} is not a number") from None
-        return max(1, min(MAX_LIMIT, limit))
+            raise BadRequest(f"{name} {raw!r} is not a number") from None
+        return max(1, min(most, value))
 
     # -- the writes
 
