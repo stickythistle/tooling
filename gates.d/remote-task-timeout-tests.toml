@@ -1,0 +1,7 @@
+# Timeout precedence suite. Named with the tool it drives, so a change to
+# the timeout logic runs this suite.
+
+[[gates]]
+name = "remote-task timeout tests"
+when = '^(bin/remote-task|tests/test_remote_task_timeout\.py)$'
+run = "python3 tests/test_remote_task_timeout.py"

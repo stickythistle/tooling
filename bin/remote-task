@@ -72,15 +72,22 @@ set -- "${ARGS[@]+"${ARGS[@]}"}"
 SRC=$(repo_root "${1:-$PWD}")
 NAME=$(tree_name "$SRC")
 
-# Captured to a variable rather than eval'd inline so the reader's non-zero
-# exit code reaches `set -e`. An `eval $(...)` of an empty string returns 0,
-# so the manifest's refusal would otherwise reach the next access to a TASK_*
-# variable as a "unbound variable" shell error pointing at the bash line, not
-# at the manifest field that is missing.
+# The manifest prints every field, including `TASK_TIMEOUT=''` when timeout
+# is absent, and eval overwrites the caller's value.
+_CALLER_TIMEOUT="${TASK_TIMEOUT:-}"
 output=$(python3 "$LIB/manifest.py" "$SRC" --task "$TASK")
 eval "$output"
 [ "$FULL" = 1 ] && [ -n "$TASK_FULL_COMMAND" ] && TASK_COMMAND=$TASK_FULL_COMMAND
-TASK_TIMEOUT=${TASK_TIMEOUT:-3600}
+# Precedence: caller wins over manifest, manifest over the 3600 default.
+# `timeout = 0` must reach `timeout(1)` as 0 (coreutils reads it as "no limit").
+# Only an empty or unset value falls through.
+if [ -n "$_CALLER_TIMEOUT" ]; then
+    TASK_TIMEOUT="$_CALLER_TIMEOUT"
+elif [ -n "$TASK_TIMEOUT" ]; then
+    : # manifest value, already set
+else
+    TASK_TIMEOUT=3600
+fi
 
 # Two locks, one per contended resource.
 #
