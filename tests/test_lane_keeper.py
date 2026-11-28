@@ -21,6 +21,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import urllib.error
 import urllib.request
 from dataclasses import replace
@@ -38,6 +39,11 @@ TOKENS = {"writer": "writer-token", "reporter": "reporter-token",
 
 # The repository the lanes are for.
 REPO = "stickythistle/tooling"
+
+# The moment the windowed history is read at. A case that reads a
+# window pins it, so the window it reads is the one it wrote down and
+# not the wall clock's.
+NOW = 1_700_000_000.0
 
 
 def digest(token: str) -> str:
@@ -58,11 +64,19 @@ class World:
             self.cert, self.key = make_cert(tmp)
         self.write_config(pool_size, tls)
         self.settings = lane_keeper.load_settings(self.config)
-        self.server = lane_keeper.make_server(self.settings)
+        # The moment the record is read at. A case that reads a window
+        # pins it, so the service reads the moment the case wrote down.
+        self.now = None
+        self.keeper = lane_keeper.Keeper(self.settings, clock=self._moment)
+        self.server = lane_keeper.make_server(self.settings, self.keeper)
         self.port = self.server.server_address[1]
         self.thread = threading.Thread(target=self.server.serve_forever,
                                         daemon=True)
         self.thread.start()
+
+    def _moment(self) -> float:
+        """The moment the case pinned, or the wall clock's."""
+        return time.time() if self.now is None else self.now
 
     def write_config(self, pool_size: int, tls: bool) -> None:
         """The settings file."""
@@ -333,6 +347,112 @@ def test_history(world: World) -> list[str]:
     return failures
 
 
+def history_of(page: str) -> str:
+    """The history part of a page."""
+    start = page.find('<section id="history">')
+    if start < 0:
+        return ""
+    end = page.find("</section>", start)
+    return page[start:end]
+
+
+def finished_lane(world: World, lease_id: int, issue: int,
+                  finished_at: float) -> int:
+    """A lane that ended at the moment the case wrote down."""
+    conn = lane.open_db(world.db)
+    conn.execute(
+        "INSERT INTO leases (id, repo, issue, harness, profile, model, "
+        "pool, cost, branch, base, worktree, clone, tmux_session, window, "
+        "session, state, state_since, created_at, finished_at, outcome) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (lease_id, REPO, issue, "hermes", "minimax", "MiniMax", "minimax", 1,
+         f"lane/{issue}", "origin/main", str(world.tmp / "wt" / str(issue)),
+         str(world.tmp / "clone"), "0", f"tooling-{issue}", "coord-a",
+         lane.RELEASED, finished_at, finished_at - 100.0, finished_at,
+         "merged"))
+    conn.close()
+    return lease_id
+
+
+def test_history_window(world: World) -> list[str]:
+    """The history shows the last seven days, and `?days` widens the window.
+
+    The lanes carry the finishing times this case wrote down, and the
+    service reads the clock this case gave it, so the window it reads is
+    the one written down and not the wall clock's.
+    """
+    failures = []
+    world.now = NOW
+    old = finished_lane(world, 901, 101, NOW - 8 * 86400)
+    recent = finished_lane(world, 902, 102, NOW - 6 * 86400)
+
+    status, page = world.call("/", token=TOKENS["reader"])
+    if status != 200:
+        return [f"history window: GET / answered {status}, not 200: "
+                f"{page[:120]!r}"]
+    history = history_of(page)
+    if "History · last 7 days" not in history:
+        failures.append("history window: the page does not name the window: "
+                        f"{history[:120]!r}")
+    if f">{old}</td>" in history:
+        failures.append("history window: a lane that ended 8 days ago is on "
+                        "the default page")
+    if f">{recent}</td>" not in history:
+        failures.append("history window: a lane that ended 6 days ago is "
+                        "missing from the default page")
+
+    status, page = world.call("/?days=14", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history window: GET /?days=14 answered {status}, "
+                        f"not 200: {page[:120]!r}")
+    else:
+        history = history_of(page)
+        if "History · last 14 days" not in history:
+            failures.append("history window: the page does not name the "
+                            f"window: {history[:120]!r}")
+        if f">{old}</td>" not in history:
+            failures.append("history window: a lane that ended 8 days ago is "
+                            "missing from a 14 day window")
+
+    # The JSON history reaches every finished lane, the window and all.
+    status, answer = world.call("/api/history", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history window: GET /api/history answered {status}, "
+                        f"not 200: {answer[:120]!r}")
+    else:
+        ids = [lease["id"] for lease in json.loads(answer)["leases"]]
+        if old not in ids:
+            failures.append("history window: the JSON history lost a lane "
+                            f"that ended 8 days ago: {ids}")
+
+    # A days the service cannot read is refused the way a limit is.
+    status, answer = world.call("/?days=seven", token=TOKENS["reader"])
+    if status != 400:
+        failures.append(f"history window: GET /?days=seven answered {status}, "
+                        f"not 400: {answer[:120]!r}")
+    status, answer = world.call("/?limit=seven", token=TOKENS["reader"])
+    if status != 400:
+        failures.append(f"history window: GET /?limit=seven answered {status}, "
+                        f"not 400: {answer[:120]!r}")
+
+    # A days out of range is bounded, the way a limit is.
+    status, page = world.call("/?days=0", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history window: GET /?days=0 answered {status}, not "
+                        f"200: {page[:120]!r}")
+    elif "History · last 1 days" not in history_of(page):
+        failures.append("history window: ?days=0 is not bounded to one day: "
+                        f"{history_of(page)[:120]!r}")
+    status, page = world.call("/?days=1000", token=TOKENS["reader"])
+    if status != 200:
+        failures.append(f"history window: GET /?days=1000 answered {status}, "
+                        f"not 200: {page[:120]!r}")
+    elif "History · last 365 days" not in history_of(page):
+        failures.append("history window: ?days=1000 is not bounded to 365 "
+                        f"days: {history_of(page)[:120]!r}")
+    return failures
+
+
 def test_dashboard(world: World) -> list[str]:
     """The dashboard shows both sections, and escapes what the record holds."""
     failures = []
@@ -529,6 +649,7 @@ CASES = [
     ("same-issue", test_same_issue, 2),
     ("default-branch", test_default_branch, 1),
     ("history", test_history, 1),
+    ("history-window", test_history_window, 1),
     ("dashboard", test_dashboard, 1),
     ("tls", test_tls, 1),
     ("import", test_import, 1),
